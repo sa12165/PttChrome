@@ -130,7 +130,6 @@ https://www.ptt.cc/bbs/Browsers/M.1786265274.A.5E3.html
    [Header Editor Lite ](https://addons.mozilla.org/en-US/firefox/addon/header-editor-lite/)
 2. **寫入設定檔**
 <img width="942" height="1369" alt="圖片" src="https://github.com/user-attachments/assets/4ea3e5e8-b581-4f23-836e-21c0f4d38bf4" />
-3. **儲存並啟用**
 ### 原理
 
 套件用下面這條規則比對你正在開啟的網址（只認**文章**網址，看板列表、搜尋頁等一律不動）：
@@ -157,7 +156,7 @@ https://abccbaandy.github.io/PttChrome/#Browsers/M.1786265274.A.5E3.html
 
 也就是說，這條規則只是幫你把網址「翻譯」成本站看得懂的形式，
 真正跳轉的是本站原本就有的**文章分享連結（deep link）**功能——你手動把網址複製貼上改成 `#` 形式，效果完全一樣。
-
+3. **儲存並啟用**
 > **💡 小提醒：**
 > * 如果你是自己部署本站（自架或改用別的網址），請把規則裡的目標網址換成你自己的站台位址。
 > * 想暫時看官方網頁版時，在 Requestly 把這條規則關掉即可（連線用的 Origin 規則請保持開啟）。
