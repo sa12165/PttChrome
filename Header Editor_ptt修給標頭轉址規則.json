@@ -1,0 +1,37 @@
+{
+	"request": [
+		{
+			"enable": true,
+			"group": "ptt",
+			"ruleType": "redirect",
+			"isFunction": false,
+			"code": "",
+			"forceRunner": "auto",
+			"name": "PTT Deep Link",
+			"condition": {
+				"regex": "^https?:\\/\\/www\\.ptt\\.cc\\/bbs\\/([A-Za-z0-9_-]+\\/M\\.\\d+\\.A\\.[A-Z0-9]+\\.html)"
+			},
+			"to": "https://sa12165.github.io/PttChrome/#$1",
+			"encoding": "utf-8"
+		}
+	],
+	"sendHeader": [
+		{
+			"enable": true,
+			"group": "ptt",
+			"ruleType": "modifySendHeader",
+			"isFunction": false,
+			"forceRunner": "auto",
+			"name": "PTT Origin",
+			"condition": {
+				"urlPrefix": "ws.ptt.cc"
+			},
+			"headers": {
+				"origin": "https://term.ptt.cc"
+			},
+			"encoding": "utf-8"
+		}
+	],
+	"receiveHeader": [],
+	"receiveBody": []
+}
