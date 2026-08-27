@@ -73,19 +73,19 @@
 
 ## 🌟 方法一：安裝擴充套件（強烈推薦，最穩定！）
 
-這個方法是透過安裝一個安全的瀏覽器擴充功能（以 Requestly 為例），來幫我們自動「假裝」成官方連線。只要設定一次，以後就可以像平常一樣順暢上 PTT 了。
+這個方法是透過安裝一個安全的瀏覽器擴充功能（以 Header Editor Lite為例），來幫我們自動「假裝」成官方連線。只要設定一次，以後就可以像平常一樣順暢上 PTT 了。
 
 ### 步驟說明：
 
-1. **安裝 Requestly 擴充功能**
-   請先在你的瀏覽器（如 Chrome, Edge 等）安裝 [Requestly 套件](https://chromewebstore.google.com/detail/requestly-intercept-modif/mdnleldcmiljblolnjhpnblkcekpdkpa) 並登入。
-2. **匯入自動設定檔**
-   安裝登入完成後，點擊下方我們準備好的「一鍵設定連結」：
-   👉 **[點我匯入 PTT 連線設定](https://app.requestly.io/rules#sharedList/63df8d2912c644ae9c698383485d84bb-ptt)**
+1. **安裝 Header Editor Lite 擴充功能**
+   請先在你的瀏覽器（火狐為例）安裝 [Header Editor Lite 套件](https://addons.mozilla.org/en-US/firefox/addon/header-editor-lite/) 。
+2. **寫入自動設定檔**
+   <img width="937" height="1377" alt="圖片" src="https://github.com/user-attachments/assets/abab49cf-6f14-47c7-869d-df74add7c6b4" />
+
 3. **儲存並啟用**
-   點擊連結後，畫面會跳轉到 Requestly 的頁面，請按下右上角的 **「Import to my rules」**（匯入）。
+  
 4. **完成！**
-   現在你可以重新打開你的第三方 PTT 網站，應該就能順利登入了！
+   現在你可以打開你的第三方 PTT 網站，應該就能順利登入了！
 
 > **💡 技術細節（給想知道原理的人）：**
 > 其實這個套件只是在每次連線到 PTT (`wss://ws.ptt.cc/bbs`) 時，自動幫你把身分標籤（Origin）改成官方的 `https://term.ptt.cc` 而已，非常安全。
@@ -126,11 +126,10 @@ https://www.ptt.cc/bbs/Browsers/M.1786265274.A.5E3.html
 
 ### 步驟說明：
 
-1. **安裝 Requestly 擴充功能**（與上面「方法一」同一個套件，已裝過就跳過）
-   [Requestly 套件](https://chromewebstore.google.com/detail/requestly-intercept-modif/mdnleldcmiljblolnjhpnblkcekpdkpa)
+1. **安裝 Header Editor Lite 擴充功能**（與上面「方法一」同一個套件，已裝過就跳過）
+   [Header Editor Lite ](https://addons.mozilla.org/en-US/firefox/addon/header-editor-lite/)
 2. **匯入設定檔**
-   👉 **[點我匯入 PTT 文章網址跳轉設定](https://app.requestly.io/rules#sharedList/1879e51729bb474c8011b0d98216927e-ptt-deep-link)**
-3. 按下右上角的 **「Import to my rules」**（匯入）即完成。
+<img width="942" height="1369" alt="圖片" src="https://github.com/user-attachments/assets/4ea3e5e8-b581-4f23-836e-21c0f4d38bf4" />
 
 ### 原理
 
