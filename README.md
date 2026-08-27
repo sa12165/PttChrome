@@ -128,9 +128,9 @@ https://www.ptt.cc/bbs/Browsers/M.1786265274.A.5E3.html
 
 1. **安裝 Header Editor Lite 擴充功能**（與上面「方法一」同一個套件，已裝過就跳過）
    [Header Editor Lite ](https://addons.mozilla.org/en-US/firefox/addon/header-editor-lite/)
-2. **匯入設定檔**
+2. **寫入設定檔**
 <img width="942" height="1369" alt="圖片" src="https://github.com/user-attachments/assets/4ea3e5e8-b581-4f23-836e-21c0f4d38bf4" />
-
+3. **儲存並啟用**
 ### 原理
 
 套件用下面這條規則比對你正在開啟的網址（只認**文章**網址，看板列表、搜尋頁等一律不動）：
