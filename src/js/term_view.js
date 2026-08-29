@@ -14,6 +14,8 @@ import { rowToText, parseArticleHeader, findPageOverlap, resolvePageOverlap, dec
 import { mergeListPage, flattenListBuffer, evictListBuffer, pinnedRowKey, MAX_LIST_ROWS, isLastReadStyledListRow, normalizeLastReadListRow, paintLastReadListRow, subjectOfListRow } from './list_session';
 import { labelListCursor, pruneListToSegment, LIST_HEADER_ROWS } from './list_window';
 import { readValuesWithDefault } from './pref_storage';
+import { cursorOffsets } from './cursor_anchor';
+import { cursorGeomSample } from './debug_recorder';
 import { isDocumentForeground } from './notification_gate';
 import icon128 from '../icon/icon_128.png';
 import cursorBack from '../cursor/back.png';
@@ -117,9 +119,11 @@ export function TermView() {
   // 滑鼠子開關（pref mouseLeftClick / mouseMiddleClick / mouseWheel）。總開關是
   // buf.useMouseBrowsing，gating 一律走 mouse_regions.resolveMouseGates。
   // 值域：mouseMiddleClick 0=關閉 1=貼上 2=左方向鍵；mouseWheel 0=關閉 1=上下頁。
+  // mouseWheelSmoothScroll：滾輪平滑捲動，只作用於文章列表好讀模式（見 pref_storage）。
   this.mouseLeftClick = true;
   this.mouseMiddleClick = 0;
   this.mouseWheel = 1;
+  this.mouseWheelSmoothScroll = true;
   // 防誤觸模式（pref mouseMisclickGuard，預設開）：可點區＝底色區的起始欄，
   // 決策在 mouse_regions.clickableColStart。
   this.mouseMisclickGuard = true;
@@ -140,7 +144,10 @@ export function TermView() {
   this.cursorX = 0;
   this.cursorY = 0;
 
-  // TODO Move this into easy_reading.js
+  // **刻意留在 view**：這是 EasyReading._enabled 的 bindProperty 來源（easy_reading.js
+  // constructor），同時被 redraw 的分支判斷／list_session／debug_recorder／e2e 探針當
+  // 公開旗標讀（docs/easy-reading.md）。搬進 easy_reading.js 等於拆掉那個契約。
+  // 手動開關一律走 App.switchToEasyReadingMode / exitEasyReading，勿直接翻這個旗標。
   this.useEasyReadingMode = false;
   this.easyReadingKeyDownKeyCode = 0;
 
@@ -176,6 +183,15 @@ export function TermView() {
   // 提早 return（位置不再更新），而 list_session 的 showCursor() 會把它清掉，
   // 連帶把這裡的抑制狀態一起清掉。
   this._cursorSuppressed = false;
+
+  // 這一幀的 (cur_x, cur_y) 落在格線外（PTT 偶爾會把 cur_x 送成 cols）。第四個獨立
+  // 來源，同樣 OR 進 _applyCursorVisibility。**必須是「藏起來」而不是「不更新」**：
+  // 舊版在這裡直接 early-return，游標仍然可見卻停在上一次的座標 ⇒ 畫面已經換了、
+  // 游標還留在原地，看起來就是「戳出反白輸入匡」。
+  this._cursorOutOfRange = false;
+
+  // 上一次送進 debug 錄製器的游標座標，用來做「真的動了才取樣」的節流。
+  this._lastGeomKey = null;
   this.autoHideBlinkCursor = true; // 須與 pref_storage.js DEFAULT_PREFS 一致
 
   // Work mode (enableWorkMode) repaints the screen in grays via CSS only, so the
@@ -311,12 +327,17 @@ export function TermView() {
   mainDisplay.appendChild(screenRoot);
   this.screenRoot = screenRoot;
 
-  // 閃爍游標。**住在 `.main` 裡面，和列共用同一棵 DOM 樹、同一個座標系**——
-  // 位置就是 `.main` 內容座標的 (cur_x*chw, cur_y*chh)，捲動由 `.main` 一起帶著走、
-  // 縮放由 `.main` 的 transform 一起套。歷史上它掛在 #BBSWindow（fixed）底下、用格線
-  // 公式算絕對座標，於是每次捲動／縮放都要補一個補償項，漏一條就「推文時游標戳出反白
-  // 輸入匡」（cbee3f5 → 865b828 修了兩輪仍復發）。**不要再把它搬回去，也不要再引入
-  // 任何 scrollTop／scale 補償。** 守護：tests/e2e/offline/cursor_shape.offline.spec.js
+  // 閃爍游標。**住在 `.main` 裡面，和列共用同一棵 DOM 樹、同一個座標系**——捲動由
+  // `.main` 一起帶著走、縮放由 `.main` 的 transform 一起套。歷史上它掛在 #BBSWindow
+  // （fixed）底下、用格線公式算絕對座標，於是每次捲動／縮放都要補一個補償項，漏一條
+  // 就「推文時游標戳出反白輸入匡」（cbee3f5 → 865b828 修了兩輪仍復發）。
+  //
+  // 位置**錨在該列真正被畫出來的節點**（updateCursorPos → _rowAnchor → offsetTop），
+  // 不是 `cur_y*chh`：後者只是「這一列應該在哪」的算術模型，與 layout 的實際結果之間
+  // 沒有任何守門，任一列的 line box 被撐大就整批脫鉤（見 js/cursor_anchor.js 開頭）。
+  //
+  // **不要再把它搬回 .main 外面，也不要再引入任何 scrollTop／scale／列高補償。**
+  // 守護：tests/e2e/offline/cursor_shape.offline.spec.js
   var bbsCursor = document.createElement('div');
   bbsCursor.setAttribute('id', 'cursor');
   bbsCursor.setAttribute('class', 'terminal_display');
@@ -325,9 +346,14 @@ export function TermView() {
 
   var lastRowDiv = document.createElement('div');
   lastRowDiv.setAttribute('id', 'easyReadingLastRow');
-  let spaces = ' '.repeat(80-25);  // TODO: Find a way to update this.
-  this.lastRowDivContent = '<span align="left"><span class="q0 b7">' + spaces + '</span><span class="q1 b7">(y)</span><span class="q0 b7">回應</span><span class="q1 b7">(X%)</span><span class="q0 b7">推文</span><span class="q1 b7">(←)</span><span class="q0 b7">離開 </span> </span>';
-  lastRowDiv.innerHTML = this.lastRowDivContent;
+  // 只建**空的** wrapper span，內容一律由 _mirrorStatusRowToFooter 填（真狀態列
+  // 的即時鏡像，含真實顏色與功能鍵）。這個 wrapper 不可省：setSingleChild 寫的是
+  // lastRowDiv.childNodes[0]，而 `#easyReadingLastRow > span` 的 CSS 也掛在它身上。
+  //
+  // 這裡曾經放一串寫死的假 footer（`(y)回應 (X%)推文 (←)離開`）＋一句上游待辦「找個
+  // 方法更新它」。mirror 上線後那是假需求：#easyReadingLastRow 預設 display:none，唯一把它
+  // 設成 block 的地方在 mirror 已經填好內容之後 ⇒ 那串字從來不會被看到。
+  lastRowDiv.appendChild(document.createElement('span'));
   this.lastRowDiv = lastRowDiv;
   this.BBSWin.appendChild(lastRowDiv);
 
@@ -387,8 +413,9 @@ export function TermView() {
     if (e.keyCode == 229)
       return false;
 
-    // TODO: Since the app is almost useless on mobile devices, we might want
-    // to revisit if we want this code.
+    // 下面兩條是 iOS 來的，但**刻意保留**：專案目標是主流桌機瀏覽器（CLAUDE.md），
+    // 不為手機做相容，而這兩條在桌機 IME 也在作用（isComposition 期間吞掉非控制鍵），
+    // 移除有風險、零收益。不要再把它當待辦。
 
     // iOS sends the keydown that starts composition as key code 0. Ignore it.
     if (e.keyCode == 0)
@@ -597,7 +624,24 @@ TermView.prototype = {
           // buildListWindowLines 的註解）⇒ 列參考相同即內容相同，render 層可以
           // 直接沿用上一幀的節點。frozen 幀原封沿用整份 _listWindowLines，24 列
           // 全部命中。
-          this._renderScreenLines(windowLines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, { pageState: 2, listEasyReading: true, rowIdentityStable: true });
+          // 次列位移（平滑捲動）：body 區交給自己的視口節點，offsetPx 就是它的
+          // scrollTop。overscan 由實際列數推導 —— frozen 幀沿用的是快照，不能
+          // 再去問 session 現在的 frac。
+          var lsBodyRows = this.buf.rows - 4;
+          var lsSession = this.bbscore && this.bbscore.listSession;
+          this._renderScreenLines(windowLines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, {
+            pageState: 2,
+            listEasyReading: true,
+            rowIdentityStable: true,
+            listScroll: {
+              bodyStart: LIST_HEADER_ROWS,
+              bodyRows: lsBodyRows,
+              viewportPx: lsBodyRows * this.chh,
+              offsetPx:
+                (lsSession && lsSession.scrollFrac && lsSession.scrollFrac()) || 0,
+              overscan: windowLines.length > LIST_HEADER_ROWS + lsBodyRows + 1
+            }
+          });
         } else {
           // No window yet (header cache / buffer still empty — engage races):
           // mirror the native screen; the next clean-list settle re-renders.
@@ -938,7 +982,9 @@ TermView.prototype = {
         return;
     }
 
-    // TODO: Move this. Make a key event mapper.
+    // 這裡只剩「本 app 自己要吃掉的鍵」。真正的分流在上面：列表好讀交給
+    // listSession.onKeyDown、文章好讀交給 easyReading._onKeyDown，沒被攔下的一律
+    // 原封落到 _keyboard.onKeyDown 送給 PTT。
     var stop = false;
     if (!e.ctrlKey && !e.altKey) {
       switch (e.key) {
@@ -1087,24 +1133,6 @@ TermView.prototype = {
     this.dynamicCss.insertRule(rule, this.dynamicCss.cssRules.length);
   },
 
-  // 格線 (col,row) → **視窗座標**。唯一消費者是 updateInputBufferPos（注音候選框
-  // `#t`，刻意留在 #BBSWindow 底下，見 index.html 的說明）。
-  // **閃爍游標不要用它** —— 它住在 `.main` 裡，用的是內容座標，見 updateCursorPos。
-  // 注意這裡的原點公式與 App.clientToPos 不同源（多了 +10 與 bbsViewMargin），
-  // 且縮放分支的垂直原點漏算 `.main` 高度那 10px，誤差 5*(1-scaleY) px。
-  convertMN2XYEx: function(cx, cy) {
-    var origin;
-    var w = this.innerBounds.width;
-    var h = this.innerBounds.height;
-    if(this.scaleX!=1 || this.scaleY!=1)
-      origin = [((w - (this.chw*this.buf.cols+10)*this.scaleX)/2) + this.bbsViewMargin, ((h - (this.chh*this.buf.rows)*this.scaleY)/2) + this.bbsViewMargin];
-    else
-      origin = [this.firstGridOffset.left, this.firstGridOffset.top];
-    var realX = origin[0] + (cx) * this.chw * this.scaleX;
-    var realY = origin[1] + (cy) * this.chh * this.scaleY;
-    return [realX, realY];
-  },
-
   checkLeftDB: function() {
     if (this.dbcsDetect && this.buf.cur_x>1) {
       var lines = this.buf.lines;
@@ -1144,11 +1172,13 @@ TermView.prototype = {
 
   // 唯一寫 #cursor display 的地方。inline 'none' 蓋過 CSS 的 .blink--active 規則
   // （main.css），設回 '' 就把顯示權交還給每秒 toggle class 的閃爍機制。
-  // 三個獨立來源做 OR：手動隱藏（list_session）、PTT 自己畫了游標（autoHideBlinkCursor）、
-  // 以及這一幀不是格線畫面（好讀累積長頁 —— 格線座標在那裡沒有意義，見 _gridRender）。
+  // 四個獨立來源做 OR：手動隱藏（list_session）、PTT 自己畫了游標（autoHideBlinkCursor）、
+  // 這一幀不是格線畫面（好讀累積長頁 —— 格線座標在那裡沒有意義，見 _gridRender）、
+  // 以及游標座標落在格線外（_cursorOutOfRange，見宣告處）。
   _applyCursorVisibility: function() {
     this.bbsCursor.style.display =
-      (this._cursorHidden || this._cursorSuppressed || !this._gridRender) ? 'none' : '';
+      (this._cursorHidden || this._cursorSuppressed || !this._gridRender ||
+       this._cursorOutOfRange) ? 'none' : '';
   },
 
   // 每幀重算（TermBuf.notify）：PTT 游標可能在「終端機游標沒移動、但該列被重畫」的
@@ -1191,7 +1221,13 @@ TermView.prototype = {
     if (this.buf.useMouseBrowsing && this.buf.listRenderMode === 'buffer') {
       var ls = this.bbscore && this.bbscore.listSession;
       var idx = row - LIST_HEADER_ROWS;
-      if (ls && idx >= 0 && idx < this.buf.rows - 4) {
+      // row === buf.rows ＝ 平滑捲動時視口底部露出的那一小條（overscan 列，
+      // 渲染 index 24）。它一樣是使用者看得到、點得到的列 ⇒ 底色也要標得到，
+      // 「可點範圍＝標示範圍」的合約才成立（docs/mouse.md）。
+      if (ls && row === this.buf.rows) {
+        var ovWin = ls.getWindowView();
+        if (ovWin && ovWin.overscanAbs != null) hover = row;
+      } else if (ls && idx >= 0 && idx < this.buf.rows - 4) {
         var win = ls.getWindowView();
         // body[idx] == null ＝ 短頁的空白補列，沒有文章可點。
         if (win && win.body[idx] != null) hover = row;
@@ -1440,8 +1476,15 @@ TermView.prototype = {
     this.applyCursorHighlight();
     if (this._cursorHidden) return;
 
-    if (this.buf.cur_y >= this.buf.rows || this.buf.cur_x >= this.buf.cols)
-      return; //sometimes, the value of this.buf.cur_x is 80 :(
+    // PTT 偶爾把 cur_x 送成 cols（原註解：sometimes the value of cur_x is 80）。
+    // **藏起來**，不是「不更新」——後者會讓可見的游標停在過期座標上。
+    var outOfRange =
+      this.buf.cur_y >= this.buf.rows || this.buf.cur_x >= this.buf.cols;
+    if (outOfRange !== this._cursorOutOfRange) {
+      this._cursorOutOfRange = outOfRange;
+      this._applyCursorVisibility();
+    }
+    if (outOfRange) return;
 
     var lines = this.buf.lines;
     var line = lines[this.buf.cur_y];
@@ -1460,50 +1503,132 @@ TermView.prototype = {
     }
 
     // **座標系合一**：#cursor 是 `.main` 的子元素（見建構子），所以這裡用的就是
-    // `.main` 的內容座標 —— 一格 chw × chh，原點在內容左上角。
+    // `.main` 的內容座標 —— 原點在內容左上角。
     //   捲動：#cursor 跟列一起被 `.main` 帶著走 ⇒ 不必扣 scrollTop，連「捲動時要重算」
     //         都不需要（純滾輪不產生 term_buf 更新，舊實作就是這樣漏掉的）。
     //   縮放：`.main` 的 transform: scale() 一併套到游標 ⇒ 不必自己乘 scaleX/scaleY，
     //         也不必複製那套置中原點公式（它與實際 layout 差 5*(1-scaleY) px）。
     //   置中／邊界：marginTop、align=center、+10 的捲軸讓位全部由 `.main` 自己吸收。
+    // **垂直位置錨在該列真正被畫出來的節點**（_rowAnchor → offsetTop），不是
+    // `cur_y * chh`：後者是「這一列應該在哪」，前者是「實際在哪」，只要有任何一列的
+    // line box 被撐大兩者就脫鉤（見 js/cursor_anchor.js 開頭）。
     // 這裡**不可以**再引入任何補償項；要補償就表示又把它搬出 `.main` 了。
     // 守護：tests/e2e/offline/cursor_shape.offline.spec.js
-    this.bbsCursor.style.left = (this.buf.cur_x * this.chw) + 'px';
-    this.bbsCursor.style.top = (this.buf.cur_y * this.chh) + 'px';
+    var anchor = this._rowAnchor(this.buf.cur_y);
+    var geo = cursorOffsets({
+      row: anchor,
+      cur_x: this.buf.cur_x, cur_y: this.buf.cur_y,
+      cols: this.buf.cols, rows: this.buf.rows,
+      chw: this.chw, chh: this.chh
+    });
+    this.bbsCursor.style.left = geo.left + 'px';
+    this.bbsCursor.style.top = geo.top + 'px';
     // if you want to set cursor color by now background, use this.
     this.bbsCursor.style.color = cursorColorForBg(bg, this.workModeActive);
-    this.updateInputBufferPos();
-
+    this.updateInputBufferPos(anchor);
+    this._sampleCursorGeom();
   },
 
-  updateInputBufferPos: function() {
-    if (this.input.getAttribute('bshow') == '1') {
-      var pos = this.convertMN2XYEx(this.buf.cur_x, this.buf.cur_y);
-      {
-        this.input.style.opacity = '1';
-        this.input.style.border = 'double';
-        {
-          //this.input.style.width  = (this.chh-4)*10 + 'px';
-          this.input.style.fontSize = this.chh-4 + 'px';
-          //this.input.style.lineHeight = this.chh+4 + 'px';
-          this.input.style.height = this.chh + 'px';
-        }
-      }
-      var innerBounds = this.innerBounds;
-      var bbswinheight = innerBounds.height;
-      var bbswinwidth = innerBounds.width;
-      if(bbswinheight < pos[1] + parseFloat(this.input.style.height) + this.chh)
-        this.input.style.top = (pos[1] - parseFloat(this.input.style.height) - this.chh)+ 4 +'px';
-      else
-        this.input.style.top = (pos[1] + this.chh) +'px';
+  // 這一幀 buf 第 row 列**真正被畫出來**的節點的 offset（相對 `.main` —— 它是
+  // position:relative，也就是 #cursor 的 containing block ⇒ 兩者同一個座標系）。
+  //
+  // 只在格線幀（_gridRender）才有意義：好讀累積長頁的 srow 是長頁列號，與 buf.cur_y
+  // 毫無關係，拿它當錨會錨到隨機一列（那種幀游標本來就整個隱藏，但 #t 還是會讀，
+  // 所以這裡要擋在源頭）。量不到就回 null，由 cursorOffsets 退回舊算術。
+  //
+  // **每次呼叫都現量，不做跨呼叫快取**：layout 會變的時機不只重繪與改字級（延遲載入
+  // 的圖片落地、pref 切換 CSS class、字型落地都會），任何以「幀序號」為鍵的快取都會
+  // 有吃到過期 offsetTop 的路徑，而那正是本函式要消滅的東西。一次 querySelector +
+  // 一次 offset 讀取，成本落在游標移動這個頻率上，可以接受。
+  // 同一次 updateCursorPos 之內由呼叫端把結果傳給 updateInputBufferPos，不重複量。
+  _rowAnchor: function(row) {
+    if (!this._gridRender) return null;
+    var cont = this.mainContainer;
+    var el = cont
+      ? cont.querySelector('[type="bbsrow"][srow="' + row + '"]')
+      : null;
+    return el ? { offsetTop: el.offsetTop, offsetLeft: el.offsetLeft, el: el } : null;
+  },
 
-      if(bbswinwidth < pos[0] + parseFloat(this.input.style.width))
-        this.input.style.left = bbswinwidth - parseFloat(this.input.style.width)- 10 +'px';
-      else
-        this.input.style.left = pos[0] +'px';
+  // debug 錄製器的幾何取樣。**只在真的在錄、而且游標真的移動了**才做——
+  // cursorGeomSample 會 getBoundingClientRect ⇒ 強制 reflow。
+  _sampleCursorGeom: function() {
+    var rec = this.bbscore && this.bbscore.debugRecorder;
+    if (!rec || !rec.isRecording) return;
+    var key = this.bbsCursor.style.left + ',' + this.bbsCursor.style.top;
+    if (key === this._lastGeomKey) return;
+    this._lastGeomKey = key;
+    rec.log('cursor.geom', cursorGeomSample(this));
+  },
 
-      //this.input.style.left = pos[0] +'px';
+  // 這一幀游標那一格的**螢幕座標**（viewport），給 `#t` 用。
+  //
+  // `#t` 刻意留在 `.main` **外面**（#BBSWindow 底下，見 index.html 的註解：它平時
+  // 在視口外，一旦成為捲動容器的子孫，focus() 就會把長頁捲飛）。既然出不了 `.main`，
+  // 就不要另外算一套格線公式 —— 舊的 convertMN2XYEx **完全不扣 .main.scrollTop**，
+  // 縮放分支的垂直原點又漏算 10px（誤差 5*(1-scaleY) px），已刪除。
+  //
+  // 改成錨在該列真正被畫出來的節點的 getBoundingClientRect()：它天然含 scrollTop 與
+  // transform: scale()。而 #BBSWindow 是 position:fixed、top/left:0、100%×100%、無
+  // border/padding ⇒ **它的 padding box 原點就是 viewport 原點**，所以 viewport
+  // 座標可以直接當 `#t`（position:absolute）的 left/top，不需要任何換算。
+  //
+  // **不要改用 #cursor 的 rect 當錨**：#cursor 基底 CSS 是 display:none，靠
+  // body.blink--active 每秒 toggle ⇒ 有一半時間量到全 0。
+  //
+  // 沒有可錨的列（好讀累積長頁：格線座標在那裡沒有意義，_rowAnchor 回 null）時
+  // **不要把框留在 -100000px**：那會讓 OS 的候選字清單跑到瀏覽器自選的角落。改停在
+  // `.main` 可視區的左下角 —— 也就是原生輸入列將要出現的位置（任何送得出去的字都會
+  // 先讓 easy_reading 進 functionMode 鏡像原生，屆時就改吃精確錨點）。這裡用的是
+  // `.main` 自己的矩形，不是「原點公式 + 補償項」。
+  _cellClientRect: function(anchor) {
+    anchor = anchor || this._rowAnchor(this.buf.cur_y);
+    if (!anchor || !anchor.el) {
+      if (!this.mainDisplay) return null;
+      var m = this.mainDisplay.getBoundingClientRect();
+      var h = this.chh * this.scaleY;
+      return { left: m.left, top: Math.max(m.top, m.bottom - h), height: h };
     }
+    var r = anchor.el.getBoundingClientRect();
+    return {
+      left: r.left + this.buf.cur_x * this.chw * this.scaleX,
+      top: r.top,
+      height: r.height || this.chh * this.scaleY
+    };
+  },
+
+  // anchor 由 updateCursorPos 傳進來（同一次更新只量一次）；獨立呼叫（composition
+  // 開始、輸入中改寬度）時自己量。
+  updateInputBufferPos: function(anchor) {
+    if (this.input.getAttribute('bshow') != '1') return;
+    var cell = this._cellClientRect(anchor);
+    if (!cell) return;
+
+    this.input.style.opacity = '1';
+    this.input.style.border = 'double';
+    this.input.style.fontSize = this.chh-4 + 'px';
+    this.input.style.height = this.chh + 'px';
+
+    // 邊界 clamp 沿用原行為：塞不下就翻到該格上方／往左靠。基準換成 viewport
+    // （#BBSWindow 就是整個 viewport，見上）。
+    //
+    // 尺寸用 **offsetWidth/Height（外框）而不是 style.height**：#t 是
+    // box-sizing:content-box + border:double ⇒ 外框比 style.height 多了邊框那幾 px。
+    // 用內容高去翻到上方，框就會壓進該列裡（實測差 8px）。舊實作那個 +4 的補正
+    // 就是在補這件事，補不準，已拿掉。
+    var bbswinheight = this.innerBounds.height;
+    var bbswinwidth = this.innerBounds.width;
+    var ih = this.input.offsetHeight || parseFloat(this.input.style.height);
+    var iw = this.input.offsetWidth || parseFloat(this.input.style.width) || 0;
+    if (bbswinheight < cell.top + cell.height + ih)
+      this.input.style.top = (cell.top - ih) + 'px';
+    else
+      this.input.style.top = (cell.top + cell.height) + 'px';
+
+    if (bbswinwidth < cell.left + iw)
+      this.input.style.left = (bbswinwidth - iw - 10) + 'px';
+    else
+      this.input.style.left = cell.left + 'px';
   },
 
   updateInputBufferWidth: function() {
@@ -2126,6 +2251,22 @@ TermView.prototype = {
       }
     }
     out.push(this._listFooterRow);
+    // 平滑捲動的 overscan 列：視口捲掉頂端 frac px 之後，底部會空出同樣高度 ⇒
+    // 多畫下一列補滿。**放在 footer 後面**（渲染 index 24）是刻意的：footer 的
+    // data-row 必須維持 23（外部契約，見 render_dom_equivalence 的 golden）。
+    // render 端（src/render/screen.js#_patchRows）會把它排進 body 視口裡。
+    if (win.overscanAbs != null) {
+      var ovRow = listLines[win.overscanAbs];
+      if (!ovRow) {
+        out.push(this._blankListRow());
+      } else if (lastReadTitle != null && ovRow._subject === lastReadTitle) {
+        var ovLr = cloneRow(ovRow);
+        paintLastReadListRow(ovLr);
+        out.push(ovLr);
+      } else {
+        out.push(ovRow);
+      }
+    }
     this._listWindowLines = out;
     return out;
   },
@@ -2163,8 +2304,9 @@ TermView.prototype = {
   // —— 那一列 padding 是替 footer overlay 讓位用的，原生鏡像畫面根本沒有 overlay。
   // 留著它，`.main`（height = chh*rows + 10、overflow-y:auto）的內容就變成
   // chh*rows + chh ⇒ **還有 chh-10 px 可捲**，而 App.mouse_scroll 在 pageState 3
-  // 時直接放行給瀏覽器（推文提示畫面的 pageState 仍是 3）⇒ 滾輪真的把輸入列捲上去，
-  // 絕對定位的 #cursor 卻不會跟著動 ⇒ 推文時閃爍游標戳出反白輸入匡。
+  // 時直接放行給瀏覽器（推文提示畫面的 pageState 仍是 3）⇒ 滾輪真的把輸入列捲上去。
+  // （2026-08-21 起 #cursor 住在 `.main` 裡、會跟著捲，所以這條不再是游標正確性的
+  // 依賴；仍要清 —— 原生鏡像畫面本來就不該有可捲距離。）
   // 回好讀時 accumulatePageLines 每次都會把 padding 設回 '1em'，而且排在
   // _evalFunctionModeExit('resume') 還原 _savedScrollTop 之前，捲動位置照舊還原。
   // 守護：tests/e2e/offline/cursor_shape.offline.spec.js
@@ -2181,8 +2323,8 @@ TermView.prototype = {
   hideEasyReadingOverlays: function() {
     this.lastRowDiv.style.display = '';
     // 清掉好讀累積翻頁時加在 #mainContainer 的 1em 底部 padding（accumulatePageLines），
-    // 否則 .main 仍可捲動，殘留 scrollTop 會把列表列捲上約一格，而絕對定位的 #cursor
-    // （用固定 firstGridOffset 算位置、不受 scrollTop 影響）不會跟著動 → 游標低高亮列一格。
+    // 否則 .main 仍可捲動，殘留 scrollTop 會把列表列捲上約一格。（游標本身已錨在列節點
+    // 上、跟著捲，不再受影響；清 padding 是為了畫面本身不該有可捲距離。）
     // 與原生退出路徑 (switchToEasyReadingMode(false), pttchrome.js:355) 保持一致。
     if (this.mainContainer) this.mainContainer.style.paddingBottom = '';
     this.mainDisplay.scrollTop = 0;

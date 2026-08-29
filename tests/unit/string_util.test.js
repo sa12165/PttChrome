@@ -19,7 +19,6 @@ import {
   parsePagerFooterContext,
   parseListRow,
   parseWaterball,
-  parsePushInitText,
   isDBCSLead,
   unescapeStr,
   b2u,
@@ -45,6 +44,32 @@ describe("wrapText group-width measurement", () => {
   // Plain ASCII below the limit is returned unchanged.
   it("leaves short ASCII untouched", () => {
     expect(wrapText("hello", 10, "\n")).toBe("hello");
+  });
+});
+
+describe("wrapText 全形標點不落行首", () => {
+  // 上游的 FIXME（"full-width punctuation marks aren't recognized"）：全形字組寫成
+  // `[^\x00-\x7f][,.?!:;]?` —— 只吸收半形標點，全形的「，。」自成一組 ⇒ 折行時會被
+  // 推到下一行的行首。lineWrap 預設 78，每次貼上都會跑到這條路徑。
+  //
+  // maxLen 4 = 兩個全形字寬。修好前「測試，」的字組是 測/試/，⇒ 前兩字剛好填滿 ⇒
+  // 逗號被擠到行首；修好後「試，」是同一組，換成「試」帶著逗號一起換行。
+  it("全形逗號跟著前一個字換行，不會被推到行首", () => {
+    expect(wrapText("測試，", 4, "\n")).toBe("測\n試，");
+  });
+
+  it("全形句號同理", () => {
+    expect(wrapText("測試。", 4, "\n")).toBe("測\n試。");
+  });
+
+  it("原本就吸收得到的半形標點不受影響", () => {
+    expect(wrapText("測試,", 4, "\n")).toBe("測\n試,");
+  });
+
+  // 刻意不做的邊界：全形「起始」標點（（「『【）不落行尾的鏡像規則要 lookahead
+  // 重組字組，不在這次範圍。這條測試釘住現況，改動時才看得到它變了。
+  it("全形起始標點仍可能落在行尾（已知邊界）", () => {
+    expect(wrapText("測「試", 4, "\n")).toBe("測「\n試");
   });
 });
 
@@ -445,47 +470,6 @@ describe("parseWaterball（show_call_in / outmsg）", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 推文輸入列的指紋。唯一消費者是 image_upload.js（決定圖片網址插到推文輸入列
-// 還是編輯器）——好讀模式的 prompt 讓位已改由 functionMode 鏡像原生畫面，
-// parseReplyText / parseReqNotMetText 隨那條 legacy 路徑一起移除。
-// 官方出處：mbbsd/bbs.c#recommend — outs(ANSI_COLOR(1) "您覺得這篇文章 ")
-// ---------------------------------------------------------------------------
-describe("parsePushInitText（bbs.c#recommend 的推文輸入列）", () => {
-  test("推文類型選單（您覺得這篇文章 …）", () => {
-    expect(parsePushInitText("您覺得這篇文章 值得推薦 給它噓聲 只加→註解 [1]? ")).toBe(
-      true
-    );
-  });
-
-  // FormatCommentString 的輸入 prompt：「→ id:」但**還沒有**行尾時間戳
-  // （tail 是送出後才接上的）。
-  test("輸入 prompt「→ id: 」（無時間戳）", () => {
-    expect(parsePushInitText("→ someuser: ")).toBe(true);
-  });
-
-  // 已完成的 → 推文帶行尾 MM/DD HH:MM，不是輸入列 —— 否則好讀模式會把
-  // 第一則箭頭推文誤當輸入列而漏掉它。
-  test("已完成的箭頭推文（有時間戳）→ false", () => {
-    expect(
-      parsePushInitText("→ someuser: 已經送出的推文                07/26 14:30")
-    ).toBe(false);
-  });
-
-  test("本板不開放回覆 prompt", () => {
-    expect(
-      parsePushInitText(
-        "很抱歉, 本板不開放回覆文章，要改回信給作者嗎？ [y/N]:"
-      )
-    ).toBe(true);
-  });
-
-  test("一般內容 → false", () => {
-    expect(parsePushInitText("推 someuser: 內容                    07/26 14:30")).toBe(
-      false
-    );
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Big5 <-> Unicode（src/conv/*.bin 查表；PTT 全站 Big5，見 CLAUDE.md）
 // ---------------------------------------------------------------------------

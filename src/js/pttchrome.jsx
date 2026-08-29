@@ -13,6 +13,8 @@ import { DeepLinkController } from './deep_link_controller';
 import { AutoLogin } from './auto_login';
 import { parseBlacklist, parseTitleBlacklist } from './comment_parse';
 import { MouseButtonTracker } from './mouse_button_tracker';
+import { LIST_HEADER_ROWS } from './list_window';
+import { wheelDeltaToPx } from './wheel_scroll';
 import {
   ACT_NONE,
   ACT_ENTER,
@@ -33,6 +35,7 @@ import PasteShortcutAlert from '../components/PasteShortcutAlert';
 import ConnectionAlert from '../components/ConnectionAlert';
 import ContextMenu from '../components/ContextMenu';
 import { renderInto, unmountFrom } from './react_root';
+import { setBellEnabled } from './bell';
 import { MantineRoot } from '../components/MantineRoot';
 import logoIcon from '../icon/logo.png';
 import logoConnectIcon from '../icon/logo_connect.png';
@@ -426,11 +429,15 @@ App.prototype.setDblclickTimer = function() {
   }, 350);
 };
 
+// `#t` 的**唯一** focus 漏斗。preventScroll 是防禦性的第二道鎖：#t 平時停在
+// left:-10000px，只要哪天它變成某個捲動容器的子孫，focus() 的自動 scrollIntoView
+// 就會把那個容器捲飛（見 index.html 的註解）。目前 #t 掛在 #BBSWindow 底下、
+// 結構上不會發生，但這行成本是零。
 App.prototype.setInputAreaFocus = function() {
   if (this.modalShown)
     return;
   //this.DocInputArea.disabled="";
-  this.inputArea.focus();
+  this.inputArea.focus({ preventScroll: true });
 };
 
 // modalShown 是終端機鍵盤／焦點的總閘門（讀取點散在 term_view.js 的 shouldAcceptInput
@@ -464,9 +471,12 @@ App.prototype.setModalOpen = function(source, open) {
     this.setInputAreaFocus();
 };
 
-// FIXME: Injected when enabled. See: src/components/ContextMenu/index.js
+// 即時看板小幫手的兩個入口：預設 noop，只有 pref 打開時才被注入真的實作
+// （components/ContextMenu/index.jsx 的 useEffect 依 liveHelperEnabled 綁定／解綁）。
+// 這是刻意的——消費端在 term_view.js（End 鍵的 onToggle…、任何非 Alt 鍵的
+// onDisable…），不能為了「功能沒開」在熱路徑上到處加判斷。onToggle 回 true 代表
+// 按鍵已被吃掉，noop 回 undefined ⇒ End 會落到原本的行為。
 App.prototype.onToggleLiveHelperModalState = noop;
-// FIXME: Injected when enabled. See: src/components/ContextMenu/index.js
 App.prototype.onDisableLiveHelperModalState = noop;
 
 App.prototype.switchToEasyReadingMode = function(doSwitch) {
@@ -673,16 +683,6 @@ App.prototype.onDOMPaste = function(e) {
   }
 };
 
-App.prototype.onSymFont = function(content) {
-  console.log("using " + (content ? "extension" : "system") + " font");
-  var font_src = content ? 'src: url('+content.data+');' : '';
-  var css = '@font-face { font-family: MingLiUNoGlyph; '+font_src+' }';
-  var style = document.createElement('style');
-  style.type = 'text/css';
-  style.innerHTML = css;
-  document.getElementsByTagName('head')[0].appendChild(style);
-};
-
 App.prototype.doSelectAll = function() {
   window.getSelection().selectAllChildren(this.view.mainDisplay);
 };
@@ -802,8 +802,8 @@ App.prototype.getFirstGridOffsets = function() {
 
 // 畫面座標 → 格子座標。**欄的那一半刻意委給 mouse_geometry.colFromClientX**：
 // 文章左側的退出提示帶（#exitHintBand）必須與這裡算出來的可點區逐格對齊，兩邊
-// 共用同一份實作才不會漂移（專案裡另有 term_view.convertMN2XYEx 一套原點公式，
-// 多了 +10 與 bbsViewMargin，用錯就差十幾個像素）。
+// 共用同一份實作才不會漂移。（歷史上 term_view 另有一套 convertMN2XYEx 原點公式，
+// 多了 +10 與 bbsViewMargin，用錯就差十幾個像素；已刪除，見 mouse_geometry.js 開頭。）
 App.prototype.clientToPos = function(cX, cY) {
   var y;
   var h = this.view.innerBounds.height;
@@ -813,7 +813,30 @@ App.prototype.clientToPos = function(cX, cY) {
     y = cY - parseFloat(this.view.firstGridOffset.top);
   }
   var col = colFromClientX(cX, this.gridGeometry());
-  var row = Math.floor(y / (this.view.chh * this.view.scaleY));
+  var rowH = this.view.chh * this.view.scaleY;
+  var row = Math.floor(y / rowH);
+
+  // 列表好讀的平滑捲動：body 區整體上移了 frac ⇒ 那一段的列號要自己補回來，
+  // 否則停在半列時點下去會開到上一篇（游標底色也會標錯列）。header／footer 不受
+  // 影響（它們不在捲動視口裡）。視口底部露出的那一小條（overscan 列）給它
+  // **渲染 index 24**，與 buildListWindowLines 放它的位置一致；不能用 3+20=23，
+  // 那是 footer 的列號。
+  var listFrac = this._listScrollFrac();
+  if (listFrac > 0) {
+    var bodyTop = LIST_HEADER_ROWS * rowH;
+    var bodyRows = this.buf.rows - 4;
+    if (y >= bodyTop && y < bodyTop + bodyRows * rowH) {
+      var bodyIdx = Math.floor(
+        (y - bodyTop + listFrac * this.view.scaleY) / rowH
+      );
+      if (bodyIdx > bodyRows) bodyIdx = bodyRows;
+      if (bodyIdx < 0) bodyIdx = 0;
+      return {
+        col: col,
+        row: bodyIdx === bodyRows ? this.buf.rows : LIST_HEADER_ROWS + bodyIdx
+      };
+    }
+  }
 
   if (row < 0)
     row = 0;
@@ -821,6 +844,13 @@ App.prototype.clientToPos = function(cX, cY) {
     row = this.buf.rows-1;
 
   return {col: col, row: row};
+};
+
+// 列表好讀的次列位移（未縮放的內容 px）。0＝沒有位移或不適用（其他畫面、frozen
+// 快照）。座標換算與 render 都以它為準。
+App.prototype._listScrollFrac = function() {
+  if (!this.listSession || this.buf.listRenderMode !== 'buffer') return 0;
+  return (this.listSession.scrollFrac && this.listSession.scrollFrac()) || 0;
 };
 
 // 各滑鼠入口的生效與否。總開關（buf.useMouseBrowsing）與四個子開關（view 上的
@@ -832,7 +862,8 @@ App.prototype.mouseGates = function() {
     mouseLeftClick: this.view.mouseLeftClick,
     mouseMisclickGuard: this.view.mouseMisclickGuard,
     mouseMiddleClick: this.view.mouseMiddleClick,
-    mouseWheel: this.view.mouseWheel
+    mouseWheel: this.view.mouseWheel,
+    mouseWheelSmoothScroll: this.view.mouseWheelSmoothScroll
   });
 };
 
@@ -875,7 +906,8 @@ App.prototype.onMouse_click = function (e) {
   var action = this.buf.mouseAction;
   var targetRow = this.buf.mouseActionRow;
 
-  // TODO make a responder stack.
+  // 分派順序＝好讀先收狀態機，再由下面的 switch 送真正的按鍵。點擊優先權表在
+  // docs/mouse.md，動作本身由純函式決策層 mouse_regions.js 決定（四種動作）。
   this.easyReading._onMouseClick(e);
   if (e.defaultPrevented)
     return;
@@ -1074,6 +1106,10 @@ App.prototype.onPrefChange = function(name, value) {
     case 'mouseWheel':
       this.view.mouseWheel = Number(value) || 0;
       break;
+    // 純事件層行為（下一個 wheel event 就生效），不影響已畫出來的畫面 ⇒ 免 redraw。
+    case 'mouseWheelSmoothScroll':
+      this.view.mouseWheelSmoothScroll = !!value;
+      break;
     case 'copyOnSelect':
       this.copyOnSelect = value;
       break;
@@ -1081,7 +1117,8 @@ App.prototype.onPrefChange = function(name, value) {
       this.endTurnsOnLiveUpdate = value;
       break;
     case 'enablePicPreview':
-      // TODO: move this to ImagePreview.
+      // 刻意存成 view 欄位：它在 redraw 時才被讀（term_view 傳成 hoverPreview 給
+      // src/render/），所以真相源必須活在渲染鏈能同步讀到的地方，不是預覽元件裡。
       this.view.enablePicPreview = value;
       break;
     // imgur 快取代理：只更新 imgur_proxy.js 的模組 config，**不 redraw**。已解析過的
@@ -1166,8 +1203,16 @@ App.prototype.onPrefChange = function(name, value) {
     case 'dbcsDetect':
       this.view.dbcsDetect = value;
       break;
+    case 'enableBell':
+      setBellEnabled(!!value);
+      break;
     case 'lineWrap':
-      this.conn.lineWrap = value;
+      // 消費端是 term_view.onTextInput 的 this.lineWrap 與 list_session.onPaste 的
+      // this._view.lineWrap ——「貼上時每滿 N 欄插一個 \r」的欄寬，不是畫面寬度
+      // （那是 termSize.cols）。曾經寫進 this.conn.lineWrap，但那個欄位沒有任何
+      // 讀取點，且 conn 每次重連都會被換掉 ⇒ 這個 pref 整個是死的（本函式把所有
+      // 錯誤都吃掉，接錯線連一聲都不會響）。守護 tests/unit/pref_line_wrap.test.js。
+      this.view.lineWrap = value;
       break;
     case 'fontFace':
       var fontFace = value;
@@ -1444,8 +1489,12 @@ App.prototype.mouse_over = function(e) {
     this.setInputAreaFocus();
 };
 
-// 滾輪＝上下翻頁（唯一動作）。改版前有三組設定（素滾／按住右鍵／按住左鍵）×
-// 四種動作，全部收斂成單一 pref `mouseWheel`（0=關閉 1=上下頁）。
+// 滾輪。改版前有三組設定（素滾／按住右鍵／按住左鍵）× 四種動作，全部收斂成單一
+// pref `mouseWheel`（0=關閉 1=上下頁）。三種畫面三種歸屬：
+//   原生 24 列   → 送 PageUp/PageDown 給 server（server 端翻頁，沒有逐行的可能）
+//   文章好讀     → 早退，完全交給瀏覽器原生捲動（不受 mouseWheel 影響）
+//   列表好讀     → 本地視窗操作：預設**平滑捲動**（pref mouseWheelSmoothScroll），
+//                 關掉才回到一次一頁
 //
 // 關閉時**直接 return，不 preventDefault** —— 語意是「我們完全不碰滾輪」。原生
 // 24 列模式下畫面沒有可捲距離（#BBSWindow 是 fixed + overflow:hidden，.main 的
@@ -1464,7 +1513,8 @@ App.prototype.mouse_scroll = function(e) {
     e.preventDefault();
     return;
   }
-  if (!this.mouseGates().wheel)
+  var gates = this.mouseGates();
+  if (!gates.wheel)
     return;
   // if in easyreading, use it like webpage
   if (this.view.useEasyReadingMode && this.buf.pageState == 3) {
@@ -1478,7 +1528,20 @@ App.prototype.mouse_scroll = function(e) {
   // Frozen（開文交易進行中）整個吞掉，比照鍵盤的開文行為。
   if (this.buf.listRenderMode === 'buffer' || this.buf.listRenderMode === 'frozen') {
     if (this.buf.listRenderMode === 'buffer' && this.listSession) {
-      this.listSession.onWheel(up ? 'pgup' : 'pgdn');
+      if (gates.wheelSmoothScroll) {
+        // 平滑捲動：換算成距離交給 ListSession 的緩動器（分幀吃掉＋次列位移）。
+        // 座標系換算是關鍵：wheel 的像素是**螢幕上的**，而視窗較矮時整個終端機
+        // 被 scaleY 縮放過（term_view.setTermFontSize）⇒ 除回去才是內容座標，
+        // 那才是 ListSession/scrollTop 用的單位。漏掉就會捲太多。
+        var scaleY = this.view.scaleY || 1;
+        var px = wheelDeltaToPx(e, {
+          lineHeight: this.view.chh * scaleY,
+          pageLines: this.buf.rows - 4
+        });
+        if (px) this.listSession.onWheelScrollPx(px / scaleY);
+      } else {
+        this.listSession.onWheel(up ? 'pgup' : 'pgdn');
+      }
     }
     e.stopPropagation();
     e.preventDefault();

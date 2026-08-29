@@ -1,6 +1,15 @@
+/* 終端機等寬格線的字寬契約就在這支字型裡：ASCII (U+0020–U+007E) 的 advance 是
+   512/1024 = **正好 0.5em**（= term_view 的 chw = chh/2），符號區（→ ← ● □ …）
+   是 1024 = 1em（兩格）。Windows 有 local MingLiu，Mac 沒有 —— 所以在 Mac 上
+   整個格線契約押在這個 webfont 上，還沒落地時 ASCII 會退回系統 monospace
+   （Menlo 的 advance 是 0.602em）⇒ 整列橫向偏 20%，而游標的欄位算術不會跟著偏。
+
+   font-display: block ＝ 寧可先不顯示，也不要用錯誤字寬畫一次再跳。搭配
+   main.jsx 的 loadTerminalFont()（startApp 前 await 這支字型）。 */
 @font-face {
   font-family: SymMingLiu;
   src: url('../fonts/symmingliu.woff') format("woff");
+  font-display: block;
 }
 
 /* 全域 border-box：原本由 bootstrap CDN 提供（終端機逐列排版以此為前提）；
@@ -183,6 +192,20 @@ a:link,a:visited,a:active,a:hover {
 #easyReadingLastRow > span {
   display:block;
   color:#C0C0C0;
+  white-space: pre;
+}
+
+/* 列表好讀模式的 body 捲動視口（平滑捲動）。高度由 JS 設成 body 列數 × 列高，
+   內容比它多一列，多出來的部分靠 overflow:hidden 裁掉；scrollTop 就是「捲掉了
+   幾個像素」。#mainContainer > span 是直系選擇器，列包進這一層之後要補等效樣式
+   （同 .mergedImageBlock 的處理）。 */
+.listBodyView {
+  overflow: hidden;
+  scrollbar-width: none;
+}
+.listBodyView > span {
+  display: block;
+  color: #C0C0C0;
   white-space: pre;
 }
 

@@ -4,6 +4,7 @@ import { Event } from './event';
 import { ColorState } from './term_ui';
 import { u2b, b2u, parseStatusRow, parseListRow } from './string_util';
 import { cjkUrlExtension } from './url_cjk';
+import { ringBell } from './bell';
 import cursorBack from '../cursor/back.png';
 import {
   ACT_NONE,
@@ -354,8 +355,10 @@ TermBuf.prototype = {
       var ch = str[i];
       switch (ch) {
       case '\x07':
-        // FIXME: beep (1)Sound (2)AlertNotification (3)change icon
-        // should only play sound
+        // BEL。pttbbs 的 bell()（mbbsd/term.c）在 captcha／棋類／水球等處會送。
+        // 只出聲，不做視覺提示：畫面通知在這裡分不出「哪件事在叫」，反而會誤導。
+        // ringBell 自己吃掉所有錯誤並節流，這條熱路徑上不需要任何守門。
+        ringBell();
         continue;
       case '\b':
         this.back();
@@ -430,8 +433,13 @@ TermBuf.prototype = {
         var ch = line[col];
         if (ch.needUpdate)
             needUpdate=true;
-        // all chars > ASCII code are regarded as lead byte of DBCS.
-        // FIXME: this is not correct, but works most of the times.
+        // Big5 模式下 isFullWidth() 就是「位元組 > 0x7f」（見本檔 isFullWidth）。
+        // 這是近似而非判準——Big5 的 trail byte 同樣落在 0x81..0xFE，單看一格分不出
+        // 頭尾。之所以還是對的，是因為這裡**每一列都從 col 0 起逐對配對**：認出頭就
+        // ++col 跳過尾，所以只要該列的高位元組成雙就不會錯。
+        // 失效條件（無法在這一層修）：列內出現奇數個高位元組時（半個全形字被覆蓋、
+        // 或全形字被畫面右緣切斷），其後的配對整個位移一格。cell-based 的終端機沒有
+        // byte-stream 狀態可以回推，PTT server 端的 pfterm 也受同樣限制。
         if ( this.isFullWidth(ch.ch) && (col + 1) < cols ) {
           ch.isLeadByte = true;
           ++col;
@@ -443,10 +451,13 @@ TermBuf.prototype = {
           if ( ch0.needUpdate != ch.needUpdate ) {
             ch0.needUpdate = ch.needUpdate = true;
           }
-        } else if (ch.isleadbyte && (col+1) < cols) {
-          var ch2 = line[col+1];
-          ch2.needUpdate = true;
         }
+        // 這裡曾有一段 `else if (ch.isleadbyte && ...) line[col+1].needUpdate = true`
+        // ——欄位名大小寫打錯（正確是 isLeadByte），條件恆為 undefined，2014 年寫下後
+        // 從未執行過。已刪：它要保證的「全形字的頭被半形字蓋掉時，被孤立的尾格也要
+        // 重畫」，puts() 在寫入當下就給了（`if (ch2.isLeadByte) line[cur_x].needUpdate
+        // = true`）。守護 tests/unit/term_buf_dirty_rows.test.js「覆蓋全形字的 lead
+        // byte」。別把它加回來。
         ch.isLeadByte = false;
       }
 
@@ -458,7 +469,6 @@ TermBuf.prototype = {
           var uris = line.uris;
           var nuris = uris.length;
 
-          // FIXME: this is inefficient
           for (var iuri = 0; iuri < nuris; ++iuri) {
             var uri = uris[iuri];
             line[uri[0]].startOfURL = false;

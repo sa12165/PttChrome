@@ -37,6 +37,10 @@ BBS 畫面每收到一頁就整份重畫，React 在這裡只剩成本（實錄�
   純邏輯（解析／狀態機／轉碼）＋核心畫面渲染（`tests/unit/helpers/mount_screen.js` 掛 `ScreenController`／
   `buildRow` + 假 TermChar；週邊 React UI 仍用 @testing-library/react）。
   **含 JSX 的測試檔用 `.test.jsx`**。mock/timer 用 `vi.*`（globals 開啟，`describe/test/expect` 免 import）。
+  **模組載入一律放檔案層級，不准在 test body 裡 `await import('../../src/...')`**：那會把整條依賴鏈的
+  冷載入算進該 case 的 5000ms testTimeout ⇒ 機器忙時偶發紅（`Test timed out in 5000ms`），單獨重跑又綠，
+  而且紅的是一支跟載入無關的測試名稱。唯一例外是模組有 page-lifetime 快取、必須配 `vi.resetModules()`
+  重載（如 `auto_login_credentials.test.js`）。靜態守護 `tests/unit/module_load_cost.test.js`。
   增強功能的逐列判斷一律放 `comment_parse.annotateComment` 並在此回歸守護（e2e 素材不穩，純邏輯先測）。
 - **Integration（雲端同步流程）**：`yarn test:integration`（Vitest + 官方 **Firebase Emulator Suite**：真 modular SDK
   + Auth/Firestore emulator + 真 `firestore.rules`，無 mock）。emulator 跑在 **Docker**（pinned `andreysenov/firebase-tools`，內含 firebase-tools+JDK；vitest 在 host 連容器埠），所以**本機跑需 Docker**（不再需本機裝 Java/firebase-tools）。orchestration 見 `scripts/run-integration.mjs`。
@@ -81,6 +85,11 @@ BBS 畫面每收到一頁就整份重畫，React 在這裡只剩成本（實錄�
     「查無」而不是報錯 ⇒ 很容易誤判成「這行為不在開源碼裡」。用
     `grep -rlF "$(printf '登入太頻繁' | iconv -f UTF-8 -t BIG5)" --include=*.c 3rd_script/pttbbs`，
     讀片段時 `| iconv -f BIG5 -t UTF-8`。
+  - **live spec 的選文／等待不准靠執行順序或固定 timeout**（2026-08-29「樓層編號」整輪紅、單獨跑綠）：
+    pref 會跨 spec 殘留（`resetSession` 現在一併關 `enableEasyReadingList`）、`End`＋`Enter` 會開到
+    置底公告（read.c `last_line` 含置底 ⇒ 十幾頁、常常零推文）。選文用
+    `helpers/ptt.js#pickListArticleWithComments`＋`openArticleByNumber`（推文數列表上就看得到，
+    開文前即可保證），等待綁內容條件。詳見 `tests/e2e/README.md`「選文與等待」。
   - **e2e 一律前景跑，不可丟背景（`run_in_background`）**：`.claude/settings.json` 的 **Stop hook 是每個
     assistant turn 結束就觸發**（不是 session 結束），一旦旗標檔在就跑 `kill-dev-server.js` → 把 Playwright
     自己起的 dev server 砍掉。症狀：前幾條綠，之後整批 `page.goto: net::ERR_CONNECTION_REFUSED`，
@@ -100,6 +109,22 @@ BBS 畫面每收到一頁就整份重畫，React 在這裡只剩成本（實錄�
   （例：`pageLines` 用 `JSON` 克隆剝掉 TermChar prototype 方法 → `ch.isStartOfURL is not a function`）。不可只靠 unit + build 綠就交付。
 - **離線重放（不連真實 PTT 也能驗依賴特定文章的 case）**：`yarn test:e2e:offline`（stub WebSocket 重放 byte cassette，
   真瀏覽器/真渲染）；Layer2 `tests/unit/replay_fixture.test.js` 用真實 `findPageOverlap` 純 node 重建跨頁去重。
+  - **offline e2e 不接受 flaky：不是時序問題，是斷言不夠嚴謹。** 量元素座標一律走
+    `tests/e2e/helpers/layout.js`（`waitPreviewsSettled` / `waitRectStable` / `assertElementUnder` /
+    `stableCommentRow` / `plainLeftEdge`），**禁止**用 `waitForTimeout` 當版面等待。理由：行內預覽是
+    延遲載入的佔位盒，`scrollIntoView` 本身會觸發載入 ⇒ 捲完立刻量的 rect 之後還會位移，點下去落在
+    別的元素上，斷言退化成沉默的 0（50fa35c 的現場）。靜態守護 `tests/unit/e2e_layout_settle.test.js`。
+  - **本機預設情境是「圖片秒回」，測不出上面那類 bug。** 改渲染／版面 code 時除 `yarn test:e2e:offline`
+    外加跑 **`yarn test:e2e:offline:adverse`**（圖片改成 慢 5.2s／404／301／混合四桶，決定性）。
+    CI 有對應的平行 job `test-e2e-offline-adverse`。情境表與 CONFIRMED 事實（產品端**沒有**圖片載入
+    timeout；Chromium 不跟隨 `route.fulfill` 的 301）見 `docs/offline-replay-testing.md`。
+    - **本機（Windows）連續開太多 Chromium 會整個 worker 掛掉**：`worker process exited unexpectedly
+      (code=3221225794)`＝`STATUS_DLL_INIT_FAILED`（新進程連 DLL 都初始化不了）。判準＝**零
+      AssertionError、失敗案例耗時 0ms、同批 spec 在一般 offline 全綠** ⇒ 環境問題，
+      **不要因此去改被測 code**。這條已自動化：該 script 走 `scripts/run-adverse-e2e.mjs`
+      （一桶一個獨立 playwright 進程＋冷卻＋只在命中指紋時 `--last-failed` 補跑；本機關掉錄影）。
+      **exit code 分三種：0 綠／1 真失敗／2 環境問題**。逃生門 `--only=<桶,桶>`／`--batch=spec`／
+      `--no-retry`。細節與「為何重用 BrowserContext 沒用」見 `docs/offline-replay-testing.md`。
   素材一次性錄製：`yarn record:cassette`（**guest-only**，capture 為 article-scoped 不含帳號）。細節見 `docs/offline-replay-testing.md`。
   - **`yarn test:e2e:offline` 含 `offline-firefox` project**（只跑 `selection.offline.spec.js`）：**本機需先
     `yarn playwright install firefox`**，否則整批 `browserType.launch: Executable doesn't exist`。選取／複製類
@@ -160,6 +185,7 @@ BBS 畫面每收到一頁就整份重畫，React 在這裡只剩成本（實錄�
   - **deploy job 偶發 `actions/deploy-pages@v5` timeout**：Pages 服務端卡在 `deployment_in_progress`，輪詢約 76s 後 `##[error]Timeout reached, aborting!` 並取消部署 → **測試/build 全綠但 run 紅、站台停在舊 commit**。屬 Pages 基礎設施問題，非本專案 code。判準：該 run 只有 `deploy` 一個 job 紅、`test-*`／`build` 全綠。處置：重跑失敗 job（`POST /repos/{o}/{r}/actions/runs/{id}/rerun-failed-jobs`；`ci:status --rerun-failed` 目前只認 integration flaky，不會自動重跑它）。**事後必須確認 `github-pages` 環境最新一筆 deployment 的 sha 是本次 commit 且 state=success**，否則站台仍是舊版。
   - **integration job（Firebase Emulator in Docker）偶發 timeout** 是已知 flaky（CI 冷啟動拉 image + 首次 Firestore 寫入超過 poll deadline，症狀 `waitForCloud timeout: upload`）。緩解手段已用盡（`INTEGRATION_TIMEOUT_MS`、CI vitest `retry: 2`、`scripts/run-integration.mjs` 的 `waitHttp` 就緒輪詢）→ 確認非真錯後用 `yarn ci:status --rerun-failed`。本機跑 `yarn test:integration` 需 **Docker**（無 Docker 只能靠 CI）。
   - **GITHUB_TOKEN 造成的事件不會再觸發 workflow**（GitHub 防遞迴，例外只有 `workflow_dispatch`／`repository_dispatch`）：任何在 Actions 內做 merge／push 的步驟若用 `secrets.GITHUB_TOKEN`，產生的 push **不會**觸發 `deploy.yml` 的 `on: push` → 站台靜默停在舊 commit（實例 PR #16）。`dependabot-auto-merge.yml` 因此改用 GitHub App installation token（secret `AUTOMERGE_APP_CLIENT_ID`／`AUTOMERGE_APP_PRIVATE_KEY`），勿改回 GITHUB_TOKEN。查驗方式：merge commit 的 SHA 上要看得到 `Deploy to GitHub Pages` run（只有 `Push on dev` 那個 `dynamic` run 是 CodeQL default setup，不算）。
+  - **Code scanning（CodeQL default setup）的 alert 用 REST API 處理**：`PATCH /repos/{o}/{r}/code-scanning/alerts/{n}`，body `{state, dismissed_reason, dismissed_comment}`；`dismissed_reason` 只吃 `false positive`／`won't fix`／`used in tests`。兩個硬限制：**`dismissed_comment` 上限 280 字元**（超過回 422，訊息才會說「Only 280 characters are allowed」，先寫長版會白做一次）、**已 dismissed 的 alert 不能直接改 comment**（回 400 `Alert is already dismissed.`），要改必須先 `{"state":"open"}` 再重新 dismiss。
   - **新增 CI job 時步驟順序必須是 `setup-node（取 node）→ corepack enable → setup-node（帶 cache:yarn）`**（照抄現有 job）：`cache: yarn` 會在 corepack 生效前跑 `yarn cache dir`，命中 runner 內建 yarn 1.22 → 遇 `packageManager: yarn@4.x` 直接掛在 setup-node 步（症狀 `current global version of Yarn is 1.22.22`）。
 - 增強功能整合的活躍陷阱（讀畫面用 `buf.getRowText` 而非 innerText、勿把 build.target 降回舊瀏覽器等）見 `docs/enhanced-addon.md`「踩坑筆記」A 段。
 - 渲染已統一單路徑（兩模式都走 `ScreenController`）見 `docs/easy-reading.md`「render 單軌」。改渲染路徑前先讀它。

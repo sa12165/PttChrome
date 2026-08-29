@@ -284,6 +284,53 @@ live 測試讀的是**最新文章**，熱門板（C_Chat）的推文會在斷�
 需要「完全等值」等級的嚴格比對就寫離線 cassette 版（bytes 固定，可逐列 `toEqual`），
 見 `offline/enhance.offline.spec.js` 同名案。
 
+## 規範：選文與等待不准靠執行順序或固定 timeout
+
+2026-08-29 `enhance.spec.js`「樓層編號」在整輪 live 裡紅（60s test timeout），單獨重跑
+卻 7 秒就綠 —— 兩個原因疊在一起，都是**判定法**的問題，不是 PTT 不穩：
+
+| 症狀來源 | 事實 | 修法 |
+|---|---|---|
+| pref 跨 spec 殘留 | `easy-reading-list.spec` 打開 `enableEasyReadingList` 之後沒人關，之後跑的 spec 在「列表好讀開著」的狀態下操作列表，End/Enter 走的是 ListSession 交易路徑，落點與原生不同 | `resetSession` 一併關掉它（`helpers/ptt.js`）。**測試之間不該靠執行順序** |
+| 用 End → Enter 當「開最新一篇」 | End ＝ read.c 的 `last_line`，**包含置底文**。C_Chat 的置底是十幾頁的公告 ⇒ 累積跑不完；公告常常零推文 ⇒ 樓層／推文者類斷言必紅 | `pickListArticleWithComments(page, {min, max})`：推文數就印在列表上（`bbs.c#readdoent`：1..99 印 `%2d`、≥100 印「爆」）⇒ **開文前**就能保證「有推文且不是爆文」，再 `openArticleByNumber` 跳號開文 |
+
+連帶規則：
+
+- **等待綁內容條件**：`openArticleByNumber` 等的是「游標列的序號＝目標」（`waitForFunction`），
+  不是 `waitForTimeout(1200)`。跳號回應的到達時間取決於連線，睡固定秒數不是慢就是不夠。
+- **把前提斷言出來**：`waitEasyReadingComplete` 逾時不丟例外，呼叫端要自己
+  `expect(acc.reachedEnd).toBe(true)`；否則「只累積到一半」會紅在後面的遞增檢查上，
+  看起來像功能壞了。
+- 舊式「開了發現不合用 → 退回列表 → 往上一篇再試」的重試迴圈（本檔黑名單／pusher 兩案）
+  仍在，能動就先不動；新測試一律用上面的選文 helper。
+
+### 好讀累積與行內預覽的等待（2026-08-29，`easy-reading.spec.js`「自動行內開圖」）
+
+同一條 spec 整輪 live 紅／紅／綠，乾淨樹對照過 ⇒ 不是被測 code，是等待條件在賭：
+
+| 舊寫法 | 事實 | 後果 |
+|---|---|---|
+| `Enter` 後 `waitForTimeout(4500)` 當「累積完」 | 好讀是自動翻頁，時間隨文長／連線變動 | 長文那時還在翻，`easy_reading` 同時在控 `.main` 的 scrollTop ⇒ 測試自己寫的 `scrollTop = y` 被拉走，佔位盒從沒進視野 |
+| 手寫單趟 seek：每格固定 `sleep(250)` 就往下捲 | mount 鏈＝IntersectionObserver → `renderInto`（React root）→ `requestPreview` promise → commit | 掃過去那格接著被 far observer 卸掉 ⇒ 掃完整篇 0 個預覽節點（現場：7 個可預覽連結、`found=0`、`scrollTop=1752`） |
+| `End` → `Enter` 開最新一篇 | `End` 含置底公告 | 開到十幾頁的公告 ⇒ 更難累積完 |
+
+規則（守護 `tests/unit/e2e_live_wait_contract.test.js`，純靜態掃描）：
+
+- 累積一律 `waitEasyReadingComplete`，**不准**用固定睡眠當終點。
+- 行內預覽的 seek 一律 `helpers/layout.js#seekMountedPreview`（`scrollIntoView` +
+  內容條件），**不准**自己寫 `scrollTop = …`。
+- **live 不可用 `waitPreviewsSettled`**：它要求 `.previewLoading` 歸零，而真圖床
+  （imgur stall，`docs/imgur-latency-research.md`）＋「產品端沒有圖片載入 timeout」
+  ⇒ 讀取指示器可以永遠留著 ⇒ settle 必逾時，只是換一種假紅。它是 offline 專用
+  （那邊有受控 route 與在途請求計數）。
+- **斷言分三層**，因為相依對象不同：
+  1. 有可預覽連結 ⇒ 必有 `.inlinePreviewSlot`（`enableLinkInlinePreview` 被寫死 false
+     時一個都不會建 —— 這就是本 spec 要守的 regression）。與外網無關，必驗。
+  2. 捲到 slot ⇒ `seek.mounted`（slot 裡出現預覽產物，含讀取中指示器）。與外網無關，必驗。
+  3. `seek.mediaFound` / `seek.loadedImage` ⇒ 才驗媒體節點與點圖放大／縮回。
+     **依賴圖床**，載不出來就 console 記錄後略過，不讓圖床決定 CI 顏色
+     （圖片載入的完整情境覆蓋在 offline 的 cache/slow/404/301 四桶）。
+
 ## 擴充
 
 新 spec 用 `shared` fixture + `resetSession`/`applyPrefs`/`gotoBoard`（見「共用登入 session」規則），例如
