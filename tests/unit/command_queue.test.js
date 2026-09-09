@@ -193,6 +193,43 @@ describe("CommandQueue", () => {
     expect(sent).toEqual(["42\r", "\x1b[D"]);
   });
 
+  // onSend / hasKind（2026-09-05，給前景導覽鍵排在背景 prefetch 後面用）。
+  test("onSend 在 keys 送出前恰好觸發一次", () => {
+    const order = [];
+    const q = new CommandQueue({ send: k => order.push("send:" + k) });
+    q.enqueue(cmd("A", { kind: "jump-end", onSend: () => order.push("onSend") }));
+    expect(order).toEqual(["onSend", "send:A"]);
+    settleWith(q, true); // 完成後不得再觸發
+    expect(order.filter(o => o === "onSend").length).toBe(1);
+  });
+
+  test("排隊中的命令要等到真的送出才 onSend（被 flush 掉的永遠不觸發）", () => {
+    const { q } = makeQueue();
+    const first = vi.fn();
+    const second = vi.fn();
+    q.enqueue(cmd("A", { onSend: first }));
+    q.enqueue(cmd("B", { onSend: second }));
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled(); // 還在 pending
+    q.flushPending();
+    settleWith(q, true); // A 完成，B 已被丟掉
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  test("hasKind 同時看 in-flight 與 pending（連按去重的判準）", () => {
+    const { q } = makeQueue();
+    q.enqueue(cmd("A", { kind: "prefetch-down" }));
+    q.enqueue(cmd("B", { kind: "jump-end" }));
+    expect(q.hasKind("prefetch")).toBe(true); // in-flight
+    expect(q.hasKind("jump-")).toBe(true); // pending
+    expect(q.hasKind("leave")).toBe(false);
+    settleWith(q, true); // prefetch 完成 → jump-end 上線
+    expect(q.hasKind("prefetch")).toBe(false);
+    expect(q.hasKind("jump-")).toBe(true);
+    settleWith(q, true);
+    expect(q.hasKind("jump-")).toBe(false);
+  });
+
   test("探針不得重新武裝 hard：絕對上限＝hard＋探針窗，不是 2×hard", () => {
     // 症狀（列表好讀偶發長凍結）：_timedOut 的探針分支呼叫 _armBoth → hard 又
     // 拿到完整一份，單一命令最壞可達 2×hard（實測「畫面停住十幾秒」的來源）。
@@ -477,6 +514,48 @@ describe("CommandQueue", () => {
       q.enqueue(cmd("A", { timeoutMs: 250, onFail: fail }));
       vi.advanceTimersByTime(250);
       expect(settleWith(q, false)).toBe("miss");
+    });
+  });
+  // flushKind：兩種列表好讀（ListSession / BoardListSession）共用同一條佇列，而
+  // 「我收攤了」以前一律 flush() 整條。兩個 session 都掛在同一個 screenSettled 上，
+  // **同一幀**可能一邊收攤、另一邊剛排好 prefetch ⇒ 整條 flush 會把對方的命令
+  // 靜默殺掉（症狀：進板之後文章列表永遠只有一頁）。
+  describe("flushKind（限縮版 flush，只清自己的命令）", () => {
+    test("在飛的是別人的命令 → 一個都不動", () => {
+      const { q, sent } = makeQueue();
+      q.enqueue(cmd("A", { kind: "prefetch-down" }));
+      q.enqueue(cmd("B", { kind: "prefetch-up" }));
+      q.flushKind("brd-");
+      expect(q.inFlightKind).toBe("prefetch-down");
+      settleWith(q, true);
+      expect(sent).toEqual(["A", "B"]); // 排隊中的那條照樣送得出去
+    });
+
+    test("在飛的是自己的命令 → 收掉並把別人排隊中的命令接上線", () => {
+      const { q, sent } = makeQueue();
+      q.enqueue(cmd("A", { kind: "brd-fetch-down" }));
+      q.enqueue(cmd("B", { kind: "prefetch-up" }));
+      q.flushKind("brd-");
+      expect(sent).toEqual(["A", "B"]);
+      expect(q.inFlightKind).toBe("prefetch-up");
+    });
+
+    test("排隊中只清掉前綴相符的，別人的留著", () => {
+      const { q, sent } = makeQueue();
+      q.enqueue(cmd("A", { kind: "prefetch-down" }));
+      q.enqueue(cmd("B", { kind: "brd-fetch-down" }));
+      q.enqueue(cmd("C", { kind: "prefetch-up" }));
+      q.flushKind("brd-");
+      settleWith(q, true); // A 完成
+      expect(sent).toEqual(["A", "C"]); // B 被清掉，C 保留
+    });
+
+    test("flush 掉在飛的命令時通知 onFlushed（AidNavigation 那類持有輸入鎖的呼叫端）", () => {
+      const { q } = makeQueue();
+      const onFlushed = vi.fn();
+      q.enqueue(cmd("A", { kind: "brd-leave", onFlushed }));
+      q.flushKind("brd-");
+      expect(onFlushed).toHaveBeenCalled();
     });
   });
 });

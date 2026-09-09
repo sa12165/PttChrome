@@ -93,6 +93,10 @@ const optionsOf = (input) => {
 const selectsIn = (panel) =>
   [...panel.querySelectorAll("input[aria-haspopup='listbox']")];
 
+// 位置會隨欄位增減而變 ⇒ 一律用 aria-label 指名要驗哪一個 Select。
+const selectByLabel = (panel, key) =>
+  selectsIn(panel).find((el) => el.getAttribute("aria-label") === i18n(key));
+
 beforeAll(() => setupI18n());
 beforeEach(() => window.localStorage.clear());
 
@@ -180,7 +184,7 @@ describe("設定頁：滑鼠分頁", () => {
 
   test("中鍵是三選一：關閉／貼上／左方向鍵（沒有 Enter）", () => {
     const panel = openMouseTab();
-    expect(optionsOf(selectsIn(panel)[0])).toEqual([
+    expect(optionsOf(selectByLabel(panel, "options_mouseMiddleClick"))).toEqual([
       i18n("options_none"),
       i18n("options_doPaste"),
       i18n("options_leftKey"),
@@ -189,11 +193,56 @@ describe("設定頁：滑鼠分頁", () => {
 
   test("滾輪是二選一：關閉／上下頁", () => {
     const panel = openMouseTab();
-    const selects = selectsIn(panel);
-    expect(optionsOf(selects[selects.length - 1])).toEqual([
+    expect(optionsOf(selectByLabel(panel, "options_mouseWheel"))).toEqual([
       i18n("options_none"),
       i18n("options_pageUpDown"),
     ]);
+  });
+
+  // 瀏覽器返回攔截（觸控板左滑手勢／側鍵／Alt+←／工具列）：**一個 pref**，
+  // 跟著總開關 disabled（上面「每一個子項都 disabled」那條會掃到所有 Select）。
+  test("返回攔截是二選一：關閉／左方向鍵", () => {
+    const panel = openMouseTab();
+    expect(optionsOf(selectByLabel(panel, "options_mouseBackNav"))).toEqual([
+      i18n("options_none"),
+      i18n("options_leftKey"),
+    ]);
+  });
+
+  test("預設開啟", () => {
+    const panel = openMouseTab();
+    expect(selectByLabel(panel, "options_mouseBackNav").value).toBe(
+      i18n("options_leftKey"),
+    );
+    expect(DEFAULT_PREFS.mouseBackNav).toBe(1);
+  });
+
+  // 手勢與側鍵已合併成同一條實作 ⇒ 設定頁不可以再有兩格（留兩個旗標只是多一處
+  // 出錯，而且它們永遠會一起開關）。
+  test("舊的兩格已經不在設定頁上", () => {
+    const panel = openMouseTab();
+    expect(panel.querySelector("[name='mouseSwipeHorizontal']")).toBeNull();
+    expect(panel.querySelector("[name='mouseBackButton']")).toBeNull();
+  });
+
+  test("關掉返回攔截 → 寫進 pref", () => {
+    const panel = openMouseTab();
+    const input = selectByLabel(panel, "options_mouseBackNav");
+    fireEvent.click(input);
+    fireEvent.click(
+      [...document
+        .getElementById(input.getAttribute("aria-controls"))
+        .querySelectorAll("[role='option']")].find(
+        (el) => el.textContent === i18n("options_none"),
+      ),
+    );
+    closeModal();
+    expect(readValuesWithDefault().mouseBackNav).toBe(0);
+  });
+
+  test("代價與前提要寫在說明裡：離站方式＋手勢取決於系統設定", () => {
+    const panel = openMouseTab();
+    expect(panel.textContent).toContain(i18n("tooltip_mouseBackNav"));
   });
 
   test("滾輪關閉時「平滑捲動」也 disabled（它是滾輪的子行為）", () => {

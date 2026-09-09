@@ -17,6 +17,8 @@ grep -rlF "$(printf '登入太頻繁' | iconv -f UTF-8 -t BIG5)" --include=*.c 3
 
 讀出來的片段要看得懂則反向轉：`sed -n '200,240p' mbbsd/talk.c | iconv -f BIG5 -t UTF-8`。
 （ASCII 的識別字、函式名、`ANSI_COLOR` 這類巨集不受影響，一般 grep 即可。）
+含 NUL 的檔案會被 grep 判成 binary（只印 `Binary file … matches`、沒有行號）⇒
+**搜原始碼一律順手加 `-a`**，免得把「有找到但沒印行」誤讀成「查無」。
 
 ## 0. 版本對齊（先做，否則比對的是別的版本）
 
@@ -156,6 +158,14 @@ entry 列欄位（`readdoent`，`mbbsd/bbs.c`）——逐欄依 printf 序列推
 反白、最後一列非空 ⇒ `term_buf.setPageState` 每個分支都不命中，而它**沒有 reset 分支** ⇒ 沿用前一幀的
 `pageState`（列表 2）。任何「這個畫面是不是列表／選單」的判斷都不可以只看 `pageState`，要再問 §5.1 的輸入框指紋。
 
+**同一個沿用也涵蓋「整頁被換掉」的畫面，這是實際踩過的坑**：從列表按 `Ctrl-P` 發文，分類選擇畫面
+（`發表文章於【 board 】` ＋ `種類：1.閒聊 2.問題 …`）同樣一個 `setPageState` 分支都不命中、末列又非空
+（連 `pageState = 0` 的退路也不走）⇒ 沿用列表的 2。黑名單標註因此把板規／分類提示的每一列都當成
+「一列文章」去比對，只要 col≥29 撞到使用者的標題關鍵字就整列被換成通知列（2026-09-05 錄製檔
+`ptt-debug-20260905-122522`）。修法不是給 `setPageState` 加分支（沿用是刻意的），而是在消費端加**逐列
+指紋** `comment_parse#isListShapedRow` —— 就是本節說的「要再問指紋」。細節見
+`docs/enhanced-addon.md` 踩坑 A。
+
 ## 6. `\f`（Ctrl+L）確定性交易依據（v5 新增，全部 CONFIRMED）
 
 - **igetch 全域熱鍵**：`Ctrl('L')` → `redrawwin()+refresh()` 後 `continue`（`mbbsd/io.c` igetch switch）——`\f` 永不回傳給呼叫者，等同「插入一幀全幅重繪」。`vkey()`＝`igetch()`（io.c `vkey`），故**所有走 vkey 的輸入點都吃這條**。
@@ -167,6 +177,56 @@ entry 列欄位（`readdoent`，`mbbsd/bbs.c`）——逐欄依 printf 序列推
 - **零回應跳號（CONFIRMED，2026-08-25 live 錄製）：跳號到真游標「已經所在」的那一列 ⇒ 畫面零增量 ⇒ server 送 0 bytes。** 證據 `ptt-debug-20260825-105701#t=12562`：t=10151 的 prefetch 錨定腿已送過 `2381\r` 把游標停在 2381，t=12562 的 open-jump 又送同一個 `2381\r` → 整整 4002ms 一個 byte 都沒有，直到 client 的軟逾時探針才問出答案。**這不是「server 偶發抽風」，是可重現的協定行為**（PTT 只送畫面差異）。⇒ client 端所有 `<數字>\r` 交易一律尾附 `\f`（見 `src/js/list_session.js` 的跳號腿與 `docs/easy-reading-list.md` 不變量 7g）；同理，任何「目標可能等於現況」的鍵（End 於底端、Home 於頂端）都屬同一類。
 - `\f` 不取代 settle：全幅重繪仍拆包（OBUFSIZE 3072），settle 判「何時看」、`\f` 保證「必有得看」。
 - **重要限制（M1 實測，cchat-list-nav `\f` 版卷）：`redrawwin` 重繪的是 server 虛擬螢幕「現狀」，不會推進畫面狀態**——跳號完成後 server 虛擬螢幕的底列本來就空（§4 ✚：feeter 要到下一個 PARTUPDATE 才重畫），`跳號+\f` 的全幅重繪底列**仍空**＝classify 仍 transient、永非 clean-list。⇒ jump 落點判定必須維持 park 指紋（§4/§5），「jump 尾附 `\f` 換 clean-list expect」不成立。`\f` 的真實價值＝**零回應情境的確定性化**：timeout 探針（強制產生一幀可判定畫面）、相對命令 miss（`鍵+\f` 保證有回應）。
+
+## 6.1 「等一個按鍵」的三種畫面：指紋與收尾鍵（2026-09 CONFIRMED）
+
+§6 只在 `\f` 的脈絡下提過 pressanykey。這裡把「server 停在等一個按鍵」的三種畫面
+與各自的收尾鍵列全，client 端消費者是 `src/js/screen_dismiss.js`（滑鼠點空白處關框）
+與 `src/js/long_push_session.js`（長推文的取消收尾），**兩者共用同一組常數**。
+
+| 類別 | 畫面指紋（一律在**最後一列**，`vshowmsg` 固定 `move(b_lines, 0)`） | 收尾鍵 | 出處 |
+|---|---|---|---|
+| **pressanykey** | 整列 `▄`（`VMSG_PAUSE_PAD`）填滿、正中央 ` 請按任意鍵繼續 `（`VMSG_PAUSE`），配色 `VCLR_PAUSE`＝`ANSI_COLOR(1;37;44)` | **任一真按鍵** | `include/proto.h:657` `#define pressanykey() vmsg(NULL)`；`mbbsd/vtuikit.c:328` `vshowmsg(NULL)`；`include/vtuikit.h:39-40` |
+| **vmsg 橫幅** | ` ◆ <訊息>`（`VMSG_MSG_PREFIX`）＋右靠 ` [按任意鍵繼續]`（`VMSG_MSG_FLOAT`） | **任一真按鍵** | `mbbsd/vtuikit.c:439-455`；`include/vtuikit.h:41-42` |
+| **vgetstring 輸入欄** | 游標所在格白底黑字（`VCLR_INPUT_FIELD`＝`ESC[0;7m`），且該列不是從 col 0 就反白（見 §5.1） | **`Ctrl-C`** | `mbbsd/vtuikit.c:1346` `case Ctrl('C'): rt.icurr=rt.iend=0; buf[0]=0; abort=1;` ⇒ `getdata` 回 0 ⇒ 呼叫端一律當取消 |
+
+- 前兩者的等待迴圈都是 `do { i = vkey(); } while (i == 0);`（`vtuikit.c:445-448`）
+  ⇒ **任何真的按鍵**都收得掉。**但 `\f` 不算按鍵**（§6 那一條），所以一律用**空白鍵**。
+- `system_key_hook`（`io.c:228-247`）**只**吃 `Ctrl-L`（與 DEBUG 版的 `Ctrl-Q`），
+  `Ctrl-C` 原樣通過。
+- `vans` 也是輸入欄：`vtuikit.c:405-413` `vans()` → `vgets()` → `vgetstring()`
+  ⇒ ` 確定[y/N]:`、`要使用小天使匿名推文嗎？ [Y/n]:` 這類提示**游標都在反白欄裡**，
+  適用第三列。它們是「整行輸入」（要 Enter 才送出），單送一個 `Y` 只會進欄位。
+
+### `Ctrl-C` 不是「安全鍵」——逐條查證
+
+| 畫面 | 送 `Ctrl-C` 的結果 | 出處 |
+|---|---|---|
+| `vgetstring` 輸入欄 | 清空 ＋ abort ＝ 取消（**要的行為**） | `vtuikit.c:1346` |
+| `pressanykey` / `vmsg` | 當成一個按鍵收掉（可以，但慣例用空白鍵） | `vtuikit.c:445` |
+| `b_config` 的「若要進行修改請按 Ctrl-P，其它鍵直接離開。」 | `!= Ctrl('P')` ⇒ `return FULLUPDATE`＝離開 | `board.c:603-605` |
+| `menu.c:232` 的 `★快速切換:` footer | `k < ' '` ⇒ `return 0`＝取消 | `menu.c:234-236` |
+| 推文型別選單 `您覺得這篇文章 …[1]?` | `type=vkey()`，非數字 ⇒ `RECTYPE_DEFAULT`，**不是取消，會前進到內容輸入欄** | `bbs.c:3000-3004` |
+| **文章列表（無 prompt）** | `read.c:950` `case Ctrl('C'):` **清空標記清單** `ClearTagList()` ⇒ **有副作用** | `mbbsd/read.c:950-955` |
+
+⇒ 最後一列是承重點：**`Ctrl-C` 只能在「確定輸入欄開著」時送**，不可以當成「反正點空白
+就送一個安全鍵」。推文型別選單那一條同時說明了「一次送不一定關得掉」——收尾要用
+「重複送、每次重新分類畫面」的模型（`long_push_session._enqueueAbort`）。
+
+### 進版畫面的完整序列（`(b)進板畫面`／進板）
+
+```
+Read()  bbs.c:4640-4657
+  enter_board()
+  more(<板>/notes, NA)                → pmore 畫進版畫面（與文章同形）
+  if (mr != READ_NEXT) pressanykey();  ← bbs.c:4654 ★「按任意鍵繼續」那張畫面
+  i_read(...)                          → 文章列表
+```
+
+`(b)進板畫面` 走 `read_comms[]` 的 `{ 0, b_notes }`（`bbs.c:4601`），`b_notes` 是同一段
+（`bbs.c:4061-4081`，`mr==-1` 時另印「本看板尚無進板畫面。」）。
+`[i]看板資訊`（`b_config`，`board.c:326`）對非板主也是 `pressanykey(); return FULLUPDATE;`
+（`board.c:598`）；`[h]說明` → `b_help`（`bbs.c:4223`）→ `show_help_table` → `PRESSANYKEY()`。
 
 ## 7. `v` 已讀設定交易（`b_mark_read_unread`，CONFIRMED）
 
@@ -198,7 +258,8 @@ entry 列欄位（`readdoent`，`mbbsd/bbs.c`）——逐欄依 printf 序列推
 - **跨模式跳轉會產生二段式畫面更新**：命中處與目前模式不符（一般↔文摘）時設 `*pdefault_ch = KEY_TAB; return DONOTHING;`——server **自己補按一個 TAB**，下一圈 `i_read_key` 用它跑 `board_digest()` 切模式 ⇒ client 會看到「prompt 消失」與「全幅切換清單」兩段。
 - 文章內（pmore）按 `#`：`more.c:108-112` → `RET_SELECTAID` → `read.c:1018-1024` 先退出 pmore 回列表再開同一個 prompt，收尾強制 `FULLUPDATE`（與列表內的 `DONOTHING` 不同）。
 - **死碼警告**：`mbbsd/aids.c` 的 `do_search_aid()`（支援 `AID@BOARDNAME` 跨板語法）整段包在 `#ifdef NEW_AIDS` 內，而 `NEW_AIDS` 全 repo 無任何定義 ⇒ **真正跑的只有 `read.c#select_by_aid`，不支援 `@板名`**。勿照那段實作 client。
-- **只搜 currboard**：`select_by_aid` 依序找 `<currboard>/.DIR.bottom`、`.DIR`、`fn_mandex`，全都是**目前看板**的檔案 ⇒ 跨板一定要先 `s<board>`。另註 `read.c:404` 自帶 FIXME：置底文若沒列在 `.DIR.bottom` 這段會搜不到（實測 Test 板的置底公告 AID 搜尋直接失敗）⇒ **client 不可假設任何一篇文章的 AID 都跳得到**。
+- **只搜 currboard**：`select_by_aid` 依序找 `<currboard>/.DIR.bottom`、`.DIR`、`fn_mandex`，全都是**目前看板**的檔案 ⇒ 跨板一定要先 `s<board>`。**`.DIR.bottom` 排在最前面 ⇒ 置底文的 `#AID` 搜尋是會中的**（游標停在該 `★` 列；`read.c:478` `*pnew_ln = n + 1`）。`read.c:404` 自帶的 FIXME 講的是另一種情況——「被標記置底但**沒列在** `.DIR.bottom`」的文章，那段搜不到，但下一段搜 `.DIR` 時仍會搜到本體。2026-09 之前本文件寫「實測 Test 板置底公告 AID 搜尋直接失敗」，那是 client 端落地判準寫死 `cursorRowNum != null`（置底列印 `★` 沒有序號）造成的誤判，非 server 行為，已修（`aid_navigation#aidSearchLanded`）。
+- **置底（★）列的落地與開文（CONFIRMED）**：命中 `.DIR.bottom` 時 `n += getbtotal(currbid)`（`read.c:411`）把它換算成合併後的行號 —— 置底區就是 `bottom_line+1..last_line` 的虛擬延伸（§3）。列表上那一列**沒有序號**（`bbs.c:843` 印 `"  " ANSI "  ★ "` 取代 `%7d`）⇒ **client 的落地判定不可要求「游標列解析得出編號」**，否則會把正確落地讀成 miss（2026-09 實際 bug：置底文 deep link 卡在列表進不了文章）。⏎ 開文在 server 端本來就支援：`read.c:999-1008` 的 `num = crs_ln - bottom_line`，`num > 0` 時把 `direct` 換成 `<board>/.DIR.bottom` 再交給 `read_post`。**live 實測 2026-09-02**（`Android` 板 `#1T3vIDTr`）：`#<aid>⏎` 落在 `>   ★  m 2 6/23 albb0920     □ [公告] 板規`（`cursorRowNum` null、底列空 ⇒ classify `transient`），再一個 `⏎` 即開文成功。
 - **per-board 游標記憶（getkeep）＝「返回原看板」可行的根據（CONFIRMED）**：`i_read` 在 `NEWDIRECT`（第一次進入該目錄）呼叫 `getkeep(currdirect, …)`（`read.c:1171`），而 `getkeep`（`read.c:105`）以 board path 的 hash 查既有 entry，**命中就沿用舊的 `crs_ln`**（`read.c:128-139`）；儲存結構是不斷追加的 link block（`KEEPSLOT=10` 一塊，滿了 malloc 下一塊），**session 內永不淘汰**。`board.c:1976` 的 `getkeep(buf, head, tmp+1)` 只在 entry 不存在時才用未讀位置當預設值，不會覆寫既有的。⇒ `s<原板>` 回去時游標仍停在離開時那一列。
   - **推論（單一例外）**：同板的 `#<aid>` 跳轉會覆寫該板的 `crs_ln`，所以「靠 getkeep 回原文」在**原板 == 目標板**時不成立（client 端 `nav_history.chooseAnchor` 據此讓 board 級錨點作廢）。
 - client 對照：`src/js/aid_navigation.js`（點 AID 連結的四段式交易＋返回時的反向重放）、`src/js/nav_history.js`（錨點三級：aid / num＋subject 驗證 / board）與列表好讀的貼上 passthrough（`list_session.js#onPaste`）——後者刻意**不**代按 Enter、不特判 AID，讓上述原生行為原樣呈現。
@@ -290,6 +351,34 @@ commentd／官方 App／bot 不走 `vgetstring`，可填滿整欄）。
 **這個「寫滿」只可當必要條件，不可當判決**——上一段已證同形。唯一有在用它的是
 `url_wrap.js`（跨行連結接合），那裡真正的判別力來自「斷點兩側併起來是合法 URL（TLD 允許清單）」，
 寬度只負責排除「作者根本沒寫滿、只是分兩則講話」。散文續行**仍然判不出來，勿再嘗試**。
+
+## 11.1.1 內文折行寬度與「怎麼判斷這兩列本來是同一行」（2026-08-30 CONFIRMED）
+
+消費端：`src/js/body_wrap.js`（內文跨行連結接合）、`term_buf.isTextWrappedRow`。
+
+| # | 事實 | 依據 |
+|---|---|---|
+| W1 | pmore **自己做 soft wrap，不靠終端機 auto-wrap**，而且刻意不用最後一欄：`headerw = MFDISP_DBCS_HEADERWIDTH(t_columns-1)`（無條件捨去成偶數，保證不切半個中文字）、`dispw = headerw - (t_columns - headerw < 2)`、`maxcol = dispw - 1`。**80 欄 ⇒ maxcol = 77**（內容佔 col 0..77 共 78 欄，不是 80） | `pmore.c:1340-1345,1447-1456,1850` |
+| W2 | `t_columns` 被 `term.c:56` crop 成 `MAX(80, MIN(200, w))` ⇒ **寬度不可能小於 80** | `term.c:56`、`var.c:300` |
+| W3 | 兩條放寬路徑會讓某列多吐一格：借用 indicator 那一格（`col + off <= maxcol+1`）、`PMORE_TRADITIONAL_FULLCOL`（預設開，`col + off < t_columns` 時印到底並改走 `MFDISP_NEWLINE_MOVE`，**不送 clrtoeol**）。⇒ **「這一列寫到 col 78/79」代表整行塞得下，不是折行** | `pmore.c:111,1862-1877` |
+| W4 | 折行符號預設**開**（`bpref.wrapindicator = 1`，process 全域、不做 per-user 持久化）：WRAP 印 `\`、TRUNCATE 印 `>`、左右捲動列首印 `<`，位置在 col 78（DBCS 跨界被回退時 col 77），配色 fg7/bright/bg0 | `pmore.c:556-558,1979-1987` |
+| W5 | **`ESC[K` 不可當續行訊號**。pmore 自己送的 `ESC[K` 與換行都被 pfterm 的虛擬螢幕吃掉；線上的 `ESC[K` 唯一來源是 `doupdate` 的 erase 最佳化，是 **per 螢幕列**且**只有該列尾端空白是 dirty 時才送**（`derase`）。同 §9 水球那條的原理 | `pfterm.c:954-1061,1315-1329,1646-1652,2008-2019` |
+| W6 | 錄到的 CR/LF 是 `fterm_rawmove_opt` 的**游標移動**（`adx && x==0` → 送 CR；`y>ft.ry && ady<FTMV_COST && adx==0` → 送 LF），不是 line terminator | `pfterm.c:2088-2153` |
+
+**⇒ 判別「同一檔案行折成兩列」的可靠訊號只有 W4 的 indicator（要先重建成螢幕 buffer 再看 cell，
+不能掃 raw stream —— pfterm 是 per-cell diff）。但反過來不成立：**沒有 indicator 也可能是斷開的**
+—— 檔案裡本來就有換行時（下面的實例）當然不會有 indicator。故 `body_wrap.js` 的訊號改成
+「URL 字元一路寫到 maxcol、下一列 col 0 續上」，兩種成因都涵蓋。
+
+**實例（2026-08-30，`tests/e2e/cassettes/pttbug-body-urlwrap.json`）**：
+```
+08/30/2026 06:06:19 ※ 文章網址: https://www.ptt.cc/bbs/PttBug/M.1788041180.A.<CR><LF>
+404.html<ESC>[K<CR><LF>
+```
+左列內容正好 78 欄（col 0..77 ＝ maxcol），**整份畫面 `\` 出現 0 次**（而 wrapindicator 預設開）
+⇒ 這不是 pmore 折行，是**檔案裡就有換行**：`bbs.c:1523-1532` 寫的是 `log_filef(…, "※ " URL_DISPLAYNAME ": %s\n", url)`，
+格式字串前面沒有時間戳、也不會在 col 78 斷開 ⇒ **PTT 端寫檔的 bug，不是版面改版，不可當新 spec**。
+（`.A.` 後面沒有 `ESC[K` 只是 W5 的 dirty 最佳化，不是續行證據。）
 
 ## 11.2 登入頻率限制與擋人機制（2026-08-25，開源碼部分 CONFIRMED）
 
@@ -423,9 +512,27 @@ PTT 私有 commit，不在公開 repo）。**觸發門檻無從得知**，但**�
 UI**，不在推文流程內。`MAX_RECOMMENDS(100)` 只影響列表上的計數顯示（`爆`／`X%d`），不擋推文。
 上游**沒有**「是否要繼續推文」之類的續推詢問。
 
-- unknown（§12）：`recommend()` 一律 `return FULLUPDATE` ⇒ 上游讀碼的結論是推完**回文章列表**，
-  但線上是私有 commit，實測可能仍停在文章。`long_push_session` 對兩種落地都免疫（列表按 X 推的
-  是同一篇），只在「落在列表且起點是文章」時補一個 `\r` 回去。
+- **CONFIRMED（2026-09 修正前為 unknown）**：`read_post` 對 pmore 的 `RET_DORECOMMEND` 是
+  `recommend(ent, fhdr, direct); return FULLUPDATE;`（`bbs.c:2471-2473`）⇒ **推完必定離開 pager
+  回到文章列表**。第 1 則的 `fhdr` 是進文章那一刻 `i_read_key` 傳進來的快取，必定推對；**第 2 則
+  起的 X 是在列表按的**，`i_read_key` 現場取 `&headers[crs_ln - top_ln]`（`read.c:1007`）。
+- **CONFIRMED：列表游標沒有文章身分綁定。** `crs_ln` 是 `.DIR` 的 1-based record index
+  （`include/pttstruct.h#keeploc_t`），`cursor_pos()` 只做上下界 clamp（`read.c:171`）。
+  `i_read` 的 `PARTUPDATE` 在 `getbtotal()` 變動時只是 `recbase = -1` 重讀 headers，
+  **`crs_ln` 原地不動**（`read.c:1198-1221`），唯一修正是 `crs_ln > last_line` 夾到最後一列
+  （`fixkeep` 只有自己 `del_range` 時才呼叫，別人刪文不會修）。所以：
+  - 一般刪文 `delete_record2`（`common/sys/record.c:157`）把後面每一筆往前搬 ⇒ 游標滑到下一篇；
+    熱門板的 safe delete 是**原地覆蓋**（`substitute_fileheader`）⇒ index 不變。
+  - 置底文放在 `.DIR.bottom`，在畫面上是 index `bottom_line+1..last_line` 的虛擬延伸
+    （`read.c#get_records_and_bottom`）⇒ 有人發新文 `bottom_line` +1，置底區整批位移。
+  - 新文章一律 append 在 `.DIR` **尾端**（`record.c#append_record`）。
+  ⇒ **「同編號」不等於「同一篇」**。列表畫面上又**沒有**印檔名或 AID（`bbs.c#readdoent` 只印
+  編號/型別/推文數/日期(M/DD)/作者(≤12)/截斷標題），所以 client 想確定游標指哪一篇只有兩條路：
+  `Q`＝`view_postinfo` 讀 AID（`bbs.c:3748`），或 `#<AIDc>⏎`＝`select_by_aid` 主動設游標
+  （`read.c:366`；**置底文也搜得到**，`.DIR.bottom` 排在搜尋順序第一位，見 §8.1）。
+  消費端與決策表見 `docs/long-push.md`「游標錨定」＋`src/js/long_push_anchor.js`。
+- 順帶：`do_add_recommend` 自己留了 race 自白（`bbs.c:2721`）——推文內容 append 到記憶體裡的
+  **舊檔名**，`.DIR` 計數卻用 `ent` 行號寫，「推的時候前文被刪 → 加到後文的推文數」。
 - unknown：`vgetstring` 畫的反白欄是 `ESC[0;7m`（fg0/bg7），與 §5.1 記的 fg7/bg0 相左。故
   **不採用「數反白格反推 `maxlength`」**，改用 §11.1 的公式 ＋ 畫面上推文列有無 IP 欄。
 
@@ -490,6 +597,35 @@ server 送的是編碼後的 ANSI，client 看不到 flag，只看得到結果�
   整列 `text-shadow` 微發光，不採用閃爍。
 - 游標**符號**（`>` / `●`）是 PTT 帳號端設定，client 不偽造 server 沒送的字元。
 
+## 11.5 `v` 已讀設定交易（`bbs.c#b_mark_read_unread`，2026-09-02 CONFIRMED）
+
+看板列表右鍵選單「前已讀後未讀」（`src/js/list_session.js#markReadUnreadBefore`）的依據。
+消費端守護：`tests/unit/list_mark_read.test.js`、`tests/e2e/offline/list_mark_read.offline.spec.js`。
+
+進入點 `read_comms[]`：`{1, b_mark_read_unread} // 'v'`（`bbs.c:4621`）。`onekey` flag **1**
+＝ needitem ⇒ 需要有效 `fhdr`，也就是**游標所在那一篇**；函式本身不移動游標。
+
+| 步 | server 畫面 | client 送什麼 |
+|---|---|---|
+| 0 | 列表畫面。**游標必須先在目標列上** | `<num>` + `⏎`（序號跳轉，本專案的 `native-sync-jump`；jump 腿一律附 `\f`，見 §6） |
+| 1 | `move(b_lines-4,0); clrtobot();` → `"\n設定已讀未讀記錄 (注意: 文章設為已讀後不會再出現修改記號 '~')\n"` → `getdata(b_lines-1, 0, "設定所有文章 (U)未讀 (V)已讀 (W)前已讀後未讀 (Q)取消？[Q] ", ans, 3, LCECHO)` | `v` |
+| 2 | `getdata` → `vgets`（**整行輸入**，LCECHO＝`VGET_LOWERCASE` 自動轉小寫，`stuff.c:309/346`） | `w` + `⏎`（**單送 `w` 不會動**） |
+| 3 | 回 `FULLUPDATE` ⇒ 整個列表重畫（已讀標記欄變了）；`w` 分支時間戳無效時先 `vmsg("請改用其它文章設定當參考點")`＝等按任意鍵 | 無 |
+
+- **prompt 畫在 `b_lines-1`**，`b_lines = t_lines - 1`（`term.c:66`）⇒ 24 列終端時 prompt 在
+  **row 22，不是底列 row 23**（`clrtobot` 從 row 19 起清空，說明文字落在 row 20）。
+  判「prompt 出現了沒」必須掃整個畫面，只看底列會永遠判否。
+- ⚠ **`v` 沒成功進 prompt 時，後續按鍵會落回列表按鍵**：`w` ＝ `b_call_in`（呼叫器，
+  對該列作者送出，**有副作用**，`bbs.c:4622` / 實作 `bbs.c:1748`）、`⏎` ＝ 開文。所以
+  step1→step2 之間**必須**有「prompt 真的出現」的內容判定，不可一次送 `vw\r`。
+- `w` 分支語意（`bbs.c:4325-4333` → `brc.c:529` `brc_toggle_read` → `brc_trunc`）：
+  拿該篇檔名時間戳 `curr` 覆蓋整份 brc 記錄成單一筆 `{create: curr, modified: curr}`；
+  之後 `brc_unread_time` 判 `ftime > create` 為未讀、`ftime == create` 為已讀
+  ⇒ **該篇（含）以前已讀、以後未讀**，且**不可回復**（原本的逐篇記錄整份被截斷）。
+- guest（`cuser.userlevel == 0`）brc 不落地（`brc.c:542`）⇒ 流程照跑但看不到效果，
+  拿 guest 驗證會誤判成 bug。
+- 置底文沒有序號，step 0 無從跳起 ⇒ client 端直接不提供（`markReadTargetAtRow` 回 null）。
+
 ## 12. 版本與未知
 
 - 以 §0 的 `build_origin`（`c1ff72df`）讀碼；PTT 實跑的是私有 commit `50372909`，差異不可見。`#ifdef`（COLORIZED_SAFEDEL、COLORDATE 等）影響著色不影響行列結構。
@@ -548,3 +684,94 @@ goto 自癒與有界升級、補畫走 notify）、
 `tests/e2e/offline/easy-reading.offline.spec.js`（`dropSteps` 模擬 P4 吞頁 → `answerGoto` 驗
 精準自癒且不重建累積頁；`splitFrames` 模擬 P6 半畫幀 → 內容完整、每頁只送一次 PageDown；
 `ezsoft-longpost.json` 150 頁長文連續累積＋每頁成本不隨長度成長的曲線斷言）。
+
+## 14. pmore 設定頁與隱藏文字擦除（2026-09-05 CONFIRMED，讀碼＋錄製檔逐格實證）
+
+用途：「離開 pmore 設定頁 ⇒ 好讀整篇重讀」與「開燈」兩個功能的依據。client 對應
+`src/js/pmore_pref.js`、`src/js/hidden_text.js`、`easy_reading._evalFunctionModeExit`。
+
+### 14.1 設定頁的畫面協定（`mbbsd/pmore.c`）
+
+| # | 事實 | 出處 |
+|---|---|---|
+| Q1 | 文章內 `\` → `pmore_QuickRawModePref()`；`o` → `pmore_Preference()`；兩者回來後都 `MFDISP_DIRTY()` | `pmore.c:2763-2770` |
+| Q2 | rawmode 三值：`MFDISP_RAW_NA`(0 預設格式化) / `MFDISP_RAW_NOANSI`(1 原始ANSI控制碼) / `MFDISP_RAW_PLAIN`(2 純文字) | `pmore.c:525-528` |
+| Q3 | 快速設定頁按鍵：`\` 循環、`1`/`2`/`3` **直選並立即 return（不需要 Enter）**、`←`/`→` 增減、其他任意鍵 return | `pmore.c:2986-3005` |
+| Q4 | 三個標題字串：快速設定頁 `" piaip's more: pmore 2007+ 快速設定 - 色彩(ANSI碼)顯示模式 "`／完整設定頁 `" piaip's more: pmore 2007+ 設定選項 "`／說明頁 `" piaip's more: pmore 2007+ 瀏覽程式使用說明"`。**只有前兩者含「設定」** ⇒ 這是把 `h` 說明頁排除掉的判準 | `pmore.c:129-135` |
+| Q5 | 選項列＝`色彩顯示方式:` ＋ `1 預設格式化內容 \|2 原始ANSI控制碼 \|3 純文字`，**選中項的數字後面緊接 `*`**，未選是空白 | `pmore.c:149-152`、`pmore_prefEntry`(2873) |
+| Q6 | 兩個設定頁都以 `vmsg()` 收尾 ⇒ 末列右側是反白的 `[按任意鍵繼續]` ⇒ client 判成 `pageState 5` | `pmore.c:2986`、`pmore.c:3061` |
+| Q7 | 快速設定頁畫在 `ystart = b_lines-2`；24 列終端 `b_lines = t_lines-1 = 23` ⇒ **0-based row 21 標題／22 選項／23 提示**。完整設定頁 `ystart = b_lines-9`＋`PMORE_SHADOW_ABOVE` 的一列 `▔` ⇒ 標題在 row 15。**client 端不得綁死列號**（`t_lines` 一變就位移） | `pmore.c:2970`、`pmore.c:3015`、`mbbsd/term.c:66` |
+| Q8 | 進設定頁前 `grayout(0, ystart-1, GRAYOUT_DARK)` ⇒ 上半畫面整片重畫成 `ESC[1;30m`（fg=0 **＋BOLD** ⇒ client 端 `getFg()` 是 **8**，不是 0） | `pmore.c:2974`、`pmore.c:3018`；§11.4 |
+| Q9 | 完整設定頁另有 `w` 斷行／`m` 斷行符號／`l` 分隔線／`t` 傳統狀態列 —— **五項全都改變整篇文章的呈現與行數** | `pmore.c:3057-3082` |
+| Q10 | `bpref` 是 **process 層全域、沒有任何 load/save** ⇒ 設定**跨文章持續到登出**，不寫回使用者設定檔（`grep -a bpref` 只命中 pmore.c） | `pmore.c:556-558` |
+
+wire 行為（錄製檔實錄，兩份檔各三輪 `\`）：進設定頁 ~2.1KB（grayout 整片重畫＋三列）；
+再按 `\` 只 **56~84 bytes**（只 patch 選項列那幾格）；離開任意鍵 1.6~2.2KB（`ESC[H` 起整頁重畫，
+**只重畫「目前這一頁」**）。離開後的狀態列：切「純文字」⇒ 行號與切換前**完全相同**
+（`第 33~55 行`）；切「原始ANSI控制碼」⇒ 停在 66%（控制碼變可見字元 ⇒ 每則推文吃兩列）。
+
+⇒ **client 端結論**：好讀累積長頁的去重主判準是狀態列絕對行號，「預設 ↔ 純文字」行號相同
+⇒ 一列都不 append ⇒ 畫面完全沒變。**離開設定頁必須整篇重讀**，且判準要判**畫面**不判按鍵
+（改到 rawmode 的入口有 `\`、`|`、`1`/`2`/`3` 三組，`w`/`l`/`t` 又改行數）。
+
+### 14.2 server 端的隱藏文字擦除（`PFTERM_DISABLE_HIDDEN_MESSAGE`）
+
+```c
+// mbbsd/pfterm.c:1037-1047，refresh() 逐格輸出時
+if (FTATTR_GETFG(FTAMAP[y][x]) == FTATTR_GETBG(FTAMAP[y][x]) &&
+    (FTAMAP[y][x] & ~(FTATTR_FGMASK | FTATTR_BGMASK)) == 0 &&
+    !(FTD[x] & FTDIRTY_DBCS) &&
+    !(x + 1 < len && (FTD[x+1] & FTDIRTY_DBCS)))
+    fterm_rawc(' ');            // ← 送空白，不送真正的字元
+else
+    fterm_rawc(FTDC[x]);
+```
+
+`ftattr` 的位元只有 `FG(3) | BOLD | BG(3) | BLINK`（`pfterm.c:285-295`，**沒有 reverse／
+underline** ⇒ reverse 更早就被攤平成 fg/bg 互換），所以擦除條件精確等於
+**fg == bg 且 BOLD=0 且 BLINK=0 且（自己與下一格都不是 DBCS）**：
+
+| 作者寫法 | server 送出的 | client `getFg()/getBg()` | 本地救得回來？ |
+|---|---|---|---|
+| `ESC[30m` + 半形英數（含網址） | **空白** | 0 / 0 | ❌ 內容不存在 |
+| `ESC[30m` + 中文（DBCS） | 原字元 | 0 / 0 | ✅ |
+| `ESC[5;30m` + 半形（blink） | 原字元 | 0 / 0 | ✅ |
+| `ESC[7;30;40m`（reverse 同色） | **空白** | 0 / 0 | ❌ |
+| `ESC[34;44m` 藍字藍底半形 | **空白** | 4 / 4 | ❌ |
+| `ESC[1;30m`（grayout 用的） | 原字元 | **8** / 0 | 不適用（看得見） |
+
+`PFTERM_DISABLE_HIDDEN_MESSAGE` 在開源碼裡**沒有任何地方 `#define`**（全 repo 只出現在
+上面那一處 `#ifdef`）⇒ 是 PTT 站方自己開的，與 §11.2 的「DDoS/BOT 偵測」同性質的私有設定。
+但整條規則（含 DBCS 例外）已被錄製檔**逐格**實證：Test 板一篇自建測試文，原文
+`abc test2`（9 個半形，隱藏）在預設模式下送的是 `ESC[30m` ＋ **9 個 0x20**；同一篇的
+`中文測試2`（隱藏）送的是 `ESC[30m` ＋ **`中文測試` 的原始 Big5 位元組** ＋ **1 個 0x20**
+（末尾那個半形 `2` 被擦掉）。Hunter 板那篇的隱藏網址：預設模式 60 格全空白、全畫面
+`partOfURL` 一格都沒有；純文字模式同一列是完整網址、60 格 `partOfURL`。
+
+⇒ **這是「畫面上看不到的字，client 端可能根本收不到」的通則**，會影響未來任何
+「從畫面文字推導」的功能。另兩則副作用：
+
+- 文章狀態列開頭有 **2 格 fg=7/bg=7 的空白**（`ESC[0;47m` 之後）⇒ 任何 `fg===bg` 的偵測
+  都要有彩底門檻（client 取連續 ≥8 格），否則每一篇文章都誤報。
+- 純文字模式（rawmode 2）送的是**原始檔頭** `作者: someuser (暱稱) 看板: Test`，不是格式化過的
+  `作者  someuser` ⇒ `comment_parse` 的 `作者`／`標題`／`看板` regex 兩種都要吃
+  （已改成 `作者[:：]?\s+`）。推文列不受影響（`推 `/`噓 `/`→ ` 與顏色無關）。
+
+## 11.6 Home / End 的原生語意（2026-09-05 全部 CONFIRMED）
+
+列表好讀的 Home/End 直通原生鍵（`docs/easy-reading-list.md`「導覽」）的依據。三個消費點各自對應
+一份 source，改任何一邊前先回來對一次：
+
+| 畫面 | source | `KEY_HOME`（同義 `0`） | `KEY_END`（同義 `$`） |
+|---|---|---|---|
+| 文章列表 | `mbbsd/read.c:893-902` | `new_ln = 0; new_top = 0` | `new_ln = last_line; new_top = p_lines-1` |
+| 看板列表 | `mbbsd/board.c:1830 / 1768` | `num = 0` | `num = brdnum - 1` |
+| psb 通用清單 | `mbbsd/psb.c:58-64` | `return 0` | `return total-1` |
+
+兩個會影響 client 設計的事實：
+
+- **`last_line` 含置底文**（read.c 的 `last_line` 是 entry 總數 - 1，置底列也在裡面）⇒ 原生 End 落在
+  真正的板尾；而跳號 `<很大的數字>` + `⏎` 走 `search_num`（`stuff.c:189-208`）只夾到最大**編號**文章，
+  停在置底列**之前**。要「跳到末頁」就該用原生 End。
+- **游標已經在落點上時 PTT 一個 byte 都不送**（live-tested）。這正是舊 client 繞去跳號的理由，
+  現在由 §6 的 `\f` 解決：交易送「鍵 ＋ Ctrl-L」，igetch 的全域熱鍵保證回一個完整幀。

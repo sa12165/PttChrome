@@ -172,9 +172,16 @@
 
 /* `.main` 是捲動容器，同時也是 #cursor 的定位容器（游標住在裡面，見上）。
    縮放模式下 transform: scale() 本來就會讓它成為 containing block，但未縮放時
-   transform 是 none —— 少了這行，游標會退回去以 #BBSWindow 為基準而全盤錯位。 */
+   transform 是 none —— 少了這行，游標會退回去以 #BBSWindow 為基準而全盤錯位。
+   overscroll-behavior **必須拆軸**：文章好讀模式下這裡是真正的捲動視口，捲到底
+   時不要把垂直捲動往外傳（-y: contain）；但 `contain` 的兩軸寫法會**連瀏覽器的
+   水平滑動導航一起停用**（MDN 明載），而游標在這個畫面下幾乎一定落在 .main 上
+   ⇒ 返回手勢會在最需要它的地方完全沒反應。-x: auto 放行導航，接住它的是
+   history_back_guard 的 sentinel。守護 tests/unit/native_gesture_css.test.js。 */
 .main {
   position: relative;
+  overscroll-behavior-y: contain;
+  overscroll-behavior-x: auto;
 }
 
 .linkurl {
@@ -195,13 +202,38 @@ a:link,a:visited,a:active,a:hover {
   white-space: pre;
 }
 
-/* 列表好讀模式的 body 捲動視口（平滑捲動）。高度由 JS 設成 body 列數 × 列高，
-   內容比它多一列，多出來的部分靠 overflow:hidden 裁掉；scrollTop 就是「捲掉了
-   幾個像素」。#mainContainer > span 是直系選擇器，列包進這一層之後要補等效樣式
-   （同 .mergedImageBlock 的處理）。 */
+/* 列表好讀模式的 body 捲動視口。高度由 JS 設成 body 列數 × 列高，內容是整段
+   緩衝（≤ MAX_LIST_ROWS 列）⇒ 有真正的可捲距離，捲動交給瀏覽器（與文章好讀
+   同一套引擎）。`overflow-y` 也由 JS 控（auto／hidden，見 screen.js
+   #_ensureBodyView）。#mainContainer > span 是直系選擇器，列包進這一層之後要補
+   等效樣式（同 .mergedImageBlock 的處理）。
+
+   捲軸**不能顯示**：傳統捲軸會佔掉約 15px 內容寬，body 的 80 格網格被壓縮，而
+   header/footer 在 #mainContainer 直系子層不受影響 ⇒ 欄位左右錯開。
+   `scrollbar-gutter: stable` 同樣佔寬，一樣不行。
+   overscroll-behavior **必須拆軸**（理由同 .main）：-y: contain 擋住垂直的
+   rubber-band 與外傳，-x: auto 放行瀏覽器的水平返回手勢。 */
 .listBodyView {
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  overscroll-behavior-x: auto;
   scrollbar-width: none;
+  /* 補頁（prepend）時的位置補償**只能有一個真相源**：ListSession 的內容錨
+     （captureScrollAnchor → applyScrollAfterRender）。瀏覽器內建的 scroll
+     anchoring 也會在前置插入節點時自己調整 scrollTop，兩邊各補一次就是補過頭。
+     實測（2026-08-30）Chrome 在我們這種「整批 patch 列節點」的更新下並沒有選中
+     anchor，拿掉這一行行為沒有可觀測差異 —— 但那是啟發式的結果、不是合約，換個
+     瀏覽器或改了 patch 方式就可能生效。明確關掉，位置只由我們算。
+     補償機制本身的守護在 tests/unit/list_session.test.js「平滑捲動 × 背景補頁」。
+
+     **這條只適用列表好讀，不要照抄到 .main（文章好讀）**：那裡的位移量沒有第二個
+     真相源，內建 anchoring 涵蓋得比自己算更全面（2026-09 實測），所以刻意留著用。
+     詳見 src/render/inline_preview_slot.js 檔頭與 docs/easy-reading.md。 */
+  overflow-anchor: none;
+}
+.listBodyView::-webkit-scrollbar {
+  display: none;
 }
 .listBodyView > span {
   display: block;
@@ -255,11 +287,13 @@ a:link,a:visited,a:active,a:hover {
   width: 100%;
   height: auto;
 }
-/* 延遲載入卸下期間的替身盒（LazyInlinePreview）。刻意也掛 .easyReadingImg，好讓
-   max-width/max-height、放大態的 width:100% 等**完全同一組規則**替它算高度 ——
+/* 真圖還沒佔到版面時的替身盒（inline_preview_slot.js）。刻意也掛 .easyReadingImg，
+   好讓 max-width/max-height、放大態的 width:100% 等**完全同一組規則**替它算高度 ——
    佔位高度因此與真圖逐像素相同，兩種尺寸模式都準，JS 端不必複製任何 CSS 常數。
    寬度走 CSS 變數（元件以 inline style 給原尺寸）：inline 的 width 會蓋掉放大態的
-   width:100%，變數不會。空盒、無邊框，使用者看到的就是圖片還沒載進來的留白。 */
+   width:100%，變數不會。空盒、無邊框，使用者看到的就是圖片還沒載進來的留白。
+   住在 .inlinePreviewSpacer 裡（不是內容層）：疊層取 max 而非相加，所以掛載當下
+   「替身盒讓位給讀取中指示器」不再是一次 438px 的塌陷。 */
 .inlinePreviewGhost {
   width: var(--ghost-w);
 }
@@ -338,6 +372,38 @@ a:link,a:visited,a:active,a:hover {
    一致、且是一般文字可被 ^C 選取複製。舊版的 .mergedCommentTime（淡色縮小＋
    user-select:none）已於 2026-08 移除——使用者要求「比照原生、要能複製」。 */
 
+/* 推文區塊行距（pref commentBlockSpacing，預設開）。容器 class 由
+   render/screen.js#_setCommentSpacing 掛上，**只在「文章好讀累積長頁」才掛**
+   （判準是 enhance.stableRows，不是 easyReading && pageState===3 —— functionMode
+   原生鏡像與防黑守門那兩條 fallback 也帶著 easyReading:true / pageState:3，畫的卻是
+   活的 24 列 buffer；那裡多出任何高度就打破「原生鏡像期間畫面必須不可捲」的不變量
+   ⇒ 復發「推文時游標戳出反白輸入匡」，見 docs/easy-reading.md）。
+
+   內緊外鬆＝同作者合併塊自成一組：
+   - 塊**間**用 margin-top（推文列與合併塊都是 #mainContainer 的直系子層，display:block）。
+   - 塊**內**只能用 line-height —— 合併塊的每一則是同一個 bbsrow 裡的 **inline**
+     bbsline span（見 render/link_segment.js 的多行分支），inline 元素吃不到
+     margin-top 與垂直 padding。
+
+   **禁止事項**（動這一段之前先讀）：
+   1. 不得出現 letter-spacing / padding / font-weight —— 等寬格線一位移，三個消費端
+      靜默壞掉：term_view.fixedResize（直接掃 DOM 改 .wpadding 的 width）、
+      mouse_geometry.colFromClientX（推文列點擊的防誤觸欄位判定）、.floorBadge 的
+      零寬盒契約。同 .lightsOn / .fnKey 的既有禁令。
+   2. 不得用 margin-bottom —— #easyReadingLastRow 以 margin-top:-1em 疊在
+      #mainContainer 的 paddingBottom:1em 上，尾端多出的 margin 會把 footer overlay 推離。
+   3. 不得改 .main 或全域的 line-height —— 那是 term_view.setTermFontSize 的 inline
+      style（= chh px）在管，原生 24 列的整套座標建立在 line-height === chh 上。
+      這裡只覆寫合併塊自己的 bbsrow。
+   守護：tests/unit/comment_spacing_css.test.js、tests/unit/comment_spacing_class.test.js */
+#mainContainer.commentSpacing > span[type="bbsrow"][data-pusher],
+#mainContainer.commentSpacing > .mergedCommentBlock {
+  margin-top: 0.55em;
+}
+#mainContainer.commentSpacing > .mergedCommentBlock span[type="bbsrow"] {
+  line-height: 1.3;
+}
+
 /* 自動開影片：尺寸上限比照 .easyReadingImg（19em/39em），**必須有 max-height**——
    直式影片（如 480×854）在舊的固定 width:640px 下高度會撐到 1138px，遠超過視窗，
    而影片不像圖片能靠捲動一段段看，播放控制列被推到畫面外就沒法操作。
@@ -382,6 +448,13 @@ img {
 .main img {
   padding: 0px;
 }
+
+/* 這裡刻意**沒有** overscroll-behavior-x —— 觸控板的返回手勢一律交給瀏覽器原生
+   跑（原生的返回箭頭、跟手位移、半途放手取消、放手才生效全是瀏覽器 chrome 的
+   行為，頁面模擬不出來，見 history_back_guard.js 檔頭），本站只在導航真的發生時
+   用 history sentinel 把它接住並轉成 PTT 的左方向鍵。
+   **不要為了擋誤觸把 overscroll-behavior-x: none 加回來**：那會連原生的視覺指示
+   一起關掉，正是 2026-09 改掉的東西。守護 tests/unit/native_gesture_css.test.js。 */
 
 body {
   color: white;
@@ -721,12 +794,36 @@ span {
   to { transform: rotate(360deg); }
 }
 
-/* 自動開圖的延遲載入佔位盒（src/components/LazyInlinePreview.jsx）。
+/* 自動開圖的延遲載入佔位盒（src/render/inline_preview_slot.js）。
    還沒捲到（或已捲遠被卸載）時裡面是空的：高度必須是 0，否則長文幾百個空盒會憑空
-   撐出好幾個螢幕的空白。卸載時把量到的高度寫進 inline style 的 min-height，
-   閱讀位置才不會因為內容塌陷而位移。 */
+   撐出好幾個螢幕的空白。
+
+   ---- 為什麼是 grid 疊層而不是單純 display:block ----
+   佔位高度**不可以**寫在 slot（或任何「捲動錨點的祖先」）自己的 inline style 上。
+   讀者停在圖片中間時，捲動錨點就在這個 slot 裡；改寫祖先的 min-height/height/
+   padding/margin/position/transform 任一項都會命中 CSS Scroll Anchoring 的
+   suppression trigger ⇒ 瀏覽器當幀**放棄補償**上方內容的高度變化 ⇒ 讀者被整整推走
+   一次塌陷量（實測 438px ＝ 一次 PgUp 的 76.6%，兩張圖就吃掉一整次 PgUp；
+   症狀＝「多圖時 PgUp 捲不上去／來回跳」）。
+
+   所以改成 grid 疊層：內容包一層 .inlinePreviewContent、佔位高度寫在它的兄弟節點
+   .inlinePreviewSpacer 上，兩者疊在同一個 grid area ⇒ slot 高度 = max(內容, 佔位)
+   （不是相加）。display:grid / grid-area 都是**靜態** stylesheet 規則、runtime 永不
+   改寫 ⇒ slot 與 content 這兩個錨點祖先零樣式變動 ⇒ 補償照常生效，捲動位置全交給
+   瀏覽器內建的 scroll anchoring（實測它在 .main 上涵蓋得比自己算更全面）。
+   align-items:start 不可省：grid item 預設 stretch 會把內容拉成整列高。
+   spacer 疊在內容上方，pointer-events:none 才不會吃掉點圖放大的點擊。 */
 .inlinePreviewSlot {
-  display: block;
+  display: grid;
+  grid-template-areas: "stack";
+  align-items: start;
+}
+.inlinePreviewSlot > .inlinePreviewContent,
+.inlinePreviewSlot > .inlinePreviewSpacer {
+  grid-area: stack;
+}
+.inlinePreviewSpacer {
+  pointer-events: none;
 }
 
 /* 自動開圖「讀取中」指示器：解析中 + 媒體下載中共用。

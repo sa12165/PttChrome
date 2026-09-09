@@ -13,9 +13,25 @@ export const DEFAULT_PREFS = {
   // can be removed entirely (no blank gaps). Engages on entering a board list.
   // Default OFF while the feature matures (same policy as enableEasyReading).
   enableEasyReadingList: false,
+  // 看板列表平滑捲動（js/board_list_session.js）：把 PTT 一頁 20 列的看板列表累積
+  // 成一整段序列畫進捲動視口，捲動交給瀏覽器 —— 與文章列表好讀同一套引擎。
+  // **只作用於「我的最愛」與「分類看板」的子分類**（footer 指紋，board.c:1279-1290）；
+  // 全部看板／熱門看板／「新文章」模式一律維持原生的一次一頁。
+  // 預設關（功能成熟前，與 enableEasyReading／enableEasyReadingList 同一套政策）。
+  enableBoardListSmoothScroll: false,
+  // 非導覽操作結束後自動切回好讀（list_session.js / board_list_session.js）。
+  // 兩件事由這一顆開關同時管（它們是同一個承諾的兩半，拆兩顆會出現「A 類凍結但
+  // B 類不回復」這種沒人想要的中間態）：
+  //   L1 A 類鍵（[ ] = \ + - < > , . { } t／看板列表的 t v V）走凍結交易，全程不切原生
+  //   L2 B 類鍵（/ v s Ctrl-P 子畫面…）操作完成、畫面靜下來之後自動回好讀
+  // **預設開**：它是上面兩個 pref 的子功能，母開關已經是 opt-in，不需要再 opt-in
+  // 一次；預設關等於沒做。關掉＝逐位元回到 2026-09-03 之前（黏性原生：開文／離板
+  // 才回好讀），這是使用者拍板的逃生門 —— 判定類功能的最後一道防線就是設定開關。
+  enableListNativeAutoResume: true,
   // Target number of VISIBLE (non-blacklisted) rows the background prefetch
   // accumulates before stopping; continuation is demand-driven (navigate near
   // an edge). 0 disables the background fill (current page + demand only).
+  // 看板列表平滑捲動共用這個目標值（同一種「先抓多少列」的取捨）。
   easyReadingListPrefetchCount: 200,
   endTurnsOnLiveUpdate: false,
   copyOnSelect: false,
@@ -122,14 +138,23 @@ export const DEFAULT_PREFS = {
   // 滾輪：0=關閉 1=上下頁。舊版有三組設定（素滾／按住右鍵／按住左鍵）× 四種動作，
   // 全部收斂成這一個。文章好讀模式一律交給瀏覽器捲動，不受此設定影響。
   mouseWheel: 1,
-  // 滾輪平滑捲動（預設開）：**只影響文章列表好讀模式** —— 那裡的畫面是我們自己
-  // 組的 24 列視窗、沒有可捲距離，捲動量與動畫都得自己算（js/wheel_scroll.js ＋
-  // js/smooth_scroll.js），畫面停得住半列（render 端的 body 視口）。關掉＝回到
-  // 一格滾輪一整頁。原生 24 列模式沒有這個選擇（翻頁在 server 端），文章好讀模式
-  // 一律交給瀏覽器原生捲動。
+  // 滾輪平滑捲動（預設開）：**兩種列表的好讀畫面共用**（文章列表好讀 ＋ 看板列表
+  // 平滑捲動）—— 語意在兩者完全同構，故刻意不開第二個滾輪開關。開＝body 視口
+  // （render/screen.js 的 .listBodyView）走 overflow-y:auto，捲動完全交給瀏覽器，
+  // 與文章好讀模式同一套引擎；關＝視口改 overflow:hidden，滾輪退回「一格一整頁」
+  // （走與鍵盤 PgUp/PgDn 相同的一條路）。原生 24 列模式沒有這個選擇（翻頁在
+  // server 端），文章好讀模式一律交給瀏覽器原生捲動、不受此設定影響。
   // 開新 key 而不是把 mouseWheel 擴成三選項：淺層合併 + 既有使用者已存 mouseWheel:1
   // ⇒ 只有新 key 的預設值吃得到（同 cursorRowBackground 那段註解）。
   mouseWheelSmoothScroll: true,
+  // 攔截瀏覽器的「返回」→ 左方向鍵：0=關閉 1=開啟。**一個 key 涵蓋所有來源**
+  // （觸控板左滑手勢、滑鼠側鍵、Alt+←／⌘[、工具列上一頁）——它們現在是同一條
+  // 實作（history sentinel，見 js/history_back_guard.js），永遠一起開關。
+  // 預設開：側鍵與觸控板左滑本來就是上一頁，不攔的話等於在 BBS 裡隨手離站。
+  // 代價（tooltip 已寫明）：本站的返回變成「退出文章」，要離站得關掉分頁。
+  // 舊 key mouseSwipeHorizontal / mouseBackButton 已刪除且**刻意不做遷移**
+  // （readValuesWithDefault 是淺層合併，殘留舊 key 不會污染新 key）。
+  mouseBackNav: 1,
 
   // displays
   fontFitWindowWidth: false,
@@ -157,6 +182,11 @@ export const DEFAULT_PREFS = {
   // enhanced add-on
   showFloorNumbers: true,
   mergeSameAuthorComments: true, // 好讀：連續同作者推文合併成一段
+  // 推文區塊行距（僅文章好讀累積長頁）：推文之間拉開距離，同作者合併塊內部的
+  // 間距則比較小 ⇒ 內緊外鬆、同一人的連續推文自成一組。**純 CSS**：只在
+  // #mainContainer 上 toggle 一個 class（render/screen.js#_setCommentSpacing），不重建
+  // 任何一列、也不進 annotationsKey。預設開——這是純排版改善，不改文字內容。
+  commentBlockSpacing: true,
   highlightAuthorComments: true,
   enableAutoFixUrl: true, // detect & show a repaired link below a broken URL
   // 裸網域（無 scheme、無路徑，如 indiegametw.com）原位變成可點連結。

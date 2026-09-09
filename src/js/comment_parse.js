@@ -163,7 +163,7 @@ export function annotateComment(text, ctx) {
 // 2026-08 從 annotateComment 搬出來：寫進 annotation 就等於讓一個純互動狀態進
 // screen_annotate_cache.annotationsKey ⇒ 點一下推文列就炸掉整份增量快取、重建
 // 好讀累積長頁的每一列節點。兩個實際回報的症狀：
-//   1. 每個 inlinePreviewSlot 被 disposeNode 收掉重建（pinned=null ⇒ minHeight
+//   1. 每個 inlinePreviewSlot 被 disposeNode 收掉重建（pinned=null ⇒ 佔位高度
 //      歸零）⇒ 圖片佔位盒塌陷再非同步撐回來＝合併推文的空白區閃爍
 //   2. 節點抽換落在雙擊的第二個 mousedown 之前 ⇒ 雙擊選字時好時壞
 // 現在由 ScreenController 在 build 時現算、切換時逐列搬 class
@@ -182,7 +182,12 @@ export function isPusherHighlighted(ann, selectedPusher) {
 // Article header (first line of a post): "作者  userid (nickname) 看板 board".
 // Returns the 原PO id in lower case (for same-author comment highlighting), or
 // null when the line is not an author header (e.g. a later page of the article).
-const ARTICLE_AUTHOR_RE = /^\s*作者\s+([0-9A-Za-z]+)/;
+//
+// 冒號的那一種是 pmore 的**純文字**顯示模式（bpref.rawmode = MFDISP_RAW_PLAIN）：
+// server 送的是原始檔頭 `作者: someuser (暱稱) 看板: Test`，不是格式化過的
+// `作者  someuser`。「開燈」會替使用者切到那個模式，所以兩種都要吃 —— 否則原PO
+// 推文高亮與 long_push_anchor 會在開燈之後靜默失效。
+const ARTICLE_AUTHOR_RE = /^\s*作者[:：]?\s+([0-9A-Za-z]+)/;
 
 export function parseArticleAuthor(text) {
   if (!text) return null;
@@ -194,7 +199,7 @@ export function parseArticleAuthor(text) {
 // Same header line also carries "看板 board"; the board name is what an AID
 // link without an explicit board falls back to. Returned as-is (PTT board
 // lookup is case-insensitive), or null when the line is not an author header.
-const ARTICLE_BOARD_RE = /看板\s+([0-9A-Za-z_-]+)/;
+const ARTICLE_BOARD_RE = /看板[:：]?\s+([0-9A-Za-z_-]+)/;
 
 export function parseArticleBoard(text) {
   if (!text) return null;
@@ -213,6 +218,21 @@ export function parseArticleHeader(text) {
   const author = parseArticleAuthor(text);
   if (!author) return null;
   return { author: author, board: parseArticleBoard(text) };
+}
+
+// Article header, second line: "標題  [閒聊] 標題文字". Returned RAW (the reply
+// prefix is NOT stripped here — subjectKey does that, so both this and a list
+// row's title reach the same key). null when the line is not a title header.
+//
+// The long-push cursor anchor uses it to learn, WHILE STILL IN THE ARTICLE, which
+// post the run belongs to — a baseline taken from the list after the first push
+// would already be poisoned by whatever moved the cursor (see long_push_anchor).
+const ARTICLE_TITLE_RE = /^\s*標題[:：]?\s+(\S.*?)\s*$/;
+
+export function parseArticleTitle(text) {
+  if (!text) return null;
+  const m = text.match(ARTICLE_TITLE_RE);
+  return m ? m[1] : null;
 }
 
 // Board list column map — 逐欄對 mbbsd/bbs.c#readdoent 的 printf 序列推出來的
@@ -482,6 +502,36 @@ export function parseListArticleNumLoose(text) {
     .replace(/^[\s●>]+/, '')
     .match(/^(\d+)\b/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+// 這一列**真的長得像看板文章列表的一列**嗎？黑名單標註（screen_annotations 的
+// PAGE_LIST 分支）與 visibleListIndices 的逐列守門。
+//
+// 為什麼需要它：`term_buf.setPageState` 沒有 reset 分支（見 docs/pttbbs-screen-
+// protocol.md §5.1），從列表叫出來的整頁畫面（Ctrl-P 發文、板規、精華區…）會**沿用**
+// 上一幀的 pageState 2，而 term_view 的 _inBoardListContext 又是黏的 ⇒ 標註層的
+// 「這是列表嗎」兩個輸入都不可信。逐列解析本身也不設防：parseListTitleRaw 對任何
+// 長度 > LIST_AUTHOR_COL_END 的列都回傳 col≥29 的整段文字 ⇒ 發文分類列
+// 「種類：1.閒聊 … 7.Vtub 8.自介 (1-8或不選)」的 col≥29 含 "Vtub"，只要使用者的標題
+// 黑名單有 vtub 就整列被換成「（本文已被黑名單）」通知列（2026-09-05 錄製檔）。
+// 文件早就寫了「任何『這個畫面是不是列表』的判斷都不可以只看 pageState」——這裡就是
+// 那個指紋。
+//
+// 判準（三者取聯集，順序即成本）：
+//   1. 作者欄是 '-' ＝ 被刪除文（parseListAuthor 會拒絕它，所以要先問）。
+//   2. **先要求合法的 userid 作者欄**。少了這關就形同虛設：parseListArticleNumLoose
+//      是 `^(\d+)\b`，板規的「1. 不得…」會回 1 而放行。
+//   3. 有編號（loose ⇒ 連舊全形 ● 游標蓋掉最高位的那一列也算）或有 ★（置底文沒有
+//      編號，PTT 把 ★ 印在編號欄）。★ 這關與 list_session.js 既有的
+//      `t.indexOf('★') >= 0 && isPinnedListRow(t)` 是同一個判準。
+// 與 list_session.js#classifyListScreen 內的區域 listShapedRow 是同一個概念，
+// 但那邊只在**已確認是列表畫面**的 entry 區裡用，可以寬鬆；這裡是畫面身分本身
+// 不可信的場合，所以嚴格。
+export function isListShapedRow(text) {
+  if (!text) return false;
+  if (isDeletedListRow(text)) return true;
+  if (parseListAuthor(text) == null) return false;
+  return parseListArticleNumLoose(text) != null || text.indexOf('★') >= 0;
 }
 
 // Recover a cursor row's full article number from its visible suffix and a clean
@@ -809,4 +859,39 @@ export function parseTitleBlacklist(str) {
 export function matchTitleBlacklist(title, keywords) {
   if (!title || !keywords || !keywords.length) return null;
   return keywords.find(k => title.includes(k)) ?? null;
+}
+
+// The subject key of a list row — pttbbs's strcmp(currtitle, subject_ex(title))
+// re-done client-side. The displayed title is ALREADY subject_ex-stripped by the
+// server (readdoent prints mark + stripped title), so the key is the title
+// region minus the leading type mark ("R:"/"□"/"轉"/"鎖"/"ˇ"); the defensive
+// Re:/Fw: loop-strip mirrors subject_ex (common/bbs/string.c:58, case-insensitive,
+// optional trailing space) in case a raw prefix ever leaks through. null = no
+// usable title (blank/short row) — never matches.
+//
+// Lives here (pure layer) rather than in list_session because THREE serialized
+// operations verify a list landing against it — list easy reading, the AID back
+// jump (aid_navigation) and the long-push cursor anchor (long_push_anchor) —
+// and the latter two must not drag the DOM-coupled list_session chain in.
+// list_session re-exports both for its own consumers.
+export function subjectOfListRow(row) {
+  return subjectOfListText(rowToText(row));
+}
+
+// Same key from an already-flattened row STRING (settle facts carry rowTexts,
+// not TermChar rows — aid_navigation's back landing and long_push's anchor
+// check both verify against these).
+export function subjectOfListText(text) {
+  let t = parseListTitleRaw(text);
+  if (!t) return null;
+  if (t.charAt(0) === 'R' && t.charAt(1) === ':') t = t.substring(2);
+  else if (t.charCodeAt(0) > 0x7f) t = t.substring(1); // □/轉/鎖/ˇ state glyph
+  t = t.trim();
+  let prev;
+  do {
+    prev = t;
+    t = t.replace(/^(re:|fw:) ?/i, '');
+  } while (t !== prev);
+  t = t.trim();
+  return t || null;
 }

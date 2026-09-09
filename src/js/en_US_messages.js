@@ -83,6 +83,9 @@ export const en_US = {
   "cmenu_addTitleBlacklist": {
     "message": "Blacklist title keyword ..."
   },
+  "cmenu_markReadUnread": {
+    "message": "Mark this post and older read, newer unread"
+  },
   "titleBlacklistModal_title": {
     "message": "Add to title blacklist"
   },
@@ -128,6 +131,15 @@ export const en_US = {
   },
   "longPushModal_tooMany": {
     "message": "#n# comments in total. This may take several minutes because of PTT's cooldown. Send anyway?"
+  },
+  "longPushModal_uploadImage": {
+    "message": "Insert image"
+  },
+  "longPushModal_uploadHint": {
+    "message": "Drop an image here, paste a screenshot, or click Insert image; the uploaded URL lands at the cursor."
+  },
+  "longPushModal_urlTooLong": {
+    "message": "The image URL is longer than one comment allows; it may be split across two comments (the image would not open). Consider a shortened URL or a separate comment."
   },
   "longPushModal_confirm": {
     "message": "Send"
@@ -290,6 +302,18 @@ export const en_US = {
   "mergeImageCaptionAi_pending": {
     "message": "AI matching… left"
   },
+  "lightsOn_on": {
+    "message": "Lights on (reveal hidden text)"
+  },
+  "lightsOn_off": {
+    "message": "Lights off"
+  },
+  "lightsOn_switchedPlain": {
+    "message": "Switched to plain-text display mode and reloaded the post — the PTT server never sends hidden alphanumeric text to the browser, so it has to resend it. Colors are gone for now; press \"Lights off\" to restore them."
+  },
+  "lightsOn_switchFailed": {
+    "message": "Lights on failed: could not open PTT's color display mode screen. Please try again."
+  },
   "debugRecord_start": {
     "message": "Record"
   },
@@ -306,6 +330,9 @@ export const en_US = {
   },
   "options_mergeSameAuthorComments": {
     "message": "Merge consecutive comments by the same author into one paragraph (easy reading only; shows time and floor range)"
+  },
+  "options_commentBlockSpacing": {
+    "message": "Add spacing between comment blocks (easy reading only; merged same-author comments stay grouped)"
   },
   "tooltip_ai": {
     "message": "These features use the browser's built-in on-device AI (Chrome Prompt API). Inference runs entirely on your machine — nothing is sent to any server. Only Chrome 148+ on desktop supports it, and enabling it downloads a multi-GB model the first time."
@@ -520,6 +547,18 @@ export const en_US = {
   "options_enableEasyReadingList": {
     "message": "Enable easy reading board list. (experimental, truly hides blacklisted rows)"
   },
+  "options_enableBoardListSmoothScroll": {
+    "message": "Enable smooth scrolling for the board list. (experimental, favourites / class boards)"
+  },
+  "tooltip_enableBoardListSmoothScroll": {
+    "message": "Accumulates the favourites and class-board listings into one sequence and hands scrolling straight to the browser (the same engine as list easy reading). The all-boards / hot-boards listings and the `c` new-post mode keep the native page-at-a-time behaviour."
+  },
+  "options_enableListNativeAutoResume": {
+    "message": "Return to easy reading / smooth scrolling once a non-navigation action finishes"
+  },
+  "tooltip_enableListNativeAutoResume": {
+    "message": "When a non-navigation key is pressed in a listing (search, tag, push, mark-as-read...), switch back to the easy-reading view as soon as the action completes and the screen goes quiet. Cursor-only keys ([ ] = \\ + - < > , . { } t, and t v V in the board list) never show the native mirror at all. Turn this off to stay native until an article is opened or the board is left."
+  },
   "options_easyReadingEndSwitchNative": {
     "message": "In easy reading, the hotkey jumps to the post bottom and switches back to native mode."
   },
@@ -698,10 +737,16 @@ export const en_US = {
     "message": "Article easy-reading keeps native browser scrolling and ignores this setting."
   },
   "options_mouseWheelSmoothScroll": {
-    "message": "Smooth scrolling in list easy-reading"
+    "message": "Smooth scrolling in list views"
   },
   "tooltip_mouseWheelSmoothScroll": {
-    "message": "In the article list's easy-reading mode the wheel scrolls smoothly, like a normal web page: continuous motion that can rest between rows, so even small trackpad swipes register. Turn it off to jump a whole page per notch. The native (non easy-reading) list always pages, since the server does the paging."
+    "message": "In list easy-reading and board-list smooth scrolling the wheel is handed straight to the browser, exactly like article easy-reading: momentum, fine trackpad swipes and your system scroll settings all behave natively. Turn it off to jump a whole page per notch. The native (non easy-reading) list always pages, since the server does the paging."
+  },
+  "options_mouseBackNav": {
+    "message": "Browser Back / trackpad swipe"
+  },
+  "tooltip_mouseBackNav": {
+    "message": "Turns the browser's Back into PTT's LEFT key: leave the post / go up one level. Covers the two-finger trackpad swipe (which uses the browser's own native back gesture, so the arrow indicator, the follow-along motion and cancelling by letting go mid-swipe all behave exactly like on any other site), the mouse side button, Alt+Left or Cmd+[, and the toolbar Back button. Whether the trackpad gesture works at all depends on your system settings (macOS: Settings → Trackpad → More Gestures → Swipe between pages). To actually leave this site, close the tab, or use Back twice on a screen that has nothing left to exit."
   },
   "options_mouseBrowsing": {
     "message": "Mouse browsing"
@@ -764,7 +809,7 @@ export const en_US = {
       'Core screens (board list, article, and both easy-reading modes) rewritten as plain JavaScript DOM, no longer going through React — a BBS screen repaints in full on every incoming page, where React is all cost and no benefit; the settings dialog and other peripheral UI stay on React.',
       'Upgraded to React 19 (bundled, function components + hooks).',
       'Dropped Bootstrap / react-bootstrap; UI components migrated to Mantine (dark by default, switchable theme).',
-      'Build tooling: Vite 8 (Rolldown core, replacing webpack + Babel), Yarn 4; tests on Vitest 4 (replacing Jest).',
+      'Build tooling: Vite 8 (Rolldown core, replacing webpack + Babel), Yarn 4; tests on Vitest 5 (replacing Jest).',
       'Removed jQuery and hammerjs in favor of native APIs; no CDN library dependencies left.',
       'Firebase npm modular SDK (lazy chunk) + App Check protection.',
       'Test infrastructure: Playwright E2E, Firebase Emulator Suite (Docker) integration tests, offline byte-cassette replay tests.',
@@ -815,6 +860,9 @@ export const en_US = {
   },
   "imageUpload_insertedSend": {
     "message": "Image URL inserted"
+  },
+  "imageUpload_insertedTarget": {
+    "message": "Image URL inserted into the input box"
   },
   "imageUpload_insertedClipboard": {
     "message": "URL copied (not on a comment prompt or the editor)"

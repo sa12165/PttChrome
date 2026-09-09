@@ -31,7 +31,8 @@
 | `mouseFunctionKeys` | `true` | bool | 畫面上的功能鍵提示變成按鈕（見下方「功能鍵按鈕」） |
 | `mouseMiddleClick` | `0` | 0 關閉 / 1 貼上 / 2 左方向鍵 | |
 | `mouseWheel` | `1` | 0 關閉 / 1 上下頁 | |
-| `mouseWheelSmoothScroll` | `true` | bool | 滾輪平滑捲動（連續位移＋緩動，畫面停得住半列），**只作用於文章列表好讀模式**（其餘畫面沒有這個選擇，見下方 render 分支表）。關掉＝該模式退回一次一頁 |
+| `mouseBackNav` | `1` | 0 關閉 / 1 左方向鍵 | 攔截瀏覽器的「返回」→ `←`。**一個 key 涵蓋所有來源**（觸控板左滑手勢／側鍵／`Alt+←`／`⌘[`／工具列），它們是同一條實作（見「手勢與瀏覽器返回」） |
+| `mouseWheelSmoothScroll` | `true` | bool | 開＝列表好讀的 body 視口走 `overflow-y:auto`，**捲動整個交給瀏覽器**（與文章好讀同一套引擎）；關＝視口改 `overflow:hidden`，滾輪退回一次一頁。**只作用於文章列表好讀模式**（其餘畫面沒有這個選擇，見下方 render 分支表） |
 
 ### 舊 → 新 key 對照（**刻意不做遷移**）
 
@@ -40,6 +41,8 @@
 | `mouseLeftFunction` | 0 無 / 1 Enter / 2 右方向鍵 | 刪除 → `mouseLeftClick`（行為導向，不再是按鍵層級） |
 | `mouseMiddleFunction` | 0 無 / 1 Enter / 2 左方向鍵 / 3 貼上 | 刪除 → `mouseMiddleClick`（**值域不同**，1 從 Enter 變貼上） |
 | `mouseWheelFunction1/2/3` | 0 無 / 1 上下行 / 2 上下頁 / 3 同標題前後篇 | 刪除 → 單一 `mouseWheel`；按住左／右鍵的兩組設定整個移除 |
+| `mouseSwipeHorizontal` | 0 關 / 1 左右方向鍵 | 刪除 → `mouseBackNav`（2026-09 兩者合併成同一條實作，永遠一起開關；右滑「進文」一併移除） |
+| `mouseBackButton` | 0 關 / 1 左方向鍵 | 刪除 → `mouseBackNav` |
 
 不遷移的理由：語意不是一對一（左鍵從「送哪個鍵」變成「開文／退出」、滾輪從三組
 變一組），寫一份遷移只會把舊值硬塞進意義不同的新格子。`readValuesWithDefault` 是
@@ -66,6 +69,7 @@
 | 3（READING） | `col < 7` | `exitArticle` | `back`（PNG） | 不上色 |
 | 3 | 其餘 | `none` | `auto` | 不上色 |
 | 0 / 5 / 6 | — | `none` | `auto` | 不上色 |
+| **任何 pageState** | `dismiss`（框開著：pressanykey／vmsg 橫幅／vgetstring 輸入欄） | `none`（送鍵不走這條，見下） | `pointer` | 不上色 |
 | **任何 pageState** | `inputPrompt`（PTT 開著輸入框） | `none` | `auto` | 不上色 |
 
 **`inputPrompt` ＝ `term_buf.isCursorOnInputField()`**（游標所在格是**白底黑字**，且該列不是從 col 0 就反白的狀態列）：PTT 的輸入框
@@ -159,10 +163,12 @@ Enter 會被輸入框吃掉（等於替使用者送出搜尋／進錯看板）�
 | 左鍵動作 | `useMouseBrowsing && mouseLeftClick` |
 | 左側提示帶 | `useMouseBrowsing && mouseLeftClick && region.cursor === CUR_BACK`（＝ pageState 1/2/3/4 的左 7 欄；**用 cursor 判、不逐一列舉 action**，日後新增退出動作不會漏列舉） |
 | 功能鍵按鈕 | `useMouseBrowsing && mouseFunctionKeys`（`term_view._renderScreenLines` 與 `_mirrorStatusRowToFooter` 兩處各 gate 一次） |
+| 點空白處關框 | `useMouseBrowsing && mouseLeftClick`（`resolveMouseGates().leftClick`，**沿用左鍵那顆 pref，沒有新 key**）＋ `buf.listRenderMode === 'native'` |
 | 防誤觸（可點區＝底色區的起始欄） | `useMouseBrowsing && mouseMisclickGuard` —— **跟著總開關走**，總開關關掉時左鍵／指標／提示帶全滅，沒有誤觸要防；設定頁那顆 checkbox 因此能與其他子項一樣 `disabled` |
 | 中鍵 | `useMouseBrowsing && mouseMiddleClick !== 0` |
 | 滾輪 | `useMouseBrowsing && mouseWheel !== 0` |
 | 滾輪平滑捲動 | `useMouseBrowsing && mouseWheel !== 0 && mouseWheelSmoothScroll`（`resolveMouseGates` 的 `wheelSmoothScroll`；只有列表好讀分支會問這一格） |
+| 瀏覽器返回（含觸控板左滑手勢） | `useMouseBrowsing && mouseBackNav !== 0`（`backNav`）—— **刻意不經過 `mouseWheel`**，見下節 |
 | 連結／圖片／`[data-pusher]`／`copyOnSelect`／右鍵選單 | **不受任何滑鼠 pref 影響** |
 
 改版前 `middleMouse_down` 與 `mouse_scroll` 完全不看 `useMouseBrowsing`，「關掉滑鼠
@@ -171,26 +177,213 @@ Enter 會被輸入框吃掉（等於替使用者送出搜尋／進錯看板）�
 
 滾輪關閉時 `mouse_scroll` **直接 return，不 preventDefault**（語意＝我們完全不碰）。
 
-**平滑捲動的三段換算**（列表好讀專用；其他畫面走上面那兩條）：
+**列表好讀的滾輪＝完全不碰**（2026-08-30 起，與文章好讀同一條路）：`mouse_scroll`
+在 `gates.wheelSmoothScroll` 時 **early return，不 preventDefault、不 stopPropagation**，
+body 視口（`.listBodyView`，`overflow-y:auto`，內容＝整段序列）由瀏覽器自己捲。
+自己刻的那一層（`wheel_scroll.js` 的 deltaMode 換算 ＋ `smooth_scroll.js` 的 rAF
+緩動器 ＋ `_stepScroll` 的次列位移）**整組刪掉**。
 
-1. `src/js/wheel_scroll.js#wheelDeltaToPx`（純函式）——認 `deltaMode`：0 像素／1 列
-   （Firefox 滑鼠滾輪送的是**列**，只看 deltaY 幾乎不動）／2 頁。
-2. **座標系**：wheel 給的是**螢幕**像素，而視窗較矮時整個終端機被 `scaleY` 縮放過
-   （`term_view.setTermFontSize`）⇒ `App.mouse_scroll` 除以 scaleY 換成**內容像素**，
-   之後所有數字（`chh`、次列偏移、body 視口的 scrollTop）都在內容座標系。漏掉這一步
-   會捲太多／太少。
-3. `src/js/smooth_scroll.js` 的緩動器把距離分幀吃掉（指數趨近，~120ms 收斂），每幀
-   交給 `ListSession._stepScroll`。
+**放行之前先問一句「到邊了沒」**（`ListSession.onWheelAtEdge`）：demand 是 scroll 事件
+驅動的，而捲不動就沒有 scroll 事件 ⇒ buffer 只有一頁時往上滾會看起來卡住。到邊的滾輪
+本身就是「請給我更多」，這條把它接回既有的 demand（零 byte 判斷）。
 
-**次列位移的座標契約**：畫面可以停在半列上（body 視口的 scrollTop = frac），所以
-`App.clientToPos` 對 body 區的列號要補回 frac，否則點擊與底色會標到上一列。視口底部
-露出的那一小條是 **overscan 列，渲染 index 24**（不是 3+20=23，那是 footer 的列號），
-`onListMouseMove`／`ListSession.onMouseClick` 都認這個值 ⇒ 「可點範圍＝標示範圍」在
-半列狀態下仍成立。
-守護：`tests/unit/wheel_scroll.test.js`、`tests/unit/smooth_scroll.test.js`、
-`tests/unit/render_list_scroll.test.js`。
+**「吞掉捲動」不能靠 `preventDefault`**：wheel listener 掛在 `window` 且沒指定
+`passive`（`pttchrome.jsx:197`），Chrome 73+ 一律視為 passive ⇒ `preventDefault()` 是
+no-op（改版前沒被發現，是因為那時列表根本沒有可捲距離）。frozen（交易中）與 pref
+關掉一律改用 CSS：視口切 `overflow:hidden`——hidden 的元素**仍是 scroll container**，
+`scrollTop`／`scrollTo()` 照常有效，只是使用者輸入捲不動它。
+另一半：`overflow:hidden` **不會取消已排定的 `scrollTo({smooth})`**，所以交易凍結時
+還要主動停掉動畫（`ListSession._cancelScroll`：把 scrollTop 原值同步寫回去），否則
+frozen 之後畫面會自己再捲幾像素。
+
+**座標契約**：`App.clientToPos` 對 body 區的列號 ＝
+`floor((y - bodyTop + scrollTop × scaleY) / rowH)`，`row = 3 + 該值`。scrollTop 是
+**內容像素**、`y` 是**螢幕像素** ⇒ 乘 `scaleY`（視窗較矮時整個終端機被
+`term_view.setTermFontSize` 縮放過）。footer 的列號 ＝ 這一幀 lines 的最後一個 index
+（全序列渲染後它不再固定是 23）。`onListMouseMove`／`ListSession.onMouseClick` 都用
+`3 + 序列位置` 反查，「可點範圍＝標示範圍」照舊成立。
+守護：`tests/unit/list_scroll.test.js`（捲動數學）、`tests/unit/render_list_scroll.test.js`
+（視口結構與 overflow 開關）、`tests/unit/list_session.test.js`（捲動語意／錨定還原／
+動畫期間的錨）。
 原生模式沒有可捲距離（`#BBSWindow` 是 `fixed; overflow:hidden`，`.main` 的高度就是
 內容高），所以放行不會造成怪異捲動。
+
+## 手勢與瀏覽器返回（2026-09，native-first）
+
+觸控板兩指左滑、滑鼠側鍵、`Alt+←`／`⌘[`、工具列上一頁在本站的語意都應該是
+「退出文章／回上一層」＝送 `←`，而不是離開 PTT。
+
+**多個來源、一種攔法、一個出口**：全部走 `history_back_guard.js` 的 sentinel
+（疊一層自己的 history entry，導航真的發生時把它吃掉並送 `←`）。
+
+### 為什麼手勢不可以自己模擬（2026-09 移除 `SwipeXDetector` 的原因）
+
+初版用 CSS `overscroll-behavior-x: none` 擋掉原生導航，再用 wheel 的 `deltaX`
+自己辨識。Mac 實機體感不對，而且**不是調參數能解的**：
+
+| 使用者要的 | 為什麼模擬做不到 |
+|---|---|
+| 原生的返回箭頭指示 | 那是**瀏覽器 chrome** 畫的，Chrome/Edge/Firefox/Safari 各自不同。`overscroll-behavior-x: none` 把整組原生 overscroll 導航（含指示）一起關掉，頁面畫不出來；自己畫一個只會變成第五種樣式 |
+| **放開手指**才退出 | DOM 的 `WheelEvent` **不含** macOS `NSEvent` 的 `phase`／`momentumPhase` ⇒ 頁面分不出「手指還在」「放開了」「這是慣性尾巴」。退而求其次的「靜止 N ms 才送」＝延遲 300–800ms，體感更差 |
+| 半途放手要取消 | 同上，沒有 phase 就沒有「放手」這個時間點 |
+| 尊重系統的手勢設定 | 使用者若把「在頁面間滑動」設成三指，兩指滑動不該有返回語意——但 wheel 照樣有 `deltaX` ⇒ 模擬版會做出使用者在系統層已經關掉的行為 |
+
+實測（macOS 26.4.1 + Chrome 151，真觸控板）：舊版的 100px 閾值落在整段手勢的
+**5–13%**（第 7–12 個事件／全部 120–165 個）⇒「一滑就退出」。門檻拉高只會變成
+「要滑很多才退」，仍然不是「放手才退」。
+
+⇒ **原生手勢跑、sentinel 接**：頁面只要不擋，其餘交給瀏覽器。實測此組合是完全的
+原生體感——箭頭有、跟手、半途可取消、**沒有截圖式全頁動畫**（頁面 rAF 全程照跑，
+最差 frame 間隔 9–10ms）、結束無閃爍。（舊版文件說「走 history 會先播完整段返回
+動畫」，那句**只適用跨文件導航**，same-document sentinel 沒有這回事。）
+
+副作用：原生手勢一旦啟動，頁面**只收得到 1–3 個 wheel 事件**就被瀏覽器接管
+（被 CSS 擋掉時是 40–200 個）。這也是 offline e2e 的合成 wheel 測不到本功能的原因。
+
+### CSS：不可以擋掉 overscroll 導航（**拆軸**）
+
+| 位置 | 現在 | 為什麼 |
+|---|---|---|
+| `html, body` | **沒有** `overscroll-behavior-x` | 有 `none` 就等於關掉整組原生導航含視覺指示 |
+| `.main`（文章好讀捲動視口）、`.listBodyView`（列表好讀 body 視口） | `overscroll-behavior-y: contain` ＋ `overscroll-behavior-x: auto` | 只刪 `html, body` 那條**不夠**：這兩個畫面下游標幾乎一定落在捲動視口上，而兩軸簡寫 `contain`／`none` 會**連瀏覽器導航一起停用**（MDN 明載 `contain` "disables native browser navigation, including ... horizontal swipe navigation"）⇒ 手勢在最需要它的畫面完全沒反應。`-y` 保留原本目的（捲到底不 rubber-band／不外傳） |
+
+守護：`tests/unit/native_gesture_css.test.js`（靜態掃描，含「不得出現兩軸簡寫」）
+＋ `tests/e2e/offline/swipe_back.offline.spec.js` 的 computed style 斷言。
+**這是最容易被下一個人順手改回去的一行。**
+
+### 出口
+
+`App.sendNavKeyAsUser(key)` → `navKeyAllowed()` 守門 → `view.sendKeyAsUser(key)`
+→ **合成 keydown 走既有的 `onKeyDown` 分派鏈**。
+
+**絕對不可以直送 `view._send('[D')`**：`←` 在三種 render 分支下語意不同（原生
+直送／文章好讀要先收狀態機／列表好讀必須走 `ListSession` 的 `{class:'leave'}` 序列化
+交易），那套分派已經存在於鍵盤路徑。裸送 byte 在列表好讀底下＝在交易中途插隊
+（v5 封閉互動禁止）。
+
+合成事件的三條硬規則（守護 `tests/unit/term_view_send_key_as_user.test.js`）：
+1. **`cancelable: true` 絕不可省** —— 整條鏈靠 `defaultPrevented` 判斷「上游接手了」，
+   省掉它 `preventDefault()` 變 no-op ⇒ 上游接手後 `TermKeyboard` 還會再送一次。
+   （已實測：對從未 dispatch 的合成事件呼叫 `preventDefault()`，Chromium／Firefox／
+   jsdom 的 `defaultPrevented` 都會變 true，這是 DOM 標準行為。**WebKit 未實測**。）
+2. 合成事件的 `e.code` 是空字串、`isTrusted:false`、`target:null`。目前只有
+   `term_keyboard.altRemapCharCode` 讀 `e.code`（已寫成 `e.code || ''`）；**日後在鏈上
+   新增讀 `e.code`／`e.target`／`e.isTrusted` 的邏輯就會靜默壞掉**。
+3. 用 `this.onKeyDown(ev)` 直接呼叫，**不 dispatch**（`#t` 上已掛 keydown listener，
+   dispatch 會讓同一個事件跑兩次分派）。
+
+送鍵守門 `nav_key_gate.navKeyAllowed(core)`：`modalShown` 關、未連線關、`pageState`
+只允許 1/2/3/4（0/5/6 不送，與 `resolveMouseRegion` 的動作集合一致）、
+`buf.isCursorOnInputField()` 為真時不送。**刻意不含 `serializedOpHint`**：那道在
+`view.onKeyDown` 開頭就有且會自己 `flashListHint`，重複擋只會讓提示閃兩次。
+
+`←` 之外**沒有前進方向**：右滑 →「開文章」在 native-first 下拿不到（sentinel 被吃掉
+後我們立刻補回，forward entry 被截斷）。已於 2026-09 移除，設定頁與 README 同步改過。
+
+### history sentinel 的六個坑（`history_back_guard.js`）
+
+1. **順序**：必須排在 `installDeepLink()` 的 `consume()`（`replaceState` 清 hash）之後，
+   否則帶著 `#Board/AID` 的網址留在 stack 裡，按 back 回到它 → `hashchange` → 又跳一次文。
+   安裝點在 `main.jsx` 的 `bootstrap()`，緊接在 `installDeepLink(app)` 之後。
+2. **user activation**：Chrome 的 History Manipulation Intervention 會把「該 document
+   從未取得 user activation 時 `pushState` 出來的 entry」在 back 時**跳過且不發
+   `popstate`** ⇒ 直接離站。所以第一層 sentinel 等第一次 `pointerdown`／`keydown` 才疊
+   （listener 常駐，pref 後來才開也補得上）。
+3. **補回 sentinel 只能用 traversal，不可以 `pushState`**（本次改版的核心）：
+   **觸控板返回手勢本身不是 user activation**（只有 click／pointerdown／keydown 等才
+   是）⇒ 在 `popstate` handler 裡 `pushState` 出來的那一層同樣被 intervention 標成可
+   跳過 ⇒ **下一次手勢完全 no-op**（沒導航、沒 popstate、也沒離站）。實機症狀：
+   **滑一次就失效，要點一下畫面才能再滑一次**。改用 `history.forward()` 走回既有的
+   entry：traversal 不建立 entry，不受 intervention 影響。stack 全程維持
+   `[E0, S1]`，我們平常站在 `S1`。
+   - `restoring` 旗標吞掉 `forward()` 自己造成的那一次 `popstate`。
+   - 保險：`forward()` 之後 `RESTORE_CHECK_MS`(120ms) 檢查 `history.state` 是不是
+     sentinel，不是就 `pushState` 補一層（否則下一次 back 直接離站）。
+   - 有 Navigation API 時先看 `navigation.canGoForward`。
+   - **不要用「一次疊 N 層」當 workaround**：實測 20 層用到一半就失效——同一次
+     activation 只讓第一層免疫。
+4. **sentinel 要帶唯一 id**（`{ pttchromeBackGuard: <seq> }`）：`popstate` 時只有
+   `state.pttchromeBackGuard === myId` 才算「落回自己站著的那一層」。用布林的話，退到
+   stack 裡**舊的**殘骸 sentinel（deep link 的 `replaceState`／使用者手動操作都可能留下）
+   會被誤判成「沒有往外退」而靜默失效（實測撞到過，症狀是「有時不能滑」）。
+5. **離站逃生門＝什麼都不做**：放行時停在 `E0`（不補 sentinel），下一次 back 自然離站。
+   **不是 `history.go(-1)`** —— 開新分頁直接進站時 `E0` 前面根本沒有 entry，`go(-1)` 是
+   靜默無效。
+   觸發條件是**「我們用不到的 back」連兩次**（`DOUBLE_BACK_MS` 800ms 內）：
+   - `sendNavKeyAsUser()` 回 true（真的送出去了）⇒ **重置計數**，不算逃生門的一次。
+     原生手勢下「文章 → 列表 → 看板列表」連退兩層很容易落在 800ms 內，舊版會把使用者
+     丟出站。
+   - 只有送不出去（未連線／modal／PTT 開著輸入框／`pageState` 0/5/6）才計數，並
+     `flashListHint(ESCAPE_HINT)`；同狀態下第二次才放行。語意＝「我們用不到的 back 就
+     還給瀏覽器」。
+
+6. **自己造成的 traversal 不可以被 deep link 消費**（2026-09-05 實機回報：按側鍵／
+   `Alt+←`／觸控板左滑都會**被導回剛剛那篇文章**）。兩個功能各自都沒錯，交會處才壞：
+   - 「網址列跟著現在在讀哪一篇走」（`deep_link_controller._syncAddressBar`）用
+     `replaceState` 改的是**當前 entry**，而我們平常站著的那一層正是 sentinel
+     ⇒ **S1 這一格帶著 `#Board/AID`**（E0 仍是站台根）。
+   - 坑 3 的 `history.forward()` 走回 S1 ⇒ fragment 變動 ⇒ 派發 **hashchange** ⇒
+     `deep_link_entry` 把它當成「使用者又貼了一條連結」⇒ aid-search + aid-open。
+
+   修法：`self_navigation.js` 的靜音窗口——guard 在自己的 traversal 期間標記，
+   `deep_link_entry.consume()` 期間內直接 return。窗口用**時間**（＝
+   `RESTORE_CHECK_MS`）而不是 begin/end 配對：same-document traversal 會派發
+   popstate **與** hashchange，規範沒保證我們讀得到的順序，在其中一個 handler 裡關
+   旗標就會漏掉另一個。
+   連帶：**`_replaceState` 必須把 `history.state` 原封帶過去**（原本傳 `null`）。
+   洗掉 state ＝ sentinel 的身分沒了 ⇒ 坑 4 的「落回自己那一層」判不出來，使用者按
+   「下一頁」回到它會被當成一次往外退而多送一個 `←`。
+
+   **順序決定重不重現**：sentinel 要在開文章「之前」疊起來（＝使用者先點過畫面才進
+   文章），E0 與 S1 的網址才會分歧；反過來兩層網址相同，traversal 根本不發
+   hashchange。寫測試時搞錯順序會得到一個「永遠綠」的假鎖。
+   守護：`tests/unit/back_guard_deep_link.test.js`（兩模組交會處）、
+   `tests/unit/deep_link_controller.test.js` 的 `_replaceState` 那條、
+   `tests/e2e/offline/swipe_back.offline.spec.js`。
+   **e2e 的觀測點必須是 `deepLinkController.request`**，不可以改成斷言送出去的
+   bytes：offline 重放停在文章畫面時 AID 跳轉會先被排隊而不立刻送 `#<aid>`
+   ⇒ 那種斷言在有 bug 的 code 上照樣綠（實測過）。
+
+另外：**長按上一頁的下拉選單可以一次跳好幾層**，單看 `popstate` 分不出退幾層。有
+Navigation API 時（Chrome/Edge/Firefox 都有）在 `navigate` 事件用
+`destination.index - navigation.currentEntry.index` 算 delta，`delta < -1` ⇒ 放行不接管、
+不補 sentinel。沒有這個 API 的引擎照吃一層。
+
+守護：`tests/unit/history_back_guard.test.js`（含連續 10 次返回、唯一 id、逃生門重設計、
+多階返回四組回歸鎖）、`tests/unit/back_guard_deep_link.test.js`（與 deep link 的交會）、
+`tests/e2e/offline/swipe_back.offline.spec.js`。
+
+### 已實測的事實（2026-09-03，macOS 26.4.1 + Chrome 151/152、Edge 150、Firefox 153）
+
+真觸控板人工操作 ＋ Playwright（`channel: chrome`）。**勿再重量。**
+
+| 事實 | 值 |
+|---|---|
+| `popstate` 何時來 | **放手之後**（距最後一個 wheel 113ms–2.5s，中間是使用者還按著） |
+| 原生手勢下頁面收到幾個 wheel | 1–3（被 CSS 擋掉時 40–200） |
+| Navigation API 能不能取代 sentinel | **不能**：連續取消 traverse 到第三次，事件變成 `cancelable=false` ⇒ `preventDefault()` 無效 ⇒ 放行離站（history-action activation 會被消耗） |
+| `⌘[` | 送出 `keydown ArrowLeft{metaKey:true}`，`preventDefault()` **有效**。鍵盤路徑其實不需要 sentinel，但側鍵需要 ⇒ **一條路涵蓋兩者，不拆兩套** |
+| 端到端 | Chrome 151 真觸控板連續 **25 次**左滑每次都退一層、history 全程 2 筆、快速連退兩層不離站、頂層出提示、第二次才放行；全程游標都在捲動區內 |
+
+**未驗**：Safari／Firefox 的端到端、Safari 的合成 `KeyboardEvent.defaultPrevented`
+（若為 false，Safari 下 `sendKeyAsUser` 會重複送鍵，屆時才改用 `App` 顯式三分支）、
+PWA standalone 下手勢是否還在、滑鼠側鍵（無硬體）。
+
+### Safari 的已知取捨
+
+Safari **不理 `overscroll-behavior`**（CSSWG issue #7878）—— 它本來就是「原生手勢 +
+sentinel 兜底」，改版後只會更一致。若它的整頁 snapshot 動畫太差，可單獨為 Safari 加回
+`overscroll-behavior-x: none`（＝退回舊行為），但**不要為此把 window 的 wheel listener
+改成 `{passive:false}`**：那會讓 Chrome 的 wheel 變成 main-thread blocking，文章好讀
+捲動掉幀（正是 2026-08 把捲動交還瀏覽器的原因）。
+
+### 順手修掉的既有 bug（保留）
+
+`mouse_scroll` 的方向判斷是 `up = e.deltaY < 0 || e.wheelDelta > 0`，而純水平滑動
+`deltaY === 0` ⇒ `up === false` ⇒ 原生 24 列畫面 `setBBSCmd('doPageDown')`＝左滑會偷送
+一個 PageDown 給 PTT（斜滑同理誤翻頁）。水平主導的事件在進入翻頁分支前就 return
+（`isHorizontalWheel`，`swipe_gesture.js` 只剩這三個純函式）。回歸鎖
+`tests/unit/wheel_horizontal.test.js`。
 
 ## 游標列標示：來源層 × 樣式層（2026-08-26）
 
@@ -276,11 +469,12 @@ localStorage 裡已經有舊 key 的舊值，翻預設對他們**完全無效**�
 |---|---|---|---|
 | 原生 24 列 | `term_buf.onMouse_move` | `App.onMouse_click`（依 `buf.mouseAction`） | `setBBSCmd('doPageUp'/'doPageDown')` |
 | 好讀文章長頁 | 同上（`clientToPos` 把 row clamp 進 0..rows-1） | 同上 + `easyReading._onMouseClick` 先收狀態機 | **early return，交給瀏覽器捲動** |
-| 列表好讀（buffer/frozen） | `term_view.onListMouseMove(row, col)` | 左 7 欄 → `list_session.onMouseExitClick()`；其餘 → `list_session.onMouseClick(row, col)` | 預設 `listSession.onWheelScrollPx(px)`（平滑）；`mouseWheelSmoothScroll` 關 → `listSession.onWheel('pgup'/'pgdn')` |
+| 列表好讀（buffer/frozen） | `term_view.onListMouseMove(row, col)` | 左 7 欄 → `list_session.onMouseExitClick()`；其餘 → `list_session.onMouseClick(row, col)` | 預設 **early return，交給瀏覽器捲動**（body 視口 `overflow-y:auto`）；`mouseWheelSmoothScroll` 關 → 視口 `overflow:hidden` ＋ `listSession.onWheel('pgup'/'pgdn')` |
 
 列表好讀分支在 `App.mouse_click` 的 `preventDefault()` 是**無條件**的（即使滑鼠功能
 整組關掉）：那個畫面是我們自己組的，不能讓瀏覽器預設行為對它動作。pref gate 只包住
-「要不要真的開文」。
+「要不要真的開文」。**滾輪相反**：預設路徑就是要讓瀏覽器的預設行為發生（那正是捲動
+本身），所以那條分支既不 `preventDefault` 也不 `stopPropagation`。
 
 ## 點擊優先權（`App.mouse_click` 左鍵分支，由上而下）
 
@@ -298,11 +492,12 @@ localStorage 裡已經有舊 key 的舊值，翻預設對他們**完全無效**�
 5. **`closest(PREVIEW_CLICK_SELECTOR)`** —— 內嵌預覽
 6. `getSelection().isCollapsed`
 7. `closest('[data-pusher]')` —— 推文者高亮（防誤觸開啟時還要 `col >= data-pusher-col`；**欄位不合不 return**，讓下面的左側退出帶接手）
-8. `listRenderMode` buffer/frozen 分支
-9. `useMouseBrowsing` gate
-10. `mouseLeftClick` gate
-11. `checkClass` / `menuitem` / `skipMouseClick`
-12. `onMouse_click(e)`
+8. **點空白處關框**（`listRenderMode === 'native'` ＋ `mouseGates().leftClick` ＋ `buf.dismissTarget()` 非 null）—— 見下方「點空白處關框」
+9. `listRenderMode` buffer/frozen 分支
+10. `useMouseBrowsing` gate
+11. `mouseLeftClick` gate
+12. `checkClass` / `menuitem` / `skipMouseClick`
+13. `onMouse_click(e)`
 
 **功能鍵用 `<a>` 是刻意的**：第 4 條的早退讓它自動贏過所有滑鼠瀏覽分支
 （含左 7 欄的退出帶）⇒ 加這個功能時 `App.mouse_click` 一行都不用改。守護在
@@ -338,9 +533,43 @@ DBCS 雙色字），只找一層在那種字上會漏判。同一個 bug 在
 ` 文章選讀  (y)回應(X)推文(^X)轉錄 …` 變成可點的 `<a class="fnKey">`，點一下＝送出
 那個按鍵。
 
-**只認單一按鍵。** `(=[]<>)`（同標題前後篇）、`(/?a)`（搜尋）、`(v/V)`（已讀／未讀）、
-`(R/y)`、`[↑↓]` 這種多鍵組一律維持純文字：取第一個會送錯鍵（`v` 標已讀 vs `V` 標未讀、
-`d` 刪一封 vs `D` 刪範圍），違反「PTT 邏輯不准猜」。
+**複合鍵逐鍵可點（2026-09）。** `(=[]<>)`（同標題前後篇）、`(/?a)`（搜尋）、
+`(v/V)`（已讀／未讀）、`(R/y)`、`[↑↓]`、`(X%)` 這種多鍵組拆成逐個 atom，
+各自一顆按鈕，「指哪就觸發該鍵」。**絕不可以「取第一個鍵」**：`v` 標已讀 vs `V` 標
+未讀、`d` 刪一封 vs `D` 刪範圍，語意完全相反。
+
+拆解在 `footer_keys.tokenizeKeyGroup(inner)`，規則是**全有全無**——只要有一個字認不
+出來，**整組**維持純文字。這是「PTT 邏輯不准猜」在這裡的落點：
+
+| 規則（順序不可調換） | 例 |
+|---|---|
+| 1. 整組本來就是一個鍵 → 單一 atom | `Ctrl-P` `^X` `PgUp` `y`。**必須最前面**，否則 `Ctrl-P` 會被第 2 條當成「Ctrl 到 P」 |
+| 2. 範圍寫法 → 整組 null | `(0-9)` `(1-9)` `(2 - 9)` `(0~255)` |
+| 3. 含 `/` 且切完每段都非空 → 每段各自必須恰好是一個 atom | `(v/V)` `(X/%)` `(enter/→)`；`(^Z/F1)` 因為 `F1` 查不到 byte 而**整組**不可點 |
+| 4. 串接裡含**數字** → 整組 null | pmore 狀態列的 `(100%)`（`pmore.c:2144` 的 `(%3d%%)`，100 沒有前導空白）與舊版狀態列的 `(53%)`（`pmore.c:2125` 的 `(%d%%)`）—— 不擋就會多出 `1` `0` `0` `%` 四顆**送得出去**的按鈕（`%` 在 pmore 是推文、數字是跳頁）。只管串接：`(1)` 走規則 1、`(0-9)` 走規則 2 |
+| 5. 其餘 → 串接掃描（多字元具名鍵長的優先 → `Ctrl-X`／`^X` → 單一 ASCII 可見字元） | `[↑↓]` `(=[]<>)` `(/?a)`（第一段是空字串 ⇒ 落到這條）`(k↑j↓)` `(X%)` `(←q)` |
+| 任何一步認不出來 → 整組 null | `(空白/PgDn)`（`空白` 不是鍵名，`NAMED_KEYS` 只有 `空白鍵`）、`(A, B, C...)`、`[正常白字黑底]`、`(1~30天)` |
+
+具名鍵比對**大小寫不敏感**（原始碼裡 `enter`／`TAB`／`END`／`DEL` 都出現過：
+`announce.c:271`／`talk.c:1355`／`psb.c:205,648`）。
+
+**邊界（使用者 2026-09 定案 D3）：**
+
+| 情況 | 可點範圍 |
+|---|---|
+| 單鍵組（`(y)` `[d]`） | **整組含括號**（維持現況：零回歸、hit area 大，且邊界必落在 ASCII 的括號上） |
+| 複合組（`[↑↓]` `(v/V)`） | **只有 atom 本身**，`(` `)` `[` `]` `/` 維持純文字 |
+
+`(v/V)` 的 `v` 因此只有一格寬（約 8px）——**這是刻意的**，「指哪就觸發該鍵」不容許
+把 `/` 或 `)` 算進某一顆按鈕。**不要**為了放大 hit area 在 renderer／CSS 加 `padding`：
+那會位移等寬格線、破壞 `.wpadding` 的寬度契約。日後真要加寬，只能改
+`tokenizeKeyGroup` 的輸出範圍，一處決定。
+
+`findFunctionKeyTokens` 的巢狀保護連帶放寬：**`(` 組允許 inner 含 `[` `]`**
+（`(=[]<>)` 的方括號就是兩顆按鍵本身），仍禁止圓括號；`[` 組維持「不得含任何括號」。
+
+**渲染端零改動**：`render/link_segment.js` 的「先 close 再 open」舞步本來就支援相鄰
+段，複合組只是多產出幾筆 `fnKeys`。
 
 | 層 | 檔案 | 職責 |
 |---|---|---|
@@ -402,7 +631,7 @@ DBCS 雙色字），只找一層在那種字上會漏判。同一個 bug 在
 順序固定（漏一步都會壞）：
 
 1. `modalShown` → return（元素層 listener 早跑，`mouse_click` 攔不到，見上方優先權表）
-2. `aidNavigation.active` → 提示後 return
+2. `serializedOpHint`（AID 跳文／長推文在途）→ 提示後 return。條件與提示文字是**四條送字入口共用**的述詞（`serialized_op_gate.js`：另三條是 `term_view.onKeyDown`／`onTextInput`、`App.onPasteDone`）
 3. `listSession.onFunctionKey(bytes)` 回 true → 它接手了（v5 封閉互動，見下）
 4. `functionKeyClickPlan` → 文章好讀時**先** `_enterFunctionMode()` 再送 byte
 5. `commandQueue.inFlightKind` → 提示後 return
@@ -446,6 +675,76 @@ DBCS 雙色字），只找一層在那種字上會漏判。同一個 bug 在
 （`term_view._mirrorStatusRowToFooter` → `term_ui.renderOverlayRow` 的第 4 參數），
 所以它自己呼叫 `parseFunctionKeys`。它沒有 `pointer-events:none` ⇒ 點得到；每次都整個
 `replaceChildren` 重建，listener 隨舊節點丟掉，無洩漏。
+
+### 輸入欄開著時**一顆按鈕都不准畫**（硬需求）
+
+`[Y/n]`（`bbs.c:3060` 小天使匿名詢問）與 ` 確定[y/N]:`（`bbs.c:3098`）都畫在
+**最後一列** ＝ `functionKeyRows` 會掃的那一列。複合鍵一放開它們立刻變成兩顆按鈕，
+但 `vans`／`getdata` 走的是**整行輸入**（`vtuikit.c#vgets`）—— 點 `Y` 只會把字打進
+欄位、**不會送出**，使用者會以為壞掉；更糟的是「要使用小天使匿名推文嗎？ [Y/n]」
+的語意是「空 Enter ＝匿名 YES」。
+
+⇒ `term_view._renderScreenLines` 算 `fnRows` 的地方與 `_mirrorStatusRowToFooter`
+**兩處都要 `&& !this.buf.isCursorOnInputField()`**。這與 `resolveMouseRegion` 的
+`inputPrompt` 早退、`cursor_highlight` 的 `inputPrompt`、`nav_key_gate` 的同一條判斷
+**是同一個事實**，四處一致才守得住。守護：`tests/unit/fnkeys_input_field_gate.test.js`
+（靜態掃描）＋ `tests/e2e/offline/screen_dismiss.offline.spec.js`（行為）。
+
+`fnRows` 已在 `annotationsKey` 裡，所以這個布林翻轉時節點會正確重建；
+`_mirrorStatusRowToFooter` 每次整個 `replaceChildren`，也沒問題。
+
+## 點空白處關框（2026-09）
+
+PTT 停在「等一個按鍵」的畫面時，滑鼠原本**沒有任何出口**：`resolveMouseRegion` 對
+pageState 5 走 `default`、對 `inputPrompt` 更是整幀早退，使用者只能去鍵盤敲一下。
+點畫面空白處 → 送對應的收尾鍵。
+
+| 類別 | 畫面指紋（只看**最後一列**） | 送什麼 | pttbbs 出處 |
+|---|---|---|---|
+| pressanykey | 含 `請按任意鍵繼續`（`VMSG_PAUSE`，左右是 `▄` padding） | **空白鍵** | `proto.h:657` `pressanykey()=vmsg(NULL)` → `vtuikit.c:328` |
+| vmsg 橫幅 | ` ◆ <訊息>` ＋右靠 ` [按任意鍵繼續]`（`push_screen.parseVmsgText`） | **空白鍵** | `vtuikit.c:439-455`、`vtuikit.h:41-42` |
+| vgetstring 輸入欄 | `buf.isCursorOnInputField()`（游標格白底黑字、該列非整列反白） | **`Ctrl-C`**（`\x03`） | `vtuikit.c:1346` `case Ctrl('C')` ⇒ abort ⇒ `getdata` 回 0 |
+
+判斷順序**輸入欄優先**：`vans`／`getdata` 的提示與訊息列長得像，但游標在不在反白欄
+裡是確定的。
+
+| 層 | 檔案 | 職責 |
+|---|---|---|
+| 判斷（純函式） | `src/js/screen_dismiss.js` | `resolveDismiss({lastRowText, cursorOnInputField})` → `{kind, bytes}`／`null`；`dismissClickAllowed({clickRow, cursorRow})`；`KEY_ABORT`／`KEY_DISMISS` 常數（與 `long_push_session` **共用同一份**） |
+| 事實 | `term_buf.dismissTarget()` | 餵 `getRowText(rows-1)` 與 `isCursorOnInputField()`，**每次現算不快取** |
+| 指標 | `mouse_regions.resolveMouseRegion` 的 `dismiss` 輸入 | 只換 `pointer`，**不上底色**（框在時下方整片是殘影，上底色會讓人以為那裡可以點）；**排在 `inputPrompt` 早退之前** |
+| 送鍵 | `App.mouse_click`（優先權第 8 條） | 現算 `dismissTarget()`，`preventDefault` 後 `view._send` |
+
+### 幾個不可以踩的地方
+
+- **不可以「點空白就送一個安全鍵」**。**沒有安全鍵**：`Ctrl-C` 在文章列表是
+  `ClearTagList()`（`read.c:950-955`，清掉標記清單）、空白鍵在文章裡是翻頁。
+  `resolveDismiss` 回 `null` 就是什麼都不做。
+- **不可以用 `\f`(Ctrl-L) 關框**：`io.c:228-247` 的 `system_key_hook` 回
+  `KEY_INCOMPLETE`，`vkey()` 直接 `continue` ⇒ 它**不算按鍵**，用它關框會整串位移
+  一格（`docs/pttbbs-screen-protocol.md` §6 有實錯記錄）。
+- **不可以用 `pageState === 5` 當判準**：它有第二條完全不同的來源
+  （`setPageState` 的 `isUnicolor(lastRow,28,53) && cur_y==lastRow && cur_x==cols-1`
+  啟發式），那種畫面不保證在等按鍵；反過來 vmsg 橫幅根本不會讓 `setPageState` 轉 5。
+- **送鍵刻意不走 `buf.mouseAction`**：`term_buf.notify()` 每個 `changed` 幀都
+  `clearHighlight()` 把它清成 `none`，而框正是「畫面剛變出來」的東西 ⇒ 使用者不動
+  滑鼠直接點時必定讀到 `none`，按鈕會像壞掉。所以在點擊當下現算。
+- **游標所在那一列不算空白處**（D2）：輸入欄開著時那一列是使用者正在打的字，
+  `pressanykey` 的 `▄` 橫幅也在那一列（`vshowmsg` 一律 `move(b_lines,0)`）。
+  點它**不送鍵，但仍 `preventDefault`**——框開著時整個畫面都是我們的。
+- **列表好讀的 buffer/frozen 不走這條**：那是 v5 封閉互動，直送 byte 會打亂
+  CommandQueue。所有會開框的鍵在列表好讀底下都走 `_beginPassthroughBytes` →
+  `_enterFunctionMode()` → 原生鏡像，所以框出現時 `listRenderMode` 已經是 `native`
+  （實測確認）。若哪天驗出 frozen 也會出現框，改成呼叫 `ListSession.onDismissClick()`
+  走 queue，不要繞過它。
+- **一次點＝一步**：型別選單那種畫面送任何非數字都會前進到下一步而不是取消
+  （`bbs.c:3000-3004`），所以「一次點不一定關得掉」是正常的 ——
+  `long_push_session._enqueueAbort` 用的是同一個模型（重複送、每次重新分類畫面）。
+- **`buf.getRowText` 只有在重畫之後才有意義**：`TermChar.isLeadByte` 是
+  `term_buf.updateCharAttr` 設的，而那支只在 `notify`（30ms debounce）→ redraw 的路上
+  跑 ⇒ 剛餵完資料時 `getRowText` 還吐原始 Big5 位元組。產品端不受影響（使用者的點擊
+  永遠在重畫之後），但**寫測試時不可以拿它當「畫面就緒」的判準**
+  （`screen_dismiss.offline.spec.js` 踩過，症狀是送出 0 byte）。
 
 ## 左側退出提示帶（`#exitHintBand`）
 
@@ -509,15 +808,25 @@ React 改寫以來**從未生效過**（只有 `pointer`/`default`/`auto` 有作
 | `tests/unit/pref_modal_mouse_tab.test.jsx` | 設定分頁的欄位、預設值、子項 disabled、選項值域 |
 | `tests/unit/pref_schema_mouse.test.js` | 新 key 齊備、舊 key 已移除、殘值不復活 |
 | `tests/unit/i18n_parity.test.js` | 兩語系 key 集合一致 |
-| `tests/unit/footer_keys.test.js` | 功能鍵解析：單鍵可點／多鍵組不可點／具名鍵 byte／**DBCS 欄位換算**／`functionKeyRows` |
+| `tests/unit/footer_keys.test.js` | 功能鍵解析：單鍵可點／**複合鍵拆 atom（`tokenizeKeyGroup` 的全有全無清單）**／具名鍵 byte／**DBCS 欄位換算**／`functionKeyRows` |
 | `tests/unit/screen_fnkeys_render.test.js` | `a.fnKey` 的屬性、`onClick`、與部分底色共存、沒給 `fnKeys` 時 DOM 逐字不變 |
 | `tests/unit/function_key_click_plan.test.js` | 文章好讀先進 functionMode／`←` 走 stopEasyReading |
 | `tests/unit/list_function_key.test.js` | 列表好讀的 `onFunctionKey` / `onMouseExitClick`（白名單走 reducer、其餘 passthrough、忙碌時給提示） |
 | `tests/unit/screen_dirty_rows.test.js` | 切 pref 後按鈕真的出現／消失（`annotationsKey` 的回歸鎖，兩條分支各一） |
 | `tests/unit/mouse_dblclick_skip.test.js` | 第二次 mousedown 不得 `preventDefault`（雙擊選字） |
-| `tests/unit/fixtures/screen_golden/list_native_fnkeys.html`／`article_footer_fnkeys.html` | 整列 DOM 快照（含多鍵組維持純文字） |
+| `tests/unit/fixtures/screen_golden/list_native_fnkeys.html`／`article_footer_fnkeys.html` | 整列 DOM 快照（含複合組拆成的相鄰多顆 `a.fnKey`） |
 | `tests/e2e/offline/mouse.offline.spec.js` | 提示帶／pointer-events／像素對齊／優先權／總開關／推文列可點區（防誤觸三態）／**列表左側退出帶** |
-| `tests/e2e/offline/function_keys.offline.spec.js` | 三條 render 分支各自都接上了、點了真的送鍵、切 pref 立即生效 |
+| `tests/e2e/offline/function_keys.offline.spec.js` | 三條 render 分支各自都接上了、點了真的送鍵、切 pref 立即生效、**`(X%)` 逐鍵送不同鍵＋括號不可點（D3）** |
+| `tests/unit/screen_dismiss.test.js` | 關框判斷：三種指紋／輸入欄優先／`pageState 5` 第二來源不得誤判／游標列不算空白處 |
+| `tests/unit/screen_dismiss_click.test.js` | `App.mouse_click` 的接線：現算而非讀 `mouseAction`、gate、buffer/frozen 不直送、連結優先 |
+| `tests/unit/fnkeys_input_field_gate.test.js` | 輸入欄開著時兩處 render 分支都不畫按鈕（靜態掃描） |
+| `tests/e2e/offline/screen_dismiss.offline.spec.js` | 合成畫面：三種框各送對的 byte、沒有框時 0 byte、D2、pref gate、`[y/N]` 上不出現按鈕 |
 | `tests/e2e/offline/selection.offline.spec.js` | 雙擊選詞／三擊選行（**必須跑 offline-firefox**） |
+| `tests/unit/swipe_gesture.test.js` | 手勢辨識的六條不變量（對角線／閾值／慣性只一次／方向翻轉／`deltaMode`／`timeStamp` 0） |
+| `tests/unit/nav_key_gate.test.js` | 送鍵守門：pageState 範圍／輸入框／modal／未連線 |
+| `tests/unit/history_back_guard.test.js` | sentinel：先 activation 才疊、popstate 補回＋送鍵、pref 關閉不疊、連按兩次離站 |
+| `tests/unit/term_view_send_key_as_user.test.js` | 合成事件三條硬規則（`cancelable`／上游接手不重送／列表好讀走 `ListSession`） |
+| `tests/unit/wheel_horizontal.test.js` | **水平 wheel 不得翻頁**的回歸鎖 ＋ 手勢入口的 pref 獨立性 |
+| `tests/e2e/offline/swipe_back.offline.spec.js` | 真 wheel 事件只送一次 `←`、真 History API 上 `goBack()` 被吃掉且沒離站 |
 | `tests/e2e/offline/easy-reading-list.offline.spec.js` | 列表好讀的底色左緣＝標題欄、切防誤觸後回到整列 |
 | `tests/e2e/offline/wheel_stuck_button.offline.spec.js` | 按鍵旗標卡死的三條路徑 |

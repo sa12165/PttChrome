@@ -555,6 +555,26 @@ export const PrefModal = ({
                   {i18n("options_enableEasyReadingList")}
                 </PrefCheckbox>
                 <PrefCheckbox
+                  name="enableBoardListSmoothScroll"
+                  checked={values.enableBoardListSmoothScroll}
+                  onChange={onCheckboxChange}
+                >
+                  {i18n("options_enableBoardListSmoothScroll")}
+                </PrefCheckbox>
+                <Text size="xs" c="dimmed">
+                  {i18n("tooltip_enableBoardListSmoothScroll")}
+                </Text>
+                <PrefCheckbox
+                  name="enableListNativeAutoResume"
+                  checked={values.enableListNativeAutoResume}
+                  onChange={onCheckboxChange}
+                >
+                  {i18n("options_enableListNativeAutoResume")}
+                </PrefCheckbox>
+                <Text size="xs" c="dimmed">
+                  {i18n("tooltip_enableListNativeAutoResume")}
+                </Text>
+                <PrefCheckbox
                   name="easyReadingEndSwitchNative"
                   checked={values.easyReadingEndSwitchNative}
                   onChange={onCheckboxChange}
@@ -957,6 +977,25 @@ export const PrefModal = ({
                   {i18n("tooltip_mouseWheelSmoothScroll")}
                 </Text>
               </fieldset>
+              {/* 瀏覽器的「返回」（觸控板左滑手勢／滑鼠側鍵／Alt+←／工具列）
+                  → 左方向鍵。**一個 pref、一條實作**（history sentinel），刻意不
+                  掛在滾輪底下 —— 見 mouse_regions.resolveMouseGates。 */}
+              <fieldset className="PrefModal__Grid__Col--right__Fieldset">
+                <legend>{i18n("options_mouseBackNav")}</legend>
+                <Select
+                  aria-label={i18n("options_mouseBackNav")}
+                  name="mouseBackNav"
+                  value={String(values.mouseBackNav)}
+                  allowDeselect={false}
+                  disabled={!values.useMouseBrowsing}
+                  onChange={(val) => onSelectNum("mouseBackNav", val)}
+                  data={selectData(["options_none", "options_leftKey"])}
+                  mb="xs"
+                />
+                <Text size="xs" c="dimmed">
+                  {i18n("tooltip_mouseBackNav")}
+                </Text>
+              </fieldset>
             </Tabs.Panel>
             <Tabs.Panel value="connection">
               <fieldset className="PrefModal__Grid__Col--right__Fieldset">
@@ -1024,6 +1063,13 @@ export const PrefModal = ({
                   onChange={onCheckboxChange}
                 >
                   {i18n("options_mergeSameAuthorComments")}
+                </PrefCheckbox>
+                <PrefCheckbox
+                  name="commentBlockSpacing"
+                  checked={values.commentBlockSpacing}
+                  onChange={onCheckboxChange}
+                >
+                  {i18n("options_commentBlockSpacing")}
                 </PrefCheckbox>
                 <PrefCheckbox
                   name="highlightAuthorComments"

@@ -13,6 +13,7 @@ import {
   resolveMouseRegion,
   cursorCss
 } from './mouse_regions';
+import { resolveDismiss } from './screen_dismiss';
 
 // Quiet period (ms) after the last redraw window before pageState is promoted to
 // `settledPageState`. Must exceed the 30ms notify debounce so a transient
@@ -255,6 +256,22 @@ export function TermBuf(cols, rows) {
   this.lines = new Array(rows);
 
   this.pageLines = [];
+
+  // ---- 列表好讀的累積緩衝（兩種列表各一份，刻意不共用）----------------------
+  // listRenderMode：'native' | 'buffer' | 'frozen' —— 全專案十幾個消費端的分岔點
+  // （滑鼠座標換算、左鍵路徑、滾輪、游標高亮、onMouse_move…）。
+  // listRenderOwner：buffer/frozen 時是誰在畫（js/list_render_owner.js 的
+  // OWNER_ARTICLE_LIST / OWNER_BOARD_LIST）。兩個 session 都掛在 screenSettled 上，
+  // **同一幀**可能一邊要 engage、另一邊要收攤 ⇒ 沒有這個欄位就是靜默的競態。
+  this.listRenderMode = 'native';
+  this.listRenderOwner = null;
+  // 文章列表（ListSession）：升冪的文章列 ＋ 平行的文章編號（置底列為 null）。
+  this.listLines = [];
+  this.listLineNums = [];
+  // 看板列表（BoardListSession）：升冪的看板列 ＋ 平行的看板編號。**獨立欄位**——
+  // 共用的話「進板 → ← 回看板列表」會讓兩個 session 的 cleanup 互相清掉對方的緩衝。
+  this.brdListLines = [];
+  this.brdListLineNums = [];
 
   // 逐列 dirty 旗標：updateCharAttr 升起（由 ch.needUpdate 聚合）、term_view.redraw
   // 是**唯一**的清除點。初值全 true ＝ 首幀必須整份畫一次；redraw 用嚴格
@@ -1261,6 +1278,19 @@ TermBuf.prototype = {
     return isReversedCell(line[this.cur_x]) && !isReversedCell(line[0]);
   },
 
+  // 這一幀有沒有一個「滑鼠關得掉的框」（pressanykey／vmsg 橫幅／vgetstring 輸入
+  // 欄）→ { kind, bytes }，沒有回 null。判斷本身在純函式
+  // screen_dismiss.resolveDismiss（pttbbs 出處逐條在那裡），這裡只餵事實。
+  //
+  // **每次呼叫都現算**，不快取：框是「畫面剛變出來」的東西，任何跨幀的暫存都會
+  // 在使用者不動滑鼠直接點的那一下讀到過期值。
+  dismissTarget: function() {
+    return resolveDismiss({
+      lastRowText: this.getRowText(this.rows - 1, 0, this.cols),
+      cursorOnInputField: this.isCursorOnInputField()
+    });
+  },
+
   // 滑鼠移到 (tcol, trow)：算出這一格的語意、更新游標底色列、換滑鼠指標、開關
   // 文章左側的退出提示帶。決策本身在純函式 mouse_regions.resolveMouseRegion
   // （逐格的行為表與依據見那裡與 docs/mouse.md），這裡只負責套用。
@@ -1290,7 +1320,10 @@ TermBuf.prototype = {
         this.useMouseBrowsing && this.view && this.view.mouseMisclickGuard
       ),
       // PTT 開著輸入框 ⇒ 這一幀什麼都不能點也不上色（見 resolveMouseRegion）。
-      inputPrompt: this.isCursorOnInputField()
+      inputPrompt: this.isCursorOnInputField(),
+      // 框開著（pressanykey／vmsg／輸入欄）⇒ 整片是「點空白處關框」的目標，
+      // 只換指標。**送鍵不在這條路上**（見 App.mouse_click 的說明）。
+      dismiss: this.dismissTarget()
     });
 
     this.mouseAction = region.action;

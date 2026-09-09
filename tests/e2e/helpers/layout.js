@@ -325,9 +325,12 @@ async function plainLeftEdge(page, { settleTimeout = 60000 } = {}) {
 // 判定分兩級，因為它們的相依對象不同：
 //   mounted  ＝ slot 裡出現任何預覽產物（含讀取中指示器）。這只證明延遲載入鏈通了，
 //              **與圖床可不可達無關** ⇒ 可以當必驗斷言。
-//   media    ＝ 真的出現 <img class=hyperLinkPreview>/<video>/<iframe>（loadedImage
-//              再加上 offsetWidth>0）。解析／下載成功才有 ⇒ 依賴外網，呼叫端只能拿它
-//              當「機會性」斷言。
+//   media    ＝ 真的出現 <img class=hyperLinkPreview>/<video>/<iframe>。解析／下載
+//              成功才有 ⇒ 依賴外網，呼叫端只能拿它當「機會性」斷言。
+//   loadedImage ＝ 上面那些之中**真的有一張 <img> 畫出來**（offsetWidth>0）。
+//              與 media 分開是因為呼叫端的「點圖放大」只對 img 成立：iframe-only
+//              的文章（YouTube 開頭）必須落在這一級之外，否則守門會放行到一段
+//              找不到 img 的斷言（見下方 loaded 的計算）。
 // 一律**不丟錯**：要斷言還是 skip 由呼叫端決定（同 waitEasyReadingComplete 的約定）。
 const MOUNTED_SEL =
   'img.hyperLinkPreview, video, iframe, .previewLoading, .previewError';
@@ -382,8 +385,14 @@ async function seekMountedPreview(
         const slot = document.querySelector('[data-e2e-slot-key="' + k + '"]');
         if (!slot) return { gone: true };
         const medias = slot.querySelectorAll(media);
+        // loaded ＝**真的有一張 <img> 畫出來了**（不含 video/iframe）。呼叫端拿它當
+        // 「點圖放大」那段斷言的守門，而那段只找得到 img ——
+        // 以前這裡把任何 media（含 YouTube 的 iframe）算進來，於是首圖是 YouTube 的
+        // 文章會通過守門、接著在 `im.getBoundingClientRect()` 上 TypeError
+        //（2026-09-03 live：C_Chat 最新一篇剛好是 YouTube 開頭）。
         let loaded = false;
-        for (const m of medias) if (m.offsetWidth > 0) loaded = true;
+        for (const m of slot.querySelectorAll('img.hyperLinkPreview'))
+          if (m.offsetWidth > 0) loaded = true;
         return {
           mounted: !!slot.querySelector(mounted),
           media: medias.length > 0,
@@ -439,6 +448,45 @@ async function seekMountedPreview(
   return result;
 }
 
+// 捲動位置停下來了嗎：連續 N 次取樣相同才算停。
+//
+// 為什麼不是 waitForTimeout：程式化的平滑捲動（scrollTo({behavior:'smooth'})）在
+// 按鍵停止之後還會繼續把畫面帶走一段距離 —— 那正是「放開後畫面自己又捲了 1~2 頁」
+// 這類 bug 的形狀。固定睡一段時間只能碰運氣抓到中間某一格；要斷言「已經停了」就得
+// 看**連續幾次取樣不再變**。回傳停下來時的 scrollTop。
+async function waitScrollStable(
+  page,
+  selector,
+  { samples = 3, interval = 100, timeout = 8000, tolerance = 0.5 } = {}
+) {
+  const deadline = Date.now() + timeout;
+  let last = null;
+  let stable = 0;
+  const seen = [];
+  while (Date.now() < deadline) {
+    const top = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el ? el.scrollTop : null;
+    }, selector);
+    if (top === null) throw new Error('waitScrollStable：找不到元素 ' + selector);
+    seen.push(Math.round(top));
+    if (last !== null && Math.abs(top - last) < tolerance) {
+      if (++stable >= samples - 1) return top;
+    } else {
+      stable = 0;
+    }
+    last = top;
+    await sleep(interval);
+  }
+  throw new Error(
+    'waitScrollStable 逾時：' +
+      selector +
+      ' 的 scrollTop 一直在動（最後取樣 ' +
+      seen.slice(-6).join(' → ') +
+      '）'
+  );
+}
+
 module.exports = {
   OVERRIDING_SEL,
   MEDIA_SEL,
@@ -454,4 +502,5 @@ module.exports = {
   stableCommentRow,
   waitPreviewsSettled,
   waitRectStable,
+  waitScrollStable,
 };

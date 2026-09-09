@@ -6,6 +6,8 @@ import { TelnetConnection } from './telnet';
 import { Websocket } from './websocket';
 import { EasyReading, switchModePlan } from './easy_reading';
 import { ListSession } from './list_session';
+import { BoardListSession } from './board_list_session';
+import { OWNER_BOARD_LIST, listRenderOwnerOf } from './list_render_owner';
 import { CommandQueue } from './command_queue';
 import { AidNavigation } from './aid_navigation';
 import { LongPushSession } from './long_push_session';
@@ -14,7 +16,6 @@ import { AutoLogin } from './auto_login';
 import { parseBlacklist, parseTitleBlacklist } from './comment_parse';
 import { MouseButtonTracker } from './mouse_button_tracker';
 import { LIST_HEADER_ROWS } from './list_window';
-import { wheelDeltaToPx } from './wheel_scroll';
 import {
   ACT_NONE,
   ACT_ENTER,
@@ -24,7 +25,16 @@ import {
   resolveMouseGates
 } from './mouse_regions';
 import { colFromClientX } from './mouse_geometry';
+import { dismissClickAllowed } from './screen_dismiss';
 import { functionKeyClickPlan, LEFT_ARROW } from './function_key_plan';
+import { serializedOpHint } from './serialized_op_gate';
+import {
+  MFDISP_RAW_PLAIN,
+  rawModeKey,
+  rawModePrefRowVisible
+} from './pmore_pref';
+import { navKeyAllowed } from './nav_key_gate';
+import { isHorizontalWheel } from './swipe_gesture';
 import { isPreviewTarget } from './preview_targets';
 import { ImageUploadController, isUploadLayerTarget } from './image_upload_controller';
 import { i18n } from './i18n';
@@ -106,6 +116,13 @@ export const App = function() {
     onIdle: () => this.easyReading.onWireIdle()
   });
   this.listSession = new ListSession(this, this.view, this.buf, this.commandQueue);
+  // 看板列表（我的最愛／分類看板子分類）的平滑捲動。與 listSession 共用
+  // buf.listRenderMode（所有權層見 js/list_render_owner.js）與同一條 CommandQueue
+  // （命令一律 'brd-' 前綴，那是佇列的所有權判準）。
+  // **順序有意義**：它的 screenSettled listener 排在 listSession 之後，於是「離開
+  // 看板列表→進板」那一幀 listSession 先 engage、我們後收攤，收攤的 flushKind 才
+  // 不會把對方剛排進去的 prefetch 殺掉。
+  this.boardListSession = new BoardListSession(this, this.view, this.buf, this.commandQueue);
   // AID (#文章代碼) link click → serialized native-key navigation to the target
   // article. A boardless link falls back to the current article's board
   // (tracked by term_view alongside articleAuthor).
@@ -122,6 +139,9 @@ export const App = function() {
   // outerHTML 節點重用都以它的參考身分為前提（每幀新建箭頭函式會讓整份標註快取
   // 每幀失效，長文直接回到 O(n²)）。
   this.view.onFunctionKey = (bytes, label) => this.onFunctionKey(bytes, label);
+  // 「開燈」的軌 B：把 pmore 的色彩顯示模式切成純文字（或切回預設格式化）。
+  // **只指派這一次，引用從此不變**（同 onFunctionKey 的理由）。
+  this.view.onLightsRawMode = (mode) => this.onLightsRawMode(mode);
   // Deep link (外部連結 #<Board>/<AID>) → 同一套 AID 跳轉。目標可能比登入先到，
   // 所以排程權在 controller 手上，不在 URL 解析那邊。
   this.deepLinkController = new DeepLinkController(this, this.view, this.buf);
@@ -129,7 +149,6 @@ export const App = function() {
   // 圖片上傳（urusai）：拖放／貼上截圖／右鍵選單 → 上傳 → 網址送進推文列或編輯器。
   // 自己綁 window 的 drag* 事件；右鍵選單透過 this.imageUpload 呼叫它。
   this.imageUpload = new ImageUploadController(this);
-
   // Debug 錄製器（src/js/debug_recorder.js）：由 DebugRecordButton 掛上/卸下，
   // 純 runtime、不落地。關鍵路徑用 this.debugRecorder?.log(tag, info) 留痕。
   this.debugRecorder = null;
@@ -369,6 +388,7 @@ App.prototype.onClose = function() {
   // Connection gone: the list buffer is stale by definition — hard reset to
   // idle/native so the reconnect starts clean.
   this.listSession.disable();
+  this.boardListSession.disable();
   // Same for the AID back stack: its anchors are replayed as key sequences and
   // rely on this session's per-board cursors (pttbbs getkeep), which die with it.
   this.aidNavigation.reset();
@@ -542,10 +562,12 @@ App.prototype.doCopyAnsi = function() {
     return;
 
   var selection = this.lastSelection;
-  var pageLines = null;
-  if (this.view.useEasyReadingMode && this.buf.pageState == 3) {
-    pageLines = this.buf.pageLines;
-  }
+  // 選取的 row 是 DOM 的 data-row ＝「這一幀交給 <Screen> 的 lines index」，所以
+  // 反查內容只能用同一份（term_view._renderScreenLines 記下的那份），不能用
+  // buf.lines —— 列表好讀畫的是自己組的虛擬視窗，列數與內容都與 server 真實
+  // 24 列不對應（超出 24 的列在 getText 裡直接 TypeError）。null＝還沒 render 過，
+  // getText 自己會退回 buf.lines。守護：tests/unit/list_copy_ansi.test.js。
+  var pageLines = (this.view && this.view._renderedLines) || null;
 
   var ansiText = '';
   if (selection.start.row == selection.end.row) {
@@ -599,10 +621,23 @@ App.prototype.showPasteUnimplemented = function() {
 // Single funnel for every paste route (DOM paste on #t, Ctrl-Shift-V, context
 // menu, middle click) — so both easy-reading modes only have to be taught here.
 App.prototype.onPasteDone = function(content) {
+  // 序列化操作（AID 跳文／長推文）在途：貼上的 bytes 會插進程式化的鍵序列中間。
+  // **排在 listSession.onPaste 之前**——那條會把內容排進同一條 CommandQueue。
+  // 這裡不是重複 onTextInput 的守門：這個漏斗有三個呼叫端（onDOMPaste、doPaste、
+  // image_upload_controller），而列表好讀接手那條根本走不到 view.onTextInput。
+  const busyHint = serializedOpHint(this);
+  if (busyHint) {
+    if (this.view.flashListHint)
+      this.view.flashListHint(busyHint);
+    return;
+  }
+
   // List easy reading owns the wire while it renders the buffer: a raw convSend
   // would race its serialized commands AND land on a screen the user can't see.
   // onPaste returns false when it isn't engaged (native mirror / idle).
-  if (this.listSession && this.listSession.onPaste(content))
+  this.noteListNativeInput(); // 原生鏡像下 activeListSession() 回 null，見該函式
+  const pasteOwner = this.activeListSession();
+  if (pasteOwner && pasteOwner.onPaste(content))
     return;
 
   // Article easy reading: the same blind spot in miniature. _onKeyDown enters
@@ -627,20 +662,19 @@ App.prototype.onPasteDone = function(content) {
 App.prototype.onFunctionKey = function(bytes, label) {
   if (!bytes) return;
   if (this.modalShown) return;
-  if (this.aidNavigation && this.aidNavigation.active) {
+  // 序列化操作（AID 跳文／長推文）在途：整條序列在程式化按 PTT 的鍵，插一個進去
+  // 就會打亂 X → 型別 → 內容 的配對（長推文的進度遮罩本身也會讓 modalShown 擋住，
+  // 這裡是同一條件的自保）。條件與提示文字四條入口共用，見 serialized_op_gate.js。
+  const busyHint = serializedOpHint(this);
+  if (busyHint) {
     if (this.view.flashListHint)
-      this.view.flashListHint('AID 跳文中，請稍候…');
-    return;
-  }
-  // 長推文送出中：整條序列在程式化按 PTT 的鍵，插一個進去就會打亂 X → 型別 →
-  // 內容 的配對（進度遮罩本身也會讓 modalShown 擋住，這裡是同一條件的自保）。
-  if (this.longPush && this.longPush.active) {
-    if (this.view.flashListHint)
-      this.view.flashListHint('長推文送出中，請稍候…');
+      this.view.flashListHint(busyHint);
     return;
   }
   // 列表好讀：封閉互動（v5）。回 true ＝它接手了，不可以再送一次。
-  if (this.listSession && this.listSession.onFunctionKey(bytes)) return;
+  this.noteListNativeInput(); // 同上：點功能鍵也是使用者送 byte
+  const fnOwner = this.activeListSession();
+  if (fnOwner && fnOwner.onFunctionKey(bytes)) return;
 
   const plan = functionKeyClickPlan({
     bytes: bytes,
@@ -669,6 +703,66 @@ App.prototype.onFunctionKey = function(bytes, label) {
   // **不用 _convSend**（會做 u2b 轉碼，對 [D 這種控制序列無意義），
   // **不用 setBBSCmd**（那是翻頁語意的分派器），**絕不用 this.view.conn.send**。
   this.view._send(bytes);
+};
+
+// 「開燈」按鈕的軌 B：替使用者切 pmore 的色彩顯示模式（bpref.rawmode）。
+//
+// 為什麼非切不可：PTT server 在送出畫面之前就把「前景色==背景色」的**半形**格換成
+// 空白了（pfterm.c 的 PFTERM_DISABLE_HIDDEN_MESSAGE），那些字**根本沒到瀏覽器**，
+// 本地怎麼改 CSS 都救不回來。唯一的路是讓 server 用不上色的模式重送一次。
+//
+// **必須序列化成兩步，不可以把 `\3` 兩個 byte 一次送出**：pttbbs 的 typeahead 會把
+// 中間那一幀吞掉（docs/pttbbs-screen-protocol.md §2），而 `3` 若落回文章按鍵是
+// pmore 的「跳至第 3 頁」，會把使用者彈到別的地方。所以第一步用 CommandQueue 送
+// `\` 並以**畫面內容**（選項列出現）判定完成，確定進了設定頁才送數字鍵。
+//
+// 第二步刻意**不**再排一條 queue 命令：EasyReading 的 screenSettled listener 註冊在
+// listSession（＝驅動 queue.onSettle 的那個）之前，所以「文章回來」那一幀
+// _evalFunctionModeExit 會比 queue.onDone 先跑；此時若還有命令在飛，
+// easy_reading._send 的 _wireBusy 閘門會把 reenterFromTop 的 Home 直接丟掉
+// （整篇重讀就失效了）。cmd1.onDone 執行時 queue 已 _finish()，線路是空的。
+App.prototype.onLightsRawMode = function(mode) {
+  const key = rawModeKey(mode);
+  if (!key) return;
+  if (this.modalShown) return;
+  const busyHint = serializedOpHint(this);
+  if (busyHint) {
+    if (this.view.flashListHint) this.view.flashListHint(busyHint);
+    return;
+  }
+  if (!this.commandQueue) return;
+  if (this.commandQueue.inFlightKind) {
+    if (this.view.flashListHint)
+      this.view.flashListHint('指令處理中，請稍候…');
+    return;
+  }
+  // 送 byte **之前**先進原生鏡像：設定頁畫在原生 24 列上，好讀的累積長頁卻原封
+  // 不動 ⇒ 使用者根本看不到它（同 onFunctionKey / onPasteDone 的既有結論）。
+  // _enterFunctionMode 在好讀關著或已在鏡像中時是 no-op。
+  if (this.view.useEasyReadingMode && this.buf.startedEasyReading)
+    this.easyReading._enterFunctionMode();
+  const self = this;
+  this.commandQueue.enqueue({
+    keys: '\\',
+    kind: 'lights-pref',
+    expect: function(snapshot, facts) {
+      return rawModePrefRowVisible(facts && facts.rowTexts);
+    },
+    onDone: function() {
+      // pmore.c 的 case '1'/'2'/'3' 直選並立即 return —— **不需要 Enter**。
+      self.view._send(key);
+      // 選項列在直選時不會被重畫，parseRawModeFromPrefRow 讀到的仍是切換前的值，
+      // 所以程式化切換要自己記下目標（見 easy_reading.js 的 _rawMode 註解）。
+      self.easyReading._rawMode = mode;
+      if (self.view.flashListHint && mode === MFDISP_RAW_PLAIN)
+        self.view.flashListHint(i18n('lightsOn_switchedPlain'), 5000);
+    },
+    onFail: function() {
+      // 第一步沒等到設定頁 ⇒ **絕不送數字鍵**（會被當成 pmore 的「跳至第 N 頁」）。
+      if (self.view.flashListHint)
+        self.view.flashListHint(i18n('lightsOn_switchFailed'));
+    }
+  });
 };
 
 App.prototype.onDOMPaste = function(e) {
@@ -816,25 +910,25 @@ App.prototype.clientToPos = function(cX, cY) {
   var rowH = this.view.chh * this.view.scaleY;
   var row = Math.floor(y / rowH);
 
-  // 列表好讀的平滑捲動：body 區整體上移了 frac ⇒ 那一段的列號要自己補回來，
-  // 否則停在半列時點下去會開到上一篇（游標底色也會標錯列）。header／footer 不受
-  // 影響（它們不在捲動視口裡）。視口底部露出的那一小條（overscan 列）給它
-  // **渲染 index 24**，與 buildListWindowLines 放它的位置一致；不能用 3+20=23，
-  // 那是 footer 的列號。
-  var listFrac = this._listScrollFrac();
-  if (listFrac > 0) {
+  // 列表好讀：body 區是一個捲動視口（整段序列都畫在裡面），所以那一段的列號要
+  // 自己算 —— 螢幕 y 落在視口裡的位置，加上視口已經捲掉的距離。捲掉的距離是
+  // **內容 px**，而 y 是螢幕 px ⇒ 乘 scaleY 換到同一個座標系。
+  // header／footer 不受影響（它們不在視口裡，是 #mainContainer 的直系子層）。
+  var listTop = this._listScrollTop();
+  if (listTop != null) {
     var bodyTop = LIST_HEADER_ROWS * rowH;
     var bodyRows = this.buf.rows - 4;
     if (y >= bodyTop && y < bodyTop + bodyRows * rowH) {
       var bodyIdx = Math.floor(
-        (y - bodyTop + listFrac * this.view.scaleY) / rowH
+        (y - bodyTop + listTop * this.view.scaleY) / rowH
       );
-      if (bodyIdx > bodyRows) bodyIdx = bodyRows;
       if (bodyIdx < 0) bodyIdx = 0;
-      return {
-        col: col,
-        row: bodyIdx === bodyRows ? this.buf.rows : LIST_HEADER_ROWS + bodyIdx
-      };
+      return { col: col, row: LIST_HEADER_ROWS + bodyIdx };
+    }
+    // footer：全序列渲染後它的列號 ＝ 這一幀 lines 的最後一個 index。
+    if (y >= bodyTop + bodyRows * rowH) {
+      var wl = this.view._listWindowLines;
+      if (wl && wl.length) return { col: col, row: wl.length - 1 };
     }
   }
 
@@ -846,11 +940,52 @@ App.prototype.clientToPos = function(cX, cY) {
   return {col: col, row: row};
 };
 
-// 列表好讀的次列位移（未縮放的內容 px）。0＝沒有位移或不適用（其他畫面、frozen
-// 快照）。座標換算與 render 都以它為準。
-App.prototype._listScrollFrac = function() {
-  if (!this.listSession || this.buf.listRenderMode !== 'buffer') return 0;
-  return (this.listSession.scrollFrac && this.listSession.scrollFrac()) || 0;
+// 現在是誰在畫列表畫面：文章列表好讀（listSession）／看板列表平滑捲動
+// （boardListSession）／null＝原生。**唯一真相源**——兩者共用 buf.listRenderMode，
+// 分派點散在鍵盤、貼上、功能鍵、左鍵、滾輪、捲動事件、render 分支七處，各自推導
+// 一次就是遲早漏一處的靜默錯畫（handoff §6.2）。
+// 「使用者剛往 PTT 送了 byte」的**無條件**通知（原生鏡像期間 activeListSession()
+// 回 null，所以不能走上面那條所有權分派 —— 收不到鍵正是我們要記的那段時間）。
+// 兩個 session 各自只記一個時間戳（不變量 N2：只讀不寫、零副作用），供
+// 「非導覽操作完成後自動切回好讀」的靜置探針判斷「使用者的手停了沒」。
+// 少了它，使用者在原生 prompt 打字打到一半就會被搶畫面。
+App.prototype.noteListNativeInput = function() {
+  if (this.listSession && this.listSession.noteNativeInput)
+    this.listSession.noteNativeInput();
+  if (this.boardListSession && this.boardListSession.noteNativeInput)
+    this.boardListSession.noteNativeInput();
+};
+
+App.prototype.activeListSession = function() {
+  switch (listRenderOwnerOf(this.buf)) {
+    case OWNER_BOARD_LIST:
+      return this.boardListSession || null;
+    case null:
+      return null;
+    default:
+      return this.listSession || null;
+  }
+};
+
+// 列表好讀 body 視口目前捲掉的距離（未縮放的內容 px）。null＝不適用（其他畫面）。
+// frozen 也要回報：交易期間畫面凍在原地，滑鼠仍然要能算出正確的列號來提示。
+App.prototype._listScrollTop = function() {
+  var mode = this.buf.listRenderMode;
+  if (mode !== 'buffer' && mode !== 'frozen') return null;
+  var screen = this.view.componentScreen;
+  if (!screen || !screen.getListScrollTop) return null;
+  return screen.getListScrollTop() || 0;
+};
+
+// 手勢（觸控板水平滑動）與瀏覽器「上一頁」共用的送鍵出口。回傳「有沒有真的送出
+// 去」——history_back_guard 用它決定要不要提示離站方式。
+//
+// 分派本身一律走 view.sendKeyAsUser（合成鍵盤事件 → 既有分派鏈），這裡只負責
+// 「現在可不可以送」的守門（純函式 navKeyAllowed，與 history 那條共用）。
+App.prototype.sendNavKeyAsUser = function(keyName) {
+  if (!navKeyAllowed(this)) return false;
+  this.view.sendKeyAsUser(keyName);
+  return true;
 };
 
 // 各滑鼠入口的生效與否。總開關（buf.useMouseBrowsing）與四個子開關（view 上的
@@ -863,7 +998,8 @@ App.prototype.mouseGates = function() {
     mouseMisclickGuard: this.view.mouseMisclickGuard,
     mouseMiddleClick: this.view.mouseMiddleClick,
     mouseWheel: this.view.mouseWheel,
-    mouseWheelSmoothScroll: this.view.mouseWheelSmoothScroll
+    mouseWheelSmoothScroll: this.view.mouseWheelSmoothScroll,
+    mouseBackNav: this.view.mouseBackNav
   });
 };
 
@@ -1106,9 +1242,16 @@ App.prototype.onPrefChange = function(name, value) {
     case 'mouseWheel':
       this.view.mouseWheel = Number(value) || 0;
       break;
-    // 純事件層行為（下一個 wheel event 就生效），不影響已畫出來的畫面 ⇒ 免 redraw。
+    // 這條**會改變已畫出來的畫面**：列表好讀的 body 視口靠 CSS overflow 決定吃不吃
+    // 使用者的捲動輸入（開＝auto 交給瀏覽器、關＝hidden 退回一次一頁），而
+    // overflow 是在 render 時套上去的 ⇒ 不 force redraw 的話要等下一次 PTT 寫畫面
+    // 才生效（使用者看到的是「關了設定滾輪還是原生捲動」）。
     case 'mouseWheelSmoothScroll':
       this.view.mouseWheelSmoothScroll = !!value;
+      this.view.redraw(true);
+      break;
+    case 'mouseBackNav':
+      this.view.mouseBackNav = Number(value) || 0;
       break;
     case 'copyOnSelect':
       this.copyOnSelect = value;
@@ -1142,6 +1285,10 @@ App.prototype.onPrefChange = function(name, value) {
       break;
     case 'mergeSameAuthorComments':
       this.view.mergeSameAuthorComments = value;
+      this.view.redraw(true);
+      break;
+    case 'commentBlockSpacing':
+      this.view.commentBlockSpacing = value;
       this.view.redraw(true);
       break;
     case 'enableAi':
@@ -1195,6 +1342,24 @@ App.prototype.onPrefChange = function(name, value) {
         this.listSession.evaluateNow();
       } else {
         this.listSession.disable();
+      }
+      break;
+    case 'enableBoardListSmoothScroll':
+      // 看板列表平滑捲動。與上面那條對稱（畫面靜止時打開不會再有 settle）。
+      if (value) {
+        this.boardListSession.evaluateNow();
+      } else {
+        this.boardListSession.disable();
+      }
+      break;
+    case 'enableListNativeAutoResume':
+      // 在原生鏡像上打開時畫面可能已經靜止（不會再有 settle 來排探針）⇒ 主動排
+      // 一次。關掉時把已排的收掉（探針自己也會再檢查一次 pref，這裡只是不留
+      // 沒有意義的 timer）。
+      for (const s of [this.listSession, this.boardListSession]) {
+        if (!s) continue;
+        if (value) s._scheduleResumeProbe();
+        else s._cancelResumeProbe();
       }
       break;
     case 'antiIdleTime':
@@ -1305,6 +1470,35 @@ App.prototype.mouse_click = function(e) {
           return;
         }
       }
+      // 點空白處關框。PTT 停在「等一個按鍵」的畫面（進版畫面／說明畫面收尾的
+      // pressanykey、vmsg 橫幅、vgetstring 輸入欄）時，滑鼠原本沒有任何出口 ——
+      // resolveMouseRegion 對 pageState 5 走 default、對 inputPrompt 整幀早退。
+      //
+      // 位置：**在 closest('a') / 內嵌預覽 / 有選取 / [data-pusher] 之後**（那些
+      // 都已在上面 return）⇒ 功能鍵按鈕、連結、預覽圖、選字一律優先；
+      // **在 buffer/frozen 分支之前**只是順序上的方便，那條分支由下面的
+      // listRenderMode 守門明確排除。
+      //
+      // 送鍵**刻意不走 buf.mouseAction**：term_buf.notify 的每個 changed 幀都
+      // clearHighlight() 把它清成 none，而框正是「畫面剛變出來」的東西 ⇒ 使用者
+      // 不動滑鼠直接點下去時必定讀到 none，按鈕會像壞掉。這裡在點擊當下現算。
+      //
+      // listRenderMode 守門：列表好讀的 buffer/frozen 是 v5 封閉互動，直送 byte
+      // 會打亂 CommandQueue。而所有會開框的鍵在列表好讀底下都走
+      // _beginPassthroughBytes → _enterFunctionMode() → 原生鏡像，所以框出現時
+      // listRenderMode 已經是 'native'。
+      if (this.buf.listRenderMode === 'native' && this.mouseGates().leftClick) {
+        var dismiss = this.buf.dismissTarget();
+        if (dismiss) {
+          // 框開著時整個畫面都是我們的 ⇒ 就算點在游標列（不送鍵）也要
+          // preventDefault，不讓瀏覽器預設行為對這張畫面動作。
+          e.preventDefault();
+          var dpos = this.clientToPos(e.clientX, e.clientY);
+          if (dismissClickAllowed({ clickRow: dpos.row, cursorRow: this.buf.cur_y }))
+            this.view._send(dismiss.bytes);
+          return;
+        }
+      }
       // List easy reading buffer/frozen render: the click is OURS — 單擊＝把選取
       // 移到那一列並開文（與原生滑鼠瀏覽同語意）。座標換算後交給 ListSession 走
       // 既有的開文交易。**永遠不要**落到下面的 useMouseBrowsing 分支：那條會依
@@ -1315,15 +1509,16 @@ App.prototype.mouse_click = function(e) {
       // 包住「要不要真的開文」。
       if (this.buf.listRenderMode === 'buffer' || this.buf.listRenderMode === 'frozen') {
         e.preventDefault();
-        if (this.mouseGates().leftClick && this.listSession) {
+        var clickOwner = this.activeListSession();
+        if (this.mouseGates().leftClick && clickOwner) {
           var lpos = this.clientToPos(e.clientX, e.clientY);
           // 左側退出帶（cols 0..EXIT_COL_END）：與原生列表同一個手勢。**絕不直送
           // byte** —— onMouseExitClick 走 reducer 的 _beginLeave，它會先 getkeep
           // 同步 server 的真游標再送鍵（v5 封閉互動）。
           if (lpos.col >= 0 && lpos.col < EXIT_COL_END)
-            this.listSession.onMouseExitClick();
+            clickOwner.onMouseExitClick();
           else
-            this.listSession.onMouseClick(lpos.row, lpos.col);
+            clickOwner.onMouseClick(lpos.row, lpos.col);
         }
         return;
       }
@@ -1514,6 +1709,15 @@ App.prototype.mouse_scroll = function(e) {
     return;
   }
   var gates = this.mouseGates();
+  // 水平主導的事件到此為止。下面整段都是「上下翻頁」，而 `up` 只看 deltaY ⇒
+  // 純水平滑動（deltaY === 0）會被算成「往下」，原生 24 列列表左滑因此會偷送一個
+  // PageDown 給 PTT（斜向滑動同理誤翻頁）。守護 tests/unit/wheel_horizontal.test.js。
+  //
+  // **這裡刻意不做手勢辨識**：觸控板的返回手勢交給瀏覽器原生跑（CSS 不擋
+  // overscroll），由 history_back_guard 的 sentinel 接住。原生手勢一啟動，頁面
+  // 只收得到 1–3 個 wheel 事件就被瀏覽器接管。
+  if (isHorizontalWheel(e))
+    return;
   if (!gates.wheel)
     return;
   // if in easyreading, use it like webpage
@@ -1523,26 +1727,24 @@ App.prototype.mouse_scroll = function(e) {
 
   var up = e.deltaY < 0 || e.wheelDelta > 0;
 
-  // List easy reading buffer/frozen render (native-parity window): 同樣是翻頁，
-  // 但**在本機的視窗上執行** —— 隱藏的真游標不可以動，也不送任何 byte 給 server。
-  // Frozen（開文交易進行中）整個吞掉，比照鍵盤的開文行為。
+  // List easy reading buffer/frozen render：body 是一個真正的捲動視口，
+  // **捲動交給瀏覽器**（與文章好讀同一條路：early return、不 preventDefault）。
+  //
+  // 「吞掉捲動」不能靠 preventDefault —— 這個 handler 掛在 window 上且沒指定
+  // passive，Chrome 73+ 一律視為 passive ⇒ preventDefault 是 no-op。改由 CSS
+  // 決定：frozen（交易中）與 pref 關掉時 .listBodyView 是 overflow:hidden
+  // （見 render/screen.js#_ensureBodyView），使用者輸入自然捲不動它。
+  // pref 關掉時滾輪退回「一次一頁」，走與鍵盤 PgUp/PgDn 完全相同的一條路。
   if (this.buf.listRenderMode === 'buffer' || this.buf.listRenderMode === 'frozen') {
-    if (this.buf.listRenderMode === 'buffer' && this.listSession) {
-      if (gates.wheelSmoothScroll) {
-        // 平滑捲動：換算成距離交給 ListSession 的緩動器（分幀吃掉＋次列位移）。
-        // 座標系換算是關鍵：wheel 的像素是**螢幕上的**，而視窗較矮時整個終端機
-        // 被 scaleY 縮放過（term_view.setTermFontSize）⇒ 除回去才是內容座標，
-        // 那才是 ListSession/scrollTop 用的單位。漏掉就會捲太多。
-        var scaleY = this.view.scaleY || 1;
-        var px = wheelDeltaToPx(e, {
-          lineHeight: this.view.chh * scaleY,
-          pageLines: this.buf.rows - 4
-        });
-        if (px) this.listSession.onWheelScrollPx(px / scaleY);
-      } else {
-        this.listSession.onWheel(up ? 'pgup' : 'pgdn');
-      }
+    var wheelOwner = this.activeListSession();
+    if (gates.wheelSmoothScroll) {
+      // 放行給瀏覽器之前先問一句「是不是已經捲到邊了」：捲不動就不會有 scroll
+      // 事件，而 demand 正是由它驅動的（buffer 只有一頁時往上滾會看起來卡住）。
+      if (wheelOwner) wheelOwner.onWheelAtEdge(up ? -1 : 1);
+      return;
     }
+    if (this.buf.listRenderMode === 'buffer' && wheelOwner)
+      wheelOwner.onWheel(up ? 'pgup' : 'pgdn');
     e.stopPropagation();
     e.preventDefault();
     return;

@@ -109,6 +109,13 @@ yarn test:e2e           # 仍連真實 PTT 的 live e2e（共存，--project=liv
   不會撿它、逐卷 spec 一律不受影響，只由 `aid_wrap.offline.spec.js` 以
   `loadCassette('ask-aid-wrap')` 指名載入。裁剪方式：丟掉列表 step 與跳轉失敗留下的
   `on:'raw'` step（`replay.js` 不認得 raw），把文章第一頁那步的 `on` 改成 `start`。
+- 實例：`pttbug-body-urlwrap.json`（ptt-debug-20260830-110548 轉出，1 頁 7 推）——守護
+  「內文跨行連結」（`src/js/body_wrap.js`）：`※ 文章網址` 那行被切成兩列（左列收在
+  col 77、右列 `404.html` 從 col 0 起）。這裡**改成 `mode:'article'`**（與 `ask-aid-wrap`
+  相反）：它是乾淨的單頁文章，讓逐卷 spec 一起跑得到，等於多一份免費覆蓋。裁剪方式：
+  丟掉列表那個 `on:'jump'` step，只留文章頁並把 `on` 改成 `start`（文章頁自己就是整屏
+  首繪 —— `ESC[H` 起、每列都有 clrtoeol，單獨餵就是乾淨的一頁）。
+  **那個版面是 PTT 端寫檔的 bug，不是新 spec**（依據見 `docs/pttbbs-screen-protocol.md` §11.1.1）。
 - 守護測試：`tests/unit/redact.test.js`、`tests/unit/debug_recorder_logic.test.js`、
   `tests/unit/debug_recorder.test.js`、`tests/e2e/offline/debug_record.offline.spec.js`。
 
@@ -283,6 +290,52 @@ apply`…）當防禦，避免圖載不到就假紅。**圖改本地 fixture 後
 （掃 cassette 內文找圖片連結，iframe 類不算）決定要不要為該卷生成「點圖縮放」測試。
 不適用的卷根本不出現在測試清單裡，而不是跑起來才 skip —— 後者在報告上看起來像覆蓋
 漏洞，也會把真問題混在同一個 skip 理由裡。素材整組為空時才留一個顯式 skip 標記。
+
+### 前提不可以由「載入節奏」決定（2026-09-05 CI 紅）
+
+`easy_reading_scroll_jump.offline.spec.js` 測試 1 的前提是「找得到一個已卸載、只剩替身盒
+頂著、而且 normal 高度從沒量過的佔位盒」。原版用兩個**時序決定**的位置去湊出這個狀態，
+兩個都會飄：
+
+| 原作法 | 為什麼會飄 | 改成 |
+|---|---|---|
+| 由上往下逐格掃到「有圖載出來」才停，在那裡點放大 | 停在第幾格取決於當下載入節奏；而停點決定了**哪幾張圖被量過 normal 高度**（`pinned[normal]`）＝候選的排除條件 | `gotoFirstSlot()`：捲到**第一個** `.inlinePreviewSlot` 上方 200px，位置由素材決定 |
+| 點縮小之後就地找候選 | 縮小那一下整頁高度塌好幾倍，最終 `scrollTop` 是瀏覽器 scroll anchoring 決定的（本機恆為 6824，CI 顯然落在別處 ⇒ 上方一個候選都不剩） | `gotoBottom()`：明確捲到底再找 |
+| 候選只要求「在目前位置上方 500px」 | 掛載邊界是 `LAZY_MOUNT_MARGIN_PX`＝1500px ⇒ 500～1500px 那段的 slot 會自己掛回來、圖秒回 ⇒ 反被「slot 裡沒有媒體」刷掉 | 要求整個 slot 落在 `scrollTop − (1500 + 200)` 之外，保證留在卸載態 |
+
+通則：**offline e2e 的前提條件只能由素材與明確設定的位置決定**。前提落空時的錯誤訊息也要
+把現況（每個 slot 的 y／高度／有無媒體／有無釘高度）一起印出來——原版只留一句「素材太短」，
+在 CI 上看不出到底是哪一種太短。
+
+### 「走完整篇」的前置動作必須每步重讀 `scrollHeight`（2026-09-05）
+
+同一支 spec 的 `walkDown()`（讓每張圖都真的載入過一次，好把高度寫進 `lazy_media` 的
+module 級 memo）舊版只在**開頭量一次** `.main.scrollHeight` 就照那個值分段往下走。圖片是
+邊走邊載、整篇邊走邊長高（實測 >2000px）⇒ 走到舊高度就收工、再直接跳到底，**中間那一段
+永遠沒被走過**。那段的圖 `aspect`／`pinned` 都是空的 ⇒ 往回捲時才第一次掛載、各撐開幾百
+px，被測試 2 的「一次 PgUp 不得暴衝（≤1.2 倍）」誤判成捲動補償壞掉。
+
+**破洞位置會隨版面高度漂移**，所以症狀是「改了任何會影響列高的 CSS 就莫名紅一條」，看起來
+像被測 code 大爆炸。判準：把同樣的高度改動加在**不含預覽圖**的列上卻全綠 ⇒ 是覆蓋率破洞，
+不是產品迴歸（實錄：加「推文區塊行距」時紅在 press 2 `gained=2460`＝三個從沒量過的推文區
+佔位盒各撐 600px）。修法是迴圈裡每一步重讀 `scrollHeight` 當結束條件；靜態守護
+`tests/unit/e2e_walkdown_coverage.test.js`。
+
+### 測不到就別在那個 profile 跑（恆綠 ≠ 有守門）
+
+同一支測試 1 在預設的 `cache` profile 下**結構性地測不到東西**：圖秒回，mount 到真圖佔到
+版面之間跨不過一次排版，`ResizeObserver` 全程只看得到 `[600,600]`。實測（把 `syncGhost`
+的判準改回舊碼的「有沒有掛載」當突變）：
+
+| profile | 突變後 | samples |
+|---|---|---|
+| `cache` | 3/3 **綠**（假的） | `600,600` |
+| `slow` | 3/3 紅 | `600,65,600,65…`（65px ＝「讀取中…」指示器） |
+
+⇒ 在 `cache` 下跑它**只可能假紅、不可能真紅**。修法不是把它從 offline project 排除，而是
+讓它**自己指定情境**：`bootOffline(page, ptt, { imageProfile: 'slow' })`（明確傳入優先序高於
+project 名，同 `image_load_conditions.offline.spec.js`）。這樣兩個 job 跑到的都是有牙齒的版本。
+新增媒體版面測試時，先照上表做一次突變驗證再決定 profile。
 
 ### 踩坑（此段修過兩次，別再重來）
 - **`page.route` 必須用述詞過濾，不可用 `'**/*'` + `route.continue()`**：Vite dev server

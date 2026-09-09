@@ -17,6 +17,9 @@ const {
   bootOffline,
   replayListCassette,
 } = require('../helpers/replay');
+// 滾輪 smoke 會量 rect 又會動指標 ⇒ 版面穩定契約要求走這個模組
+// （tests/unit/e2e_layout_settle.test.js 靜態守護）。
+const { waitRectStable, waitScrollStable } = require('../helpers/layout');
 
 const nav = loadCassette('cchat-list-nav');
 const prompt = loadCassette('cchat-list-prompt');
@@ -42,10 +45,34 @@ async function dumpListState(page) {
       queueIdle: app.commandQueue.idle,
       sentCount: (window.__replay && window.__replay.sent.length) || 0,
       cursorHidden: document.getElementById('cursor').style.display === 'none',
+      chh: app.view.chh,
       domRows: document.querySelectorAll('#mainContainer [data-type="bbsline"]')
-        .length
+        .length,
+      seqLen: ls._sequence().length,
+      // 捲動視口：畫面高度必須恆等於 body 那 20 列（＝畫面仍是 24 列），
+      // 內容比它高的部分就是可捲距離。
+      viewportPx: (() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        return v ? v.clientHeight : -1;
+      })(),
+      scrollTop: (() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        return v ? v.scrollTop : -1;
+      })(),
+      overflowY: (() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        return v ? getComputedStyle(v).overflowY : null;
+      })()
     };
   });
+}
+
+// 畫面是不是「看起來仍是 24 列」。全序列渲染後 DOM 的列數 = 3 header + 序列
+// （不足 bodyRows 補到 bodyRows）+ 1 footer，而**視口高度**才是使用者看到的
+// 那 20 列 —— 這才是原本 `domRows === 24` 想守的東西。
+function expectListViewport(s) {
+  expect(s.domRows).toBe(4 + Math.max(s.seqLen, 20));
+  expect(s.viewportPx).toBe(20 * s.chh); // bodyRows × 列高
 }
 
 // 24 行视窗的 DOM 文字（好读与原生同一渲染单轨，可直接互 diff）。
@@ -69,14 +96,30 @@ async function cursorRowIndex(page) {
   });
 }
 
-// 視窗頂端在「過濾後序列」裡的位置（0 = 已在 buffer 最上方）。滾輪平滑捲動的
-// 斷言需要知道上方還剩多少可捲距離。
+// 視口頂端在「過濾後序列」裡的位置（0 = 已在 buffer 最上方）。**直接量 DOM 的
+// scrollTop**，不靠 session 狀態反查 —— 捲動的真相源就是那個 scrollTop。
 async function windowTopPos(page) {
   return await page.evaluate(() => {
-    const ls = window.__app.listSession;
-    const nums = window.__app.buf.listLineNums || [];
-    const abs = nums.indexOf(ls._topNum);
-    return abs === -1 ? -1 : ls._sequence().indexOf(abs);
+    const v = document.querySelector('#mainContainer .listBodyView');
+    if (!v) return -1;
+    return Math.round(v.scrollTop / window.__app.view.chh);
+  });
+}
+
+// 游標那一列相對**視口**的位置（0 = 視口第一列）；null = 游標捲出視野了。
+// 全序列渲染後 cursorRowIndex 是絕對列號（3 + 序列位置），不再等於視口位置。
+async function cursorRowInViewport(page) {
+  return await page.evaluate(() => {
+    const rows = Array.from(
+      document.querySelectorAll('#mainContainer [data-type="bbsline"]')
+    );
+    const i = rows.findIndex((el) => el.textContent.startsWith('>'));
+    if (i < 0) return null;
+    const v = document.querySelector('#mainContainer .listBodyView');
+    if (!v) return null;
+    const chh = window.__app.view.chh;
+    const pos = i - 3 - Math.round(v.scrollTop / chh);
+    return pos >= 0 && pos < 20 ? pos : null;
   });
 }
 
@@ -186,8 +229,9 @@ test.describe('文章列表好读模式（离线）', () => {
       for (let i = 1; i < numbered.length; i++) {
         expect(numbered[i]).toBeGreaterThan(numbered[i - 1]);
       }
-      // 原生视窗仿真：DOM 固定 24 行（不随缓冲成长），fill prepend 不动视窗。
-      expect(s.domRows).toBe(24);
+      // 畫面仍是 24 列：整段序列都在 DOM 裡，但視口高度恆等於 body 那 20 列。
+      expectListViewport(s);
+      expect(s.overflowY).toBe('auto'); // 捲動交給瀏覽器
       // 游标 = 恰好一列行首 '>'（body 区内）。行首比对：'>' 可能出现在标题里。
       const rows = await dumpScreenRows(page);
       const cursorRows = rows
@@ -195,7 +239,9 @@ test.describe('文章列表好读模式（离线）', () => {
         .filter((i) => i !== -1);
       expect(cursorRows.length).toBe(1);
       expect(cursorRows[0]).toBeGreaterThanOrEqual(3);
-      expect(cursorRows[0]).toBeLessThanOrEqual(22);
+      // 剛 engage 時游標看得見 ⇒ 相對視口落在 body 的 20 列內。（絕對列號現在是
+      // 序列位置＋3，可以遠大於 22——游標本來就允許被捲出視野。）
+      expect(await cursorRowInViewport(page)).not.toBeNull();
       // 半形游标只盖 %7d 的前导空格 ⇒ 序号完整可见（旧全形 ● 会吃掉最高位）。
       expect(rows[cursorRows[0]]).toMatch(/^>\d{5,7}\s/);
     } catch (e) {
@@ -233,7 +279,7 @@ test.describe('文章列表好读模式（离线）', () => {
       for (let i = 1; i < numbered.length; i++) {
         expect(numbered[i]).toBeGreaterThan(numbered[i - 1]);
       }
-      expect(s.domRows).toBe(24);
+      expectListViewport(s);
 
       // 渲染出來的游標仍是我們畫的 '>'（素材是 ● 世代，但畫面不該出現 ●）。
       const rows = await dumpScreenRows(page);
@@ -274,9 +320,12 @@ test.describe('文章列表好读模式（离线）', () => {
       );
       expect(after.state).toBe('functionMode');
       // 代送恰好一键（z 一个 byte；cassette 无对应 step，server 无回应＝良性）。
+      // 2026-09-03 起尾附 \f（Ctrl-L）：PTT 完全忽略某个键时是零 byte 零 settle，
+      // 没有它命令只能等满 3s timeout —— 使用者要盯著原生画面发呆，
+      //「操作完成后自动回好读」也无从触发。协定 §6：\f 全域被 igetch 拦截。
       expect(after.sentCount).toBe(before.sentCount + 1);
       const sent = await page.evaluate(() => window.__replay.sent.slice(-1)[0]);
-      expect(sent).toBe('z');
+      expect(sent).toBe('z\f');
     } catch (e) {
       console.log('--- console tail ---');
       for (const l of logs.slice(-25)) console.log(l);
@@ -389,7 +438,7 @@ test.describe('文章列表好读模式（离线）', () => {
       // 恰好一次送出、内容完整（不得拆成逐字或漏字）。
       expect(after.sentCount).toBe(before.sentCount + 1);
       const sent = await page.evaluate(() => window.__replay.sent.slice(-1)[0]);
-      expect(sent).toBe(AID);
+      expect(sent).toBe(AID + '\f'); // 同 native-key：尾附 \f 保证必有一帧
       // 没有多余的 Insert 跳脱序列混进去。
       const all = await page.evaluate(() => window.__replay.sent.join(''));
       expect(all).not.toContain('\x1b[2~');
@@ -438,7 +487,9 @@ test.describe('文章列表好读模式（离线）', () => {
     }
   });
 
-  test('滾輪平滑捲動：捲的距離就是滾輪的距離、畫面停得住半列；關掉設定回到一次一頁', async ({ page }) => {
+  // 捲動語意：用 scrollTo 直接驅動視口（決定性、不動指標、不量座標）。
+  // 這裡驗的是「捲動之後 app 做了什麼」——錨跟上、游標不動、demand 觸發、不重繪。
+  test('原生捲動：視口捲動更新錨與 demand，游標不被拉走，且不重繪', async ({ page }) => {
     test.setTimeout(60000);
     const logs = ptt.attachConsole(page);
     try {
@@ -450,94 +501,271 @@ test.describe('文章列表好读模式（离线）', () => {
         easyReadingListPrefetchCount: 200
       });
       // fill 往舊文方向長 ⇒ 視窗上方會累積夠多列可捲。
+      const before = await waitState(
+        page,
+        (x) => x.state === 'active' && x.listLen > 40 && x.queueIdle,
+        20000
+      );
+
+      // body 視口是真的可捲容器：內容比視口高，overflow-y 交給瀏覽器。
+      expect(before.overflowY).toBe('auto');
+      const geom = await page.evaluate(() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        return {
+          chh: window.__app.view.chh,
+          clientHeight: v.clientHeight,
+          scrollHeight: v.scrollHeight
+        };
+      });
+      expect(geom.clientHeight).toBe(20 * geom.chh); // 畫面仍是 20 列 body
+      expect(geom.scrollHeight).toBeGreaterThan(geom.clientHeight); // 有可捲距離
+
+      const topPos0 = await windowTopPos(page);
+      expect(topPos0).toBeGreaterThan(3); // 上方要有捲得動的空間
+
+      // 捲到一個**不是列高整數倍**的位置：畫面停得住半列（原生捲動的自然結果）。
+      const target = (topPos0 - 3) * geom.chh + 7;
+      await page.evaluate((top) => {
+        document.querySelector('#mainContainer .listBodyView').scrollTop = top;
+      }, target);
+      await page.waitForFunction(
+        (t) =>
+          Math.abs(
+            document.querySelector('#mainContainer .listBodyView').scrollTop - t
+          ) < 1,
+        target
+      );
+      // scroll handler 是 rAF 合併的，等錨真的跟上。
+      await page.waitForFunction(
+        (t) => window.__app.listSession._lastScrollTop === t,
+        target,
+        { timeout: 5000 }
+      );
+
+      const after = await dumpListState(page);
+      // 1) 錨跟著畫面走（視口頂那一列 + 列內偏移）。
+      expect(await windowTopPos(page)).toBe(topPos0 - 3);
+      expect(
+        await page.evaluate(() => window.__app.listSession._scrollFrac)
+      ).toBeCloseTo(7, 0);
+      // 2) 游標**不被拉走**（網頁式語意：它可以被捲出視野）。
+      expect(after.selectedNum).toBe(before.selectedNum);
+      // 3) 捲動不改變 DOM 列數（沒有重繪、沒有視窗切片）。
+      expect(after.domRows).toBe(before.domRows);
+
+      // 4) 往下捲到接近 buffer 底 ⇒ 觸發方向性 demand（背景補頁）。
+      const fedBefore = await page.evaluate(() => window.__replay.fed);
+      await page.evaluate(() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        v.scrollTop = v.scrollHeight;
+      });
+      await page.waitForTimeout(300);
+      const grown = await waitState(page, (x) => x.queueIdle, 15000);
+      expect(grown.state).toBe('active'); // 捲動零 byte、不轉態
+      expect(await page.evaluate(() => window.__replay.fed)).toBeGreaterThanOrEqual(
+        fedBefore
+      );
+    } catch (e) {
+      console.log('--- console tail ---');
+      for (const l of logs.slice(-25)) console.log(l);
+      throw e;
+    }
+  });
+
+  // 滾輪 smoke：**真的**用滑鼠滾輪，驗 default action 有作用在視口上。
+  // 這條非用 page.mouse.wheel 不可——合成的 WheelEvent 是 untrusted，沒有
+  // default action，改成原生捲動後量到的位移恆為 0（假綠）。
+  test('滾輪 smoke：真滾輪驅動瀏覽器原生捲動', async ({ page }) => {
+    test.setTimeout(60000);
+    const logs = ptt.attachConsole(page);
+    try {
+      await bootOffline(page, ptt);
+      await replayListCassette(page, nav);
+      await page.waitForFunction(() => window.__app.buf.pageState === 2);
+      await ptt.applyPrefs(page, {
+        enableEasyReadingList: true,
+        easyReadingListPrefetchCount: 200
+      });
       await waitState(
         page,
         (x) => x.state === 'active' && x.listLen > 40 && x.queueIdle,
         20000
       );
 
-      // 未縮放的列高（次列位移與 scrollTop 用的座標系）。滾輪給的是**螢幕**像素，
-      // 而視窗較矮時整個終端機被 scaleY 縮放過 ⇒ 換算成內容像素才是這裡的單位
-      // （產品端同樣除以 scaleY，見 App.mouse_scroll）。
-      const { lineH, scaleY } = await page.evaluate(() => ({
-        lineH: window.__app.view.chh,
-        scaleY: window.__app.view.scaleY || 1
-      }));
-      expect(lineH).toBeGreaterThan(0);
-      const topPos0 = await windowTopPos(page);
-      expect(topPos0).toBeGreaterThan(3); // 上方要有捲得動的空間
-
-      // 滾輪事件直接派給 window（handler 掛在 window 的 capture 階段，與指標位置
-      // 無關）。刻意不用 page.mouse.wheel：那會讓這支 spec 同時「量座標＋動指標」，
-      // 撞上 tests/unit/e2e_layout_settle.test.js 的版面穩定契約，而這裡的捲動根本
-      // 不依賴任何量出來的座標。同 wheel_stuck_button.offline.spec.js 的作法。
-      const wheel = (deltaY) =>
-        page.evaluate((dy) => {
-          window.dispatchEvent(
-            new WheelEvent('wheel', { deltaY: dy, deltaMode: 0, cancelable: true })
-          );
-        }, deltaY);
-      // 動畫跑完（緩動器把距離吃光）為止。
-      const settleScroll = async () => {
-        await page.waitForFunction(() => {
-          const ls = window.__app.listSession;
-          return !ls._scroller || ls._scroller.pending() === 0;
-        }, null, { timeout: 5000 });
-        await page.waitForTimeout(80);
-      };
-
-      // 先離開底端：進板落點通常就貼在板尾，那裡「最後一列貼齊視口底部」的規則會
-      // 把次列偏移吸成 0（一次性的對齊，不是捲動距離不準），量測要避開它。
-      await wheel(-lineH * 5);
-      await settleScroll();
-      const pos0 = await page.evaluate(() => {
-        const ls = window.__app.listSession;
-        const nums = window.__app.buf.listLineNums || [];
-        const abs = nums.indexOf(ls._topNum);
-        return {
-          top: abs === -1 ? -1 : ls._sequence().indexOf(abs),
-          frac: ls.scrollFrac()
-        };
+      // 先離開頂端，才有往上捲的空間可量。
+      await page.evaluate(() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        v.scrollTop = Math.round(v.scrollHeight / 2);
       });
-      expect(pos0.top).toBeGreaterThan(3); // 上方還要有捲得動的空間
+      const box = await waitRectStable(page, '#mainContainer .listBodyView');
+      const before = await page.evaluate(
+        () => document.querySelector('#mainContainer .listBodyView').scrollTop
+      );
 
-      // 刻意選一個「不是列高整數倍」的距離：捲完必定停在半列上。
-      const dist = lineH * 2 + 7;
-      await wheel(-dist);
-      await settleScroll();
+      await page.mouse.move(box.left + box.width / 2, box.top + box.height / 2);
+      await page.mouse.wheel(0, -300);
+      await page.waitForFunction(
+        (b) =>
+          document.querySelector('#mainContainer .listBodyView').scrollTop < b,
+        before,
+        { timeout: 5000 }
+      );
+    } catch (e) {
+      console.log('--- console tail ---');
+      for (const l of logs.slice(-25)) console.log(l);
+      throw e;
+    }
+  });
 
-      const after = await page.evaluate(() => ({
-        frac: window.__app.listSession.scrollFrac(),
-        viewTop: (() => {
-          const v = document.querySelector('#mainContainer .listBodyView');
-          return v ? v.scrollTop : null;
-        })(),
-        rows: document.querySelectorAll('#mainContainer [data-type="bbsline"]').length
-      }));
-      const topPos1 = await windowTopPos(page);
+  // 按住 PgUp/PgDn 的回歸（2026-08-30 回報：按著畫面一直慢慢爬，放開之後才快速補捲
+  // 1~2 頁）。根因：programmatic scrollTo({behavior:'smooth'}) **不保留速度** —— OS
+  // 的自動重複（約 30/s）比動畫快，每次呼叫都取消上一個動畫、從 ease 曲線的起點重跑，
+  // 而目標卻一次往前一整頁 ⇒ 按著的時候永遠追不上，剩下的距離在放開之後才補完。
+  // 修法：連發一律 instant（list_scroll.revealPlan 的 repeat）。
+  //
+  // 這條非 e2e 不可：unit 的 scrollListTo mock 量不到「瀏覽器的動畫繼續把畫面帶走」。
+  // 用 CDP 的 autoRepeat 送鍵 ⇒ 拿到的是**真的 trusted keydown 且 event.repeat===true**，
+  // 不必靠「連按夠快」這種會 flaky 的時序假設。
+  test('按住 PgUp（自動重複）：位移立刻跟上按鍵，放開後畫面不再自己捲', async ({ page }) => {
+    test.setTimeout(60000);
+    const logs = ptt.attachConsole(page);
+    try {
+      await bootOffline(page, ptt);
+      await replayListCassette(page, nav);
+      await page.waitForFunction(() => window.__app.buf.pageState === 2);
+      await ptt.applyPrefs(page, {
+        enableEasyReadingList: true,
+        easyReadingListPrefetchCount: 200
+      });
+      await waitState(
+        page,
+        (x) => x.state === 'active' && x.listLen > 50 && x.queueIdle,
+        20000
+      );
 
-      // 1) 捲掉的距離＝滾輪給的距離（像素級，不是「取整到列」）。
-      //    位置一律用像素座標：topPos * 列高 + 次列偏移；螢幕像素 ÷ scaleY。
-      const px0 = pos0.top * lineH + pos0.frac;
-      const px1 = topPos1 * lineH + after.frac;
-      expect(px0 - px1).toBeCloseTo(dist / scaleY, 0);
-      // 2) 真的停在半列上（這就是「像網頁」與「一階一階跳」的差別）。
-      expect(after.frac).toBeGreaterThan(0);
-      expect(after.frac).toBeLessThan(lineH);
-      // 3) 畫面上確實位移了：body 視口的 scrollTop 就是次列偏移。
-      expect(after.viewTop).toBeCloseTo(after.frac, 0);
-      // 4) 露出的那一小條由 overscan 列補滿（24 → 25 列）。
-      expect(after.rows).toBe(25);
+      const BODY_ROWS = 20;
+      const pos0 = await windowTopPos(page);
+      // 第一發至少要能整整往上翻一頁而不被 clamp，斷言才量得到「有沒有跟上按鍵」。
+      expect(pos0).toBeGreaterThanOrEqual(BODY_ROWS + 5);
 
-      // 逃生門：關掉設定立刻回到一次一頁（不必重整）。
+      // 終點用那一列的**內容身分**（序號）而不是 px：按住 PgUp 會觸發背景補頁，而
+      // prepend 會讓整段序列往下位移（不變量 6 的補償），px 不是穩定的座標。
+      const numAtPos = (pos) =>
+        page.evaluate((p) => {
+          const seq = window.__app.listSession._sequence();
+          return window.__app.buf.listLineNums[seq[p]];
+        }, pos);
+      const afterFirst = await numAtPos(pos0 - BODY_ROWS);
+      const afterSecond = await numAtPos(Math.max(0, pos0 - 2 * BODY_ROWS));
+      expect(afterFirst).toBeGreaterThan(0);
+
+      const cdp = await page.context().newCDPSession(page);
+      const pgup = (extra) =>
+        cdp.send(
+          'Input.dispatchKeyEvent',
+          Object.assign(
+            {
+              key: 'PageUp',
+              code: 'PageUp',
+              windowsVirtualKeyCode: 33,
+              nativeVirtualKeyCode: 33
+            },
+            extra
+          )
+        );
+      const topNum = () => page.evaluate(() => window.__app.listSession._topNum);
+
+      // **送完鍵當下就到位**：鍵盤那條路整段是同步的（_moveSelection → 重繪 →
+      // applyScrollAfterRender 寫 scrollTop），所以這裡刻意一次都不等 —— 等下去舊行為
+      // 也會慢慢捲到，就抓不到「按著跟不上」了。
+      await pgup({ type: 'rawKeyDown', autoRepeat: true });
+      expect(await topNum()).toBe(afterFirst);
+      await pgup({ type: 'rawKeyDown', autoRepeat: true });
+      expect(await topNum()).toBe(afterSecond);
+      await pgup({ type: 'keyUp' });
+
+      // 放開之後畫面不再自己捲：沒有殘留的平滑動畫可以再把視口帶走。
+      await waitScrollStable(page, '#mainContainer .listBodyView');
+      expect(await topNum()).toBe(afterSecond);
+      expect(
+        await page.evaluate(() => window.__app.listSession._scrollAnim)
+      ).toBeNull();
+    } catch (e) {
+      console.log('--- console tail ---');
+      for (const l of logs.slice(-25)) console.log(l);
+      throw e;
+    }
+  });
+
+  // 逃生門與吞捲動：兩者都靠 CSS overflow，不靠 preventDefault
+  //（window 上的 wheel listener 在 Chrome 是 passive ⇒ preventDefault 是 no-op）。
+  test('pref 關掉＝一次一頁；交易進行中（frozen）畫面凍住', async ({ page }) => {
+    test.setTimeout(60000);
+    const logs = ptt.attachConsole(page);
+    try {
+      await bootOffline(page, ptt);
+      await replayListCassette(page, nav);
+      await page.waitForFunction(() => window.__app.buf.pageState === 2);
+      await ptt.applyPrefs(page, {
+        enableEasyReadingList: true,
+        easyReadingListPrefetchCount: 200
+      });
+      await waitState(
+        page,
+        (x) => x.state === 'active' && x.listLen > 40 && x.queueIdle,
+        20000
+      );
+
+      // --- 逃生門：關掉 pref → 視口不吃使用者輸入，滾輪退回一次一頁 ---
       await ptt.applyPrefs(page, { mouseWheelSmoothScroll: false });
+      await page.waitForFunction(
+        () =>
+          getComputedStyle(
+            document.querySelector('#mainContainer .listBodyView')
+          ).overflowY === 'hidden'
+      );
       const topPos2 = await windowTopPos(page);
-      await wheel(-100);
-      await page.waitForTimeout(150);
+      expect(topPos2).toBeGreaterThan(3);
+      // pref 關掉時走 window handler（不需要 default action）⇒ 合成事件可用。
+      await page.evaluate(() => {
+        window.dispatchEvent(
+          new WheelEvent('wheel', { deltaY: -100, deltaMode: 0, cancelable: true })
+        );
+      });
+      // 翻頁也走平滑捲動 ⇒ 要等它**到站**再量，不能看到動一下就收工
+      //（動畫中間值會讓這裡量到「只捲了一列」）。
+      const wantTop = Math.max(0, topPos2 - 20);
+      await page.waitForFunction(
+        (t) => {
+          const v = document.querySelector('#mainContainer .listBodyView');
+          return Math.round(v.scrollTop / window.__app.view.chh) === t;
+        },
+        wantTop,
+        { timeout: 5000 }
+      );
       const topPos3 = await windowTopPos(page);
       expect(topPos2 - topPos3).toBe(Math.min(20, topPos2));
-      // 翻頁會回到整列對齊（不留半列）。
-      expect(await page.evaluate(() => window.__app.listSession.scrollFrac())).toBe(0);
+
+      // --- frozen：開文交易進行中，視口一樣不吃輸入、scrollTop 原地不動 ---
+      await ptt.applyPrefs(page, { mouseWheelSmoothScroll: true });
+      const frozenTop = await page.evaluate(() => {
+        const app = window.__app;
+        app.listSession._freezeForTransaction();
+        app.buf.listRenderMode = 'frozen';
+        app.view.redraw(true);
+        return document.querySelector('#mainContainer .listBodyView').scrollTop;
+      });
+      await page.waitForFunction(
+        () =>
+          getComputedStyle(
+            document.querySelector('#mainContainer .listBodyView')
+          ).overflowY === 'hidden'
+      );
+      expect(
+        await page.evaluate(
+          () => document.querySelector('#mainContainer .listBodyView').scrollTop
+        )
+      ).toBe(frozenTop);
     } catch (e) {
       console.log('--- console tail ---');
       for (const l of logs.slice(-25)) console.log(l);
@@ -579,14 +807,20 @@ test.describe('文章列表好读模式（离线）', () => {
         const lines = Array.from(
           document.querySelectorAll('#mainContainer [data-type="bbsline"]')
         ).map((el) => el.textContent.toLowerCase());
+        const v = document.querySelector('#mainContainer .listBodyView');
         return {
           domRows: lines.length,
           hasAuthor: lines.some((t) => t.includes(a)),
-          listLen: window.__app.buf.listLines.length
+          listLen: window.__app.buf.listLines.length,
+          seqLen: window.__app.listSession._sequence().length,
+          viewportPx: v ? v.clientHeight : -1,
+          chh: window.__app.view.chh
         };
       }, author);
       expect(res.hasAuthor).toBe(false);
-      expect(res.domRows).toBe(24); // 视窗不因隐藏而缺行（邻近列补满/尾端补空）
+      // 隱藏列直接從序列消失（不留空隙），畫面高度不變。
+      expect(res.domRows).toBe(4 + Math.max(res.seqLen, 20));
+      expect(res.viewportPx).toBe(20 * res.chh);
       expect(res.listLen).toBeGreaterThanOrEqual(20); // 缓冲仍保留隐藏列
     } catch (e) {
       console.log('--- console tail ---');
@@ -615,13 +849,24 @@ test.describe('文章列表好读模式（离线）', () => {
       const fedBefore = await page.evaluate(() => window.__replay.fed);
       await page.keyboard.press('PageUp');
       await page.waitForTimeout(300);
-      // 游标 = 视窗第一列（DOM row 3 = body 顶）。
-      expect(await cursorRowIndex(page)).toBe(3);
+      // 游标 = 视口第一列（PgUp 以視口頂為基準，游標落在新頁頂）。
+      await page.waitForFunction(() => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        const rows = Array.from(
+          document.querySelectorAll('#mainContainer [data-type="bbsline"]')
+        );
+        const i = rows.findIndex((el) => el.textContent.startsWith('>'));
+        if (i < 0 || !v) return false;
+        return i - 3 - Math.round(v.scrollTop / window.__app.view.chh) === 0;
+      });
+      const cursorNumBefore = (await dumpListState(page)).selectedNum;
       s = await waitState(page, (x) => x.queueIdle && x.listLen > 50, 15000);
       const fedAfter = await page.evaluate(() => window.__replay.fed);
       expect(fedAfter).toBeGreaterThan(fedBefore); // demand 确实走了锚定对
-      // prepend 之后视窗以序号锚定 —— 游标仍在原列（新页没有把它往下挤）。
-      expect(await cursorRowIndex(page)).toBe(3);
+      // prepend 之后视口以内容锚定（不变量 6）—— 游标仍停在同一篇、也仍在视口顶，
+      // 新页没有把画面往下挤。
+      expect((await dumpListState(page)).selectedNum).toBe(cursorNumBefore);
+      expect(await cursorRowInViewport(page)).toBe(0);
 
       // 选取开文目标（录制的第三个 jump，也是缓冲最旧一篇）。
       const jumps = nav.steps.filter((st) => st.num != null);
@@ -652,6 +897,25 @@ test.describe('文章列表好读模式（离线）', () => {
       expect(s.selectedNum).toBe(openNum);
       expect(s.cursorHidden).toBe(true);
       await page.waitForTimeout(300);
+
+      // 视野必须停在 server 落点那一页：视口顶列＝锚（_topNum）那一列，刚读的
+      // 那篇在视野内。**下面的逐行 diff 抓不到这件事**——全序列渲染后
+      // dumpScreenRows 撈的是整段緩衝，對 scrollTop 完全不敏感。
+      //
+      // 注意这条**不是**「退文后视野跑掉」的重现（本卷录的开文目标恰好就是缓冲
+      // 最旧一篇 ⇒ 落点页顶＝序列位置 0，锚被覆写成 0 也看不出差别）。那条回归
+      // 由 unit 守：list_session.test.js「退文回列表：视野停在 server 落点那一页」
+      // ＋ render_list_scroll.test.js 的 hasListViewport()。这里守的是「视口位置
+      // 与锚一致、游标可见」，锚若被写去别处（例如沿用进文章前的 scrollTop）会红。
+      const topPos = await page.evaluate(() => {
+        const ls = window.__app.listSession;
+        const nums = window.__app.buf.listLineNums || [];
+        return ls._sequence().indexOf(nums.indexOf(ls._topNum));
+      });
+      expect(topPos).toBeGreaterThanOrEqual(0); // 锚没丢
+      expect(await windowTopPos(page)).toBe(topPos);
+      expect(await cursorRowInViewport(page)).not.toBeNull();
+
       const rowsAfterRestore = await dumpScreenRows(page);
       // body + footer（rows 3..23）逐行严格相同。两处「原生也会变」的合法差异
       // 正规化掉：header 的「人氣」计数（开文期间 server 重画 header），与开文
@@ -839,10 +1103,26 @@ test.describe('文章列表好读模式（离线）', () => {
       expect(beforeClick.selectedNum).not.toBe(openNum);
 
       const rows = await dumpScreenRows(page);
+      // 全序列渲染後目標列可能在視口外（body 的 data-row 是絕對序列位置）。
       const targetRow = rows.findIndex(
-        (t, i) => i >= 3 && i <= 22 && t.trim().startsWith(String(openNum))
+        (t, i) => i >= 3 && t.trim().startsWith(String(openNum))
       );
       expect(targetRow).toBeGreaterThanOrEqual(3);
+      // 先把它捲進視口再點：Playwright 的 auto-scroll 會在點擊當下才捲，
+      // 那之後量到的位置與實際點下去的位置可能對不上。
+      await page.evaluate((r) => {
+        const v = document.querySelector('#mainContainer .listBodyView');
+        v.scrollTop = (r - 3) * window.__app.view.chh;
+      }, targetRow);
+      await page.waitForFunction(
+        (r) => {
+          const v = document.querySelector('#mainContainer .listBodyView');
+          return (
+            Math.abs(v.scrollTop - (r - 3) * window.__app.view.chh) < 1
+          );
+        },
+        targetRow
+      );
 
       // 真的用滑鼠點那一列（clientToPos → body index → 絕對索引 → 開文交易）。
       // x 必須落在**標題欄**（col >= 30，見 comment_parse.LIST_TITLE_COL_START）：
@@ -928,13 +1208,16 @@ test.describe('置底文 Enter 开启（离线，pinned 卷）', () => {
 });
 
 // 2026-07-10：'/' 与 'v' 的模拟交易退役——非白名单键一键切原生（passthrough：
-// 可选 sync 腿 → enter-function-mode → 代送原键），prompt 由原生镜像显示，
-// 回 clean-list settle 自动恢复好读（resume+rebuild，不变量 15）。
+// 可选 sync 腿 → enter-function-mode → 代送原键），prompt 由原生镜像显示。
+// 2026-09-03（本檔兩條的語意反轉）：原生操作**做完之後**不再停在原生 —— 畫面
+// 靜下來（RESUME_QUIET_MS=250ms 內沒有 server 活動也沒有使用者送 byte）就由靜置
+// 探針自動切回好讀（resume+rebuild，不變量 15 照舊）。pref
+// enableListNativeAutoResume 預設開；關掉才是舊的黏性行為。
 test.describe('passthrough 一键切原生（离线，search/mark 卷）', () => {
   const search = loadCassette('cchat-list-search');
   const mark = loadCassette('cchat-list-mark');
 
-  test('/ 一键切原生：原生 prompt 打字提交→黏性停原生（MODE_SELECT）→← 退回主列表仍原生', async ({ page }) => {
+  test('/ 一键切原生：原生 prompt 打字提交→MODE_SELECT 落地後自动回好读→← 退回主列表仍好读', async ({ page }) => {
     test.skip(!search, '缺 cchat-list-search cassette');
     test.setTimeout(60000);
     const logs = ptt.attachConsole(page);
@@ -964,10 +1247,9 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
       await page.keyboard.type(q, { delay: 30 });
       await page.keyboard.press('Enter');
 
-      // 提交完成 → MODE_SELECT 清单以原生镜像显示；黏性 hold（2026-07-10 UX）：
-      // clean-list settle 不弹回 buffer——停在原生直到 article/menu 情境切换。
-      // 注意 dump 的 nums 是「buffer」序号（hold 期间不更新），画面序号需自行
-      // 从 DOM 列解析。
+      // 提交完成 → MODE_SELECT 清单落地。画面静下来之后靜置探針自动把我们切回
+      // 好读（resume+rebuild：MODE_SELECT 是独立编号空间，协定 §8）。
+      // 画面序号从 DOM 列解析（buffer 重建前后都对得上）。
       const screenNums = async () => {
         const rows = await dumpScreenRows(page);
         return rows
@@ -977,9 +1259,6 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
           })
           .filter((n) => n != null);
       };
-      await page.waitForFunction(
-        () => window.__app.listSession.state === 'functionMode'
-      );
       // MODE_SELECT 画面到齐（row0 先画、body 后画的串流时序 → poll 到
       // 「画面序号整页落入独立小序号空间」为止，一次取样必踩 race）。
       await expect
@@ -988,11 +1267,17 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
           return ns.length > 0 && Math.max(...ns) < Math.min(...mainNums);
         }, { timeout: 15000 })
         .toBe(true);
-      s = await dumpListState(page);
-      expect(s.renderMode).toBe('native');
-      expect(s.state).toBe('functionMode'); // 黏性：不弹回好读
+      // 自动回好读（本次改动的主体）：不按任何键，state 自己回 active、
+      // .listBodyView 重新出现。
+      s = await waitState(
+        page,
+        (x) => x.state === 'active' && x.renderMode === 'buffer',
+        15000
+      );
+      await expect(page.locator('.listBodyView')).toHaveCount(1);
 
-      // ← 原生退出 select → back step 喂主列表 → 仍停原生（黏性）。
+      // ← 退回主列表：这时已经是好读，所以走的是序列化的离开交易（back step）。
+      // 落地仍是好读（编号空间换了 ⇒ rebuild）。
       await page.keyboard.press('ArrowLeft');
       await expect
         .poll(async () => {
@@ -1000,9 +1285,11 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
           return ns.some((n) => n >= Math.min(...mainNums));
         }, { timeout: 15000 })
         .toBe(true);
-      s = await dumpListState(page);
-      expect(s.state).toBe('functionMode');
-      expect(s.renderMode).toBe('native');
+      s = await waitState(
+        page,
+        (x) => x.state === 'active' && x.renderMode === 'buffer',
+        15000
+      );
     } catch (e) {
       console.log('--- console tail ---');
       for (const l of logs.slice(-25)) console.log(l);
@@ -1010,7 +1297,7 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
     }
   });
 
-  test('v 一键切原生：sync 腿→代送 v→原生 prompt→Enter 取消→黏性停原生', async ({ page }) => {
+  test('v 一键切原生：sync 腿→代送 v→原生 prompt→Enter 取消→自动回好读', async ({ page }) => {
     test.skip(!mark, '缺 cchat-list-mark cassette');
     test.setTimeout(60000);
     const logs = ptt.attachConsole(page);
@@ -1048,13 +1335,160 @@ test.describe('passthrough 一键切原生（离线，search/mark 卷）', () =>
       const rows = await dumpScreenRows(page);
       expect(rows.some((t) => t.includes('(U)未讀') || t.includes('未讀'))).toBe(true);
 
-      // Enter 取消（cancel step 喂 FULLUPDATE）→ 黏性 hold：停在原生镜像，
-      // 不自动弹回好读（2026-07-10 UX——反复 [ ] 的闪动/误触 banner 修正）。
+      // Enter 取消（cancel step 喂 FULLUPDATE）→ 操作完成、画面静下来 ⇒ 靜置探針
+      // 自动把我们切回好读。这就是本次改动要的行为：使用者除了非导览操作本身，
+      // 大部分时间都看不到原生模式。
       await page.keyboard.press('Enter');
-      await page.waitForTimeout(1500); // 给 settle 机会（若误弹回这里会转 active）
-      s = await dumpListState(page);
-      expect(s.state).toBe('functionMode');
-      expect(s.renderMode).toBe('native');
+      s = await waitState(
+        page,
+        (x) => x.state === 'active' && x.renderMode === 'buffer',
+        15000
+      );
+      await expect(page.locator('.listBodyView')).toHaveCount(1);
+    } catch (e) {
+      console.log('--- console tail ---');
+      for (const l of logs.slice(-25)) console.log(l);
+      throw e;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 中文輸入法（IME）在列表好讀下的兩件事，都是使用者回報的「切到中文模式打字，
+// 整個畫面就卡住」的組成部分：
+//   1. 組字框 #t 必須看得見（它是 OS 候選字清單的錨；跑到視窗外＝使用者以為當機）。
+//      #t 的幾何契約主場在 cursor_shape.offline.spec.js，但那裡的兩條刻意關掉
+//      enableEasyReadingList；列表好讀的環境（cassette／pref／waitState）在本檔，
+//      而且斷言不同（要的是「落在視窗內」而非「貼齊該格」），所以放這裡。
+//   2. 組完字送出必須先切成原生鏡像，否則 PTT 畫的 prompt 被累積緩衝視窗蓋住。
+// IME 的 keydown keyCode 是 229，被 keyEventFilter 擋在 onKeyDown 之外 ⇒ 走不到
+// _classifyKey 的 passthrough，這兩件事都得靠 onTextInput 那條共用漏斗。
+// 純邏輯守護：tests/unit/row_anchor.test.js、tests/unit/list_text_input.test.js。
+// ---------------------------------------------------------------------------
+test.describe('中文輸入法（離線）', () => {
+  test.skip(!nav, '缺 cchat-list-nav cassette（yarn record:cassette 先錄一次）');
+
+  // 真 IME 事件序：compositionstart（框出現）→ 填字 → compositionend（送出）。
+  async function composeStart(page) {
+    await page.evaluate(() => {
+      const t = document.getElementById('t');
+      t.focus();
+      t.style.width = '40px'; // 避免右邊界 clamp 介入量測
+      t.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    });
+  }
+  async function composeEnd(page, text) {
+    await page.evaluate((s) => {
+      const t = document.getElementById('t');
+      t.value = s;
+      t.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: s }));
+    }, text);
+  }
+
+  // prefetch: 0 ＝只有 seed 那 20 列，body 剛好塞滿視口、捲不動。要驗「錨到捲出
+  // 視野的列」就得先讓上方長出可捲距離（比照「原生捲動」那條：fill 往舊文方向長）。
+  async function engaged(page, { fill = false } = {}) {
+    await bootOffline(page, ptt);
+    await replayListCassette(page, nav);
+    await page.waitForFunction(() => window.__app.buf.pageState === 2);
+    await ptt.applyPrefs(page, {
+      enableEasyReadingList: true,
+      easyReadingListPrefetchCount: fill ? 200 : 0,
+    });
+    return waitState(
+      page,
+      (x) => x.state === 'active' && x.queueIdle && (!fill || x.listLen > 40),
+      20000
+    );
+  }
+
+  test('組字框 #t 落在視窗內（不再錨到捲出視野的那一列）', async ({ page }) => {
+    test.setTimeout(60000);
+    const logs = ptt.attachConsole(page);
+    try {
+      await engaged(page, { fill: true });
+
+      // 捲到序列深處：buf.cur_y 對應的 srow 是整段序列最前面幾列，捲下去之後
+      // 就在視口上方外。捲動用 DOM 真相源（scrollTop），等它穩再量。
+      await page.evaluate(() => {
+        document.querySelector('#mainContainer .listBodyView').scrollTop = 9999;
+      });
+      await waitScrollStable(page, '#mainContainer .listBodyView');
+
+      const pre = await page.evaluate(() => {
+        const app = window.__app;
+        const v = document.querySelector('#mainContainer .listBodyView');
+        const el = document.querySelector(
+          `#mainContainer [type="bbsrow"][srow="${app.buf.cur_y}"]`
+        );
+        return {
+          cur_y: app.buf.cur_y,
+          scrollTop: v ? v.scrollTop : -1,
+          rowTop: el ? el.getBoundingClientRect().top : null,
+        };
+      });
+      // 前提成立才有意義（否則這條會沉默地永真）：真的捲動了、buf.cur_y 落在
+      // body（非 header 那 3 列）、而且那一列真的被捲出視野上方。
+      expect(pre.scrollTop).toBeGreaterThan(0);
+      expect(pre.cur_y).toBeGreaterThanOrEqual(3);
+      expect(pre.rowTop).not.toBeNull();
+      expect(pre.rowTop).toBeLessThan(0);
+
+      await composeStart(page);
+      const m = await page.evaluate(() => {
+        const b = document.getElementById('t').getBoundingClientRect();
+        return {
+          bshow: document.getElementById('t').getAttribute('bshow'),
+          top: b.top, bottom: b.bottom, left: b.left, right: b.right,
+          w: window.innerWidth, h: window.innerHeight,
+        };
+      });
+      expect(m.bshow).toBe('1');
+      // 舊碼：top ≈ pre.rowTop（大負數）⇒ 框整個在視窗外，候選字清單跟著跑掉。
+      expect(m.top).toBeGreaterThanOrEqual(0);
+      expect(m.bottom).toBeLessThanOrEqual(m.h);
+      expect(m.left).toBeGreaterThanOrEqual(0);
+      expect(m.right).toBeLessThanOrEqual(m.w);
+    } catch (e) {
+      console.log('--- console tail ---');
+      for (const l of logs.slice(-25)) console.log(l);
+      throw e;
+    }
+  });
+
+  test('組完字送出：切原生鏡像＋走 CommandQueue（Big5，恰送一次）', async ({ page }) => {
+    test.setTimeout(60000);
+    const logs = ptt.attachConsole(page);
+    const TEXT = '測試';
+    try {
+      const before = await engaged(page);
+      // seed 落點 server 游標＝選取 ⇒ 免 sync 腿（cassette 沒有那一腿的素材）。
+      await page.evaluate(() => {
+        const ls = window.__app.listSession;
+        ls._serverNum = ls._selectedNum;
+      });
+
+      await composeStart(page);
+      await composeEnd(page, TEXT);
+
+      const after = await waitState(
+        page,
+        (x) => x.state === 'functionMode' && x.renderMode === 'native',
+        10000
+      );
+      // 恰好一次送出（不得裸送 + 佇列各送一次）
+      expect(after.sentCount).toBe(before.sentCount + 1);
+      const sent = await page.evaluate(() => window.__replay.sent.slice(-1)[0]);
+      // Big5：兩個全形字 = 4 bytes，每個 byte < 256（裸送 UTF-16 會是 2 個 >0xFF 的碼位）
+      // 尾巴多一個 \f（同 native-key，保證必有一幀可判定）。
+      expect(sent.slice(-1)).toBe('\f');
+      const body = sent.slice(0, -1);
+      expect(body.length).toBe(4);
+      expect(Math.max(...[...body].map((c) => c.charCodeAt(0)))).toBeLessThan(256);
+      expect(body).not.toBe(TEXT);
+      // 原生鏡像：第二層捲動視口收掉，畫面回到固定 24 列
+      expect(after.viewportPx).toBe(-1);
+      expect(after.domRows).toBe(24);
     } catch (e) {
       console.log('--- console tail ---');
       for (const l of logs.slice(-25)) console.log(l);

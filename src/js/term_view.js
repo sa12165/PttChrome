@@ -3,7 +3,7 @@
 import { TermKeyboard } from './term_keyboard';
 import { cursorColorForBg } from './cursor_color';
 import { DEFAULT_HIGHLIGHT_BG, cursorHighlightClasses, highlightColStart, resolveHighlightRow } from './cursor_highlight';
-import { clickableColStart, cursorCss, CUR_BACK, CUR_POINTER, CUR_AUTO, EXIT_COL_END } from './mouse_regions';
+import { clickableColStart, cursorCss, CUR_BACK, CUR_POINTER, CUR_AUTO, EXIT_COL_END, resolveMouseGates } from './mouse_regions';
 import { functionKeyRows, parseFunctionKeys } from './footer_keys';
 import { exitBandRect } from './mouse_geometry';
 import { renderOverlayRow, renderScreen } from './term_ui';
@@ -13,10 +13,13 @@ import { u2b, parseStatusRow, normalizePasteText } from './string_util';
 import { rowToText, parseArticleHeader, findPageOverlap, resolvePageOverlap, decideAccumulateBranch, classifyPageTransition, pageArticleNums, isPinnedListRow, parseListArticleNumLoose, hasServerCursorMark } from './comment_parse';
 import { mergeListPage, flattenListBuffer, evictListBuffer, pinnedRowKey, MAX_LIST_ROWS, isLastReadStyledListRow, normalizeLastReadListRow, paintLastReadListRow, subjectOfListRow } from './list_session';
 import { labelListCursor, pruneListToSegment, LIST_HEADER_ROWS } from './list_window';
+import { BRD_HEADER_ROWS, boardListRowNums } from './board_list_parse';
+import { OWNER_BOARD_LIST } from './list_render_owner';
 import { readValuesWithDefault } from './pref_storage';
-import { cursorOffsets } from './cursor_anchor';
+import { cursorOffsets, paintedRowsAreBufRows } from './cursor_anchor';
 import { cursorGeomSample } from './debug_recorder';
 import { isDocumentForeground } from './notification_gate';
+import { serializedOpHint } from './serialized_op_gate';
 import icon128 from '../icon/icon_128.png';
 import cursorBack from '../cursor/back.png';
 
@@ -35,6 +38,32 @@ const STABLE_ROWS = Object.freeze({ stableRows: true });
 // Object.is 比較，連續的「不上色」不會白白觸發 render。
 // col＝底色從第幾欄畫起（0 = 整列），與可點區同源，見 cursor_highlight.highlightColStart。
 const NO_CURSOR_HIGHLIGHT = Object.freeze({ row: -1, cls: null, col: 0 });
+
+// flattenListBuffer 的置底 map 參數：看板列表沒有置底列（那是 read.c 的概念），
+// 但那支純函式的簽章是兩個 map ⇒ 共用一個永不寫入的空 Map（它只 forEach 讀取）。
+const EMPTY_PINNED_MAP = new Map();
+
+// 現在是誰在畫列表畫面（文章列表好讀 ListSession／看板列表 BoardListSession），
+// null ＝原生（沒有人接管，鍵盤／滑鼠／捲動一律走原路）。**唯一真相源是
+// App.activeListSession**（它讀 buf.listRenderOwner）——term_view 這邊的分派點有
+// 六處，各自推導一次就是遲早漏一處的靜默錯畫。
+// 寫成吃 core 的模組層純函式而不是 prototype 方法：好幾支 unit 測試是用
+// `TermView.prototype.onKeyDown.call(plainCtx, …)` 呼叫的，`this` 上沒有方法。
+function listOwnerOf(core) {
+  return core && core.activeListSession ? core.activeListSession() : null;
+}
+
+// 依樣造一列全空白（預設 attr）的 TermChar 列，給短頁補列用。兩種列表各自快取
+// 一份（來源 header 不同），造法共用這一支。
+function blankRowLike(src) {
+  const row = cloneRow(src);
+  for (let i = 0; i < row.length; ++i) {
+    row[i].ch = ' ';
+    row[i].isLeadByte = false;
+    row[i].resetAttr();
+  }
+  return row;
+}
 
 // Snapshot-clone a screen row (TermChar[]) for retention in buf.pageLines. The live
 // 24-row buffer is overwritten as PTT repaints, so accumulated rows must be copied.
@@ -124,6 +153,9 @@ export function TermView() {
   this.mouseMiddleClick = 0;
   this.mouseWheel = 1;
   this.mouseWheelSmoothScroll = true;
+  // mouseBackNav：攔截瀏覽器的「返回」→ 左方向鍵（0 關 1 開）。來源含觸控板
+  // 左滑手勢、滑鼠側鍵、Alt+←／⌘[、工具列上一頁，全走同一條 history sentinel。
+  this.mouseBackNav = 1;
   // 防誤觸模式（pref mouseMisclickGuard，預設開）：可點區＝底色區的起始欄，
   // 決策在 mouse_regions.clickableColStart。
   this.mouseMisclickGuard = true;
@@ -149,7 +181,6 @@ export function TermView() {
   // 公開旗標讀（docs/easy-reading.md）。搬進 easy_reading.js 等於拆掉那個契約。
   // 手動開關一律走 App.switchToEasyReadingMode / exitEasyReading，勿直接翻這個旗標。
   this.useEasyReadingMode = false;
-  this.easyReadingKeyDownKeyCode = 0;
 
   // List easy reading hides the PTT cursor while the buffer render owns the
   // screen (the real cursor points into the 24-row buffer, not the long list).
@@ -176,6 +207,12 @@ export function TermView() {
   // functionMode 鏡像原生 24 列（easy_reading._onKeyDownProcessUI），那是格線幀。
   // 只有真的重畫畫面的分支才改它。
   this._gridRender = true;
+
+  // _gridRender 的**姊妹旗標，語意不同**：這一幀畫出去的 srow 是不是 buf 的列號。
+  // 列表好讀視窗是格線幀（_gridRender=true）但 srow 是「整段序列」的 index ⇒ 拿
+  // buf.cur_y 反查會錨到毫無關係的一列。由 _renderScreenLines 依實際餵出去的 lines
+  // 推導（cursor_anchor.paintedRowsAreBufRows），首次 render 之前是惰性值。
+  this._srowIsBufRow = true;
 
   // 閃爍游標抑制（autoHideBlinkCursor）：PTT 自己畫了 '>' 游標的畫面（列表／選單）
   // 不需要再疊一個閃爍游標。與 _cursorHidden 是**兩個獨立來源**，用 OR 合併於
@@ -220,6 +257,9 @@ export function TermView() {
   // 好讀「連續同作者推文合併」：render 層合併（Screen#computeAnnotations +
   // comment_merge.js），僅好讀文章頁生效。Set via App.onPrefChange.
   this.mergeSameAuthorComments = true;
+  // 推文區塊行距（內緊外鬆）：純 CSS，容器 class 由 render/screen.js 掛。
+  // Set via App.onPrefChange.
+  this.commentBlockSpacing = true;
   // 裝置端 AI（Chrome Prompt API）總開關。每個 AI 子功能的生效條件都是
   // `enableAi && <子開關>`，AND 在下面 _renderScreenLines 匯總（單一 choke point）。
   // Set via App.onPrefChange.
@@ -248,6 +288,8 @@ export function TermView() {
   // boardless #AID link. Assigned by the App like flashListHint etc.
   this._articleBoard = null;
   this.onAidClick = null;
+  // 「開燈」需要切 pmore 色彩顯示模式時的入口（App 指派，見 pttchrome.jsx）。
+  this.onLightsRawMode = null;
   // Pusher highlight: lower-cased id of the pusher whose comments are currently
   // highlighted (whole row), or null. Set by togglePusherHighlight on click.
   this._selectedPusher = null;
@@ -606,9 +648,22 @@ TermView.prototype = {
         if (this.mainDisplay) this.mainDisplay.scrollTop = 0;
         this._gridRender = true;
         var windowLines = null;
+        // 兩種列表好讀共用這條分支與同一個旗標，差別只有「累積／組視窗」用哪一份
+        // 緩衝，以及 enhance 的 pageState。誰在畫由 buf.listRenderOwner 決定
+        //（js/list_render_owner.js —— 那是唯一真相源，別在這裡自行推導）。
+        var isBrdList = this.buf.listRenderOwner === OWNER_BOARD_LIST;
+        var lsSession = listOwnerOf(this.bbscore);
         if (this.buf.listRenderMode === 'buffer') {
-          this.accumulateListLines();
-          windowLines = this.buildListWindowLines();
+          // 重繪前先把「使用者現在看著哪一列」從 DOM 的 scrollTop 擷取成內容錨：
+          // 下一行的 accumulate 會 merge/evict/prune，整段序列可能上下位移。
+          if (lsSession) lsSession.captureScrollAnchor();
+          if (isBrdList) {
+            this.accumulateBoardListLines();
+            windowLines = this.buildBoardListWindowLines();
+          } else {
+            this.accumulateListLines();
+            windowLines = this.buildListWindowLines();
+          }
         } else {
           windowLines = this._listWindowLines || null;
         }
@@ -624,31 +679,57 @@ TermView.prototype = {
           // buildListWindowLines 的註解）⇒ 列參考相同即內容相同，render 層可以
           // 直接沿用上一幀的節點。frozen 幀原封沿用整份 _listWindowLines，24 列
           // 全部命中。
-          // 次列位移（平滑捲動）：body 區交給自己的視口節點，offsetPx 就是它的
-          // scrollTop。overscan 由實際列數推導 —— frozen 幀沿用的是快照，不能
-          // 再去問 session 現在的 frac。
+          // 捲動：body（＝整段序列）住在一個固定高度的視口節點裡，捲動交給
+          // 瀏覽器。`scrollable` 決定它吃不吃使用者輸入——frozen（交易中）與
+          // pref 關掉時走 overflow:hidden（畫面凍住／退回一次一頁），而
+          // scrollTop 與 scrollTo() 在 hidden 下照樣有效。
+          //
+          // 看板列表（isBrdList）**把 pageState pin 成 1（MENU）並關掉 inListContext**，
+          // 而且不帶 listEasyReading。理由：computeAnnotations 的 PAGE_LIST 分支會對
+          // 每一列跑 parseListAuthor + 黑名單比對，看板列的「作者欄」落在看板名／類別
+          // 上 ⇒ 誤命中就整個看板從清單消失（原生模式只是換成通知列，至少還看得到）。
+          // pin 成 1 只跑 applyFunctionKeys，而 functionKeyRows(1, n) 與 (2, n) 回傳
+          // 相同（footer_keys.js）⇒ row1／footer 的功能鍵按鈕行為零損失。
+          // 滑鼠的欄位規則讀的是 buf.pageState（在看板列表仍是 2），不受此 override 影響。
           var lsBodyRows = this.buf.rows - 4;
-          var lsSession = this.bbscore && this.bbscore.listSession;
-          this._renderScreenLines(windowLines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, {
-            pageState: 2,
-            listEasyReading: true,
+          this._renderScreenLines(windowLines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, Object.assign({
             rowIdentityStable: true,
             listScroll: {
-              bodyStart: LIST_HEADER_ROWS,
-              bodyRows: lsBodyRows,
+              bodyStart: isBrdList ? BRD_HEADER_ROWS : LIST_HEADER_ROWS,
               viewportPx: lsBodyRows * this.chh,
-              offsetPx:
-                (lsSession && lsSession.scrollFrac && lsSession.scrollFrac()) || 0,
-              overscan: windowLines.length > LIST_HEADER_ROWS + lsBodyRows + 1
+              scrollable:
+                this.buf.listRenderMode === 'buffer' && this._listWheelGates().wheelSmoothScroll
             }
-          });
+          }, isBrdList
+            ? { pageState: 1, inListContext: false }
+            : { pageState: 2, listEasyReading: true }));
+          // 捲動事件的接線（ScreenController 只在建立視口節點時掛一次 listener，
+          // 這裡給它 callback）。hook 是常駐閉包，不必每幀重建。
+          if (this.componentScreen) {
+            if (!this._listScrollHook) {
+              var self = this;
+              this._listScrollHook = function() {
+                var s = listOwnerOf(self.bbscore);
+                if (s && s.onDomScroll) s.onDomScroll();
+              };
+            }
+            this.componentScreen.onListScroll = this._listScrollHook;
+          }
+          // 重繪後把錨還原成新的 scrollTop（＋消費排隊中的 reveal）。frozen 幀
+          // 刻意不做：畫面要逐像素凍在交易開始的那一刻。
+          if (lsSession && this.buf.listRenderMode === 'buffer')
+            lsSession.applyScrollAfterRender();
         } else {
           // No window yet (header cache / buffer still empty — engage races):
           // mirror the native screen; the next clean-list settle re-renders.
           // **不可以**帶 rowIdentityStable：這裡畫的是 buf.lines（term_buf 就地
           // 改寫的活 buffer），列參考相同不代表內容相同。上面那一行長得很像，別
           // 順手複製過來。它走的是 changedRows 那條路（下方 enhanceOverrides）。
-          this._renderScreenLines(lines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, { pageState: 2, listEasyReading: true, changedRows: changedRows });
+          this._renderScreenLines(lines.slice(), /* dropHidden */ false, /* inlinePreview */ false, /* hoverPreview */ false, Object.assign(
+            { changedRows: changedRows },
+            isBrdList
+              ? { pageState: 1, inListContext: false }
+              : { pageState: 2, listEasyReading: true }));
         }
       } else if (this.useEasyReadingMode && this.buf.pageState == 3) {
         // Easy-reading article: accumulate the long page into buf.pageLines (pure
@@ -737,12 +818,43 @@ TermView.prototype = {
   // author / pusher highlight) lives entirely in Screen#computeAnnotations now,
   // shared by both modes.
   _renderScreenLines: function(lines, dropHidden, inlinePreview, hoverPreview, enhanceOverrides) {
+    // 這一幀實際畫出去的那一份 lines。`data-row` 的定義就是「傳給 <Screen> 的
+    // lines index」（dropHidden 移除的列不位移其餘列的 data-row），所以凡是拿
+    // 選取座標反查內容的消費端（App.doCopyAnsi）都只能用這一份 —— 七條 render
+    // 分支餵的來源各不相同（buf.lines／buf.pageLines／列表好讀的虛擬視窗），
+    // 用錯就是複製到別的畫面，超出 buf.rows 的列還會直接 TypeError。
+    // 守護：tests/unit/list_copy_ansi.test.js。
+    this._renderedLines = lines;
+    // 同一份事實的另一面，給 #cursor／#t 的錨點用：**這一幀的 srow 是不是 buf 的
+    // 列號**（見 cursor_anchor.paintedRowsAreBufRows 與 docs/easy-reading.md
+    // 「游標／#t 的錨點契約」）。呼叫端只餵 lines，判準在這裡一次算完 —— 七條分支
+    // 各自宣告一個旗標的話，漏掉任何一條都是靜默畫錯。
+    this._srowIsBufRow = paintedRowsAreBufRows(lines, this.buf.lines, this.buf.rows);
     // Maintain the sticky board-list context (see constructor). LIST enters it,
     // MENU/READING leave it, everything else (overlay prompts, transient frames)
     // keeps the previous value so blacklist hiding persists across e.g. the v prompt.
+    //
+    // 「everything else keeps the previous value」有一個**必要的例外**：整頁換掉的
+    // 畫面（Ctrl-P 發文、板規、精華區…）。setPageState 沒有 reset 分支，那些畫面會
+    // 沿用列表的 pageState 2，黏性旗標又跟著留著 ⇒ 標註層兩個輸入同時說謊
+    // （2026-09-05 錄製檔：發文分類列被標題黑名單 vtub 命中）。判準用 row2 的表頭
+    // 「編號」——`bbs.c` 的 vbarf(ANSI_REVERSE "   編號 …")，與
+    // list_session#classifyListScreen 用的是同一個指紋。**刻意不用 footer**：
+    // 「v 設定已讀未讀」這類 overlay 只重畫最後一列，表頭仍在，黏性語意才守得住
+    // （tests/unit/screen_dropHidden.test.js 的 sticky 那組）。
+    // 真正的守門仍是 comment_parse#isListShapedRow 的逐列指紋；這裡只是把旗標本身
+    // 修回誠實，別讓下一個消費端又踩同一個洞。
+    //
+    // 順序刻意：表頭解碼（rowToText 走 80 格 Big5）**只在真的會沿用舊 true 的幀**
+    // 才跑 —— 這個函式是每一幀 render 的必經之路，無條件解碼是白付的成本。
     const ps = this.buf.pageState;
     if (ps === 2) this._inBoardListContext = true;
     else if (ps === 1 || ps === 3) this._inBoardListContext = false;
+    else if (
+      this._inBoardListContext &&
+      rowToText(this.buf.lines[2] || []).indexOf('編號') < 0
+    )
+      this._inBoardListContext = false;
     // 功能鍵可點：**全專案唯一**算 functionKeyRows 的地方（這個函式是七條 render
     // 分支共用的 enhance choke point）。
     //
@@ -750,9 +862,23 @@ TermView.prototype = {
     // （buf.pageLines，數千列），那裡沒有「最後一列＝狀態列」這回事，而且它們吃
     // 增量快取 —— 永不給這個欄位，快取零風險。
     // pageState 用 override 優先（列表好讀的視窗幀把它 pin 成 2），沒有才用 buf 的。
+    //
+    // `!isCursorOnInputField()` 是**硬需求**（2026-09 複合鍵放開之後）：
+    // `[Y/n]`（bbs.c:3060 小天使）與 ` 確定[y/N]:`（bbs.c:3098）都畫在最後一列
+    // ＝ functionKeyRows 會掃的那一列，一旦拆成兩顆按鈕，點 `Y` 只會把字打進
+    // vgetstring 的欄位、**不會送出**（vgets 要 Enter），使用者會以為壞掉；
+    // 更糟的是「要使用小天使匿名推文嗎？ [Y/n]」的語意是空 Enter ＝匿名 YES。
+    // 這與 resolveMouseRegion 的 inputPrompt 早退、cursor_highlight 的
+    // inputPrompt、nav_key_gate 的同一條判斷**是同一個事實**，四處一致才守得住。
+    // （fnRows 進了 annotationsKey，所以這個布林翻轉時節點會正確重建。）
     const ov = enhanceOverrides || {};
     let fnRows = null;
-    if (!ov.stableRows && this.mouseFunctionKeys && this.buf.useMouseBrowsing) {
+    if (
+      !ov.stableRows &&
+      this.mouseFunctionKeys &&
+      this.buf.useMouseBrowsing &&
+      !this.buf.isCursorOnInputField()
+    ) {
       fnRows = functionKeyRows(
         ov.pageState != null ? ov.pageState : this.buf.pageState,
         lines.length
@@ -770,6 +896,9 @@ TermView.prototype = {
           titleBlacklist: this.titleBlacklist,
           showFloorNumbers: this.showFloorNumbers,
           mergeSameAuthorComments: this.mergeSameAuthorComments,
+          // 推文區塊行距。**刻意不進 annotationsKey**（js/screen_annotate_cache.js
+          // 的白名單）：它只影響容器 class，不改變任何一列的標註。
+          commentBlockSpacing: this.commentBlockSpacing,
           captionAiEnabled: this.enableAi && this.enableCaptionAi,
           highlightAuthor: this.highlightAuthorComments,
           articleAuthor: this._articleAuthor,
@@ -803,7 +932,17 @@ TermView.prototype = {
           // this.onFunctionKey，與 onAidClick 同一種 view-optional callback 慣例；
           // **引用必須穩定**，annotationsKey.refs 與 outerHTML 節點重用都靠它）。
           functionKeyRows: fnRows,
-          onFunctionKey: this.onFunctionKey
+          onFunctionKey: this.onFunctionKey,
+          // 「開燈」的軌 B：目前的 pmore 色彩顯示模式（0/1/2，null＝還沒看過設定
+          // 頁）＋切換入口。App 在啟動時指派 onLightsRawMode，**引用必須穩定**
+          // （同 onFunctionKey/onAidClick 的 view-optional callback 慣例）。
+          // 兩者刻意**不進** annotationsKey：它們只影響浮動按鈕，不影響任何一列
+          // 的標註（見 js/screen_annotate_cache.js 的白名單）。
+          rawMode:
+            this.bbscore && this.bbscore.easyReading
+              ? this.bbscore.easyReading.rawMode
+              : null,
+          onLightsRawMode: this.onLightsRawMode
         },
         // List easy reading pins pageState:2 so computeAnnotations applies list
         // blacklist rules to the accumulated buffer even on transient frames.
@@ -889,11 +1028,13 @@ TermView.prototype = {
       return;
     }
 
-    if (this.useEasyReadingMode && this.buf.startedEasyReading &&
-        this.easyReadingKeyDownKeyCode == 229 && e.target.value != 'X') { // only use on chinese IME
-      e.target.value = '';
-      return;
-    }
+    // 這裡**不看 keyCode**：IME 組出的任何字元都往 onTextInput 這條共用漏斗走，
+    // 由 noteTextInput 決定要不要先切成原生鏡像。舊碼有一段
+    // `easyReadingKeyDownKeyCode == 229 && value != 'X'` 就丟棄字元的特判，語意是
+    // 「IME 開著時除了 X 以外一律靜默吞掉」，與「keydown／IME／貼上三個入口一致」
+    // 的設計直接衝突；而且它永不可達（唯一寫入點在 onKeyDown 內，keyEventFilter
+    // 第一條就把 229 擋在外面）。2026-08 已刪，勿再加回。
+    // 守護：tests/unit/term_view_text_input.test.js。
     if (e.target.value) {
       this.onTextInput(e.target.value);
     }
@@ -901,10 +1042,33 @@ TermView.prototype = {
   },
 
   onTextInput: function(text, isPasting) {
-    // 送字給 PTT ≠ 按鍵。好讀模式是在 keydown 決定要不要切成原生鏡像（functionMode），
-    // 而 IME（keydown 的 e.key 是 'Process'）與貼上都繞得過那道判斷 → PTT 開了推文／
-    // 搜尋 prompt，畫面卻還停在好讀長頁上，使用者看不到輸入框卻打得進去。
-    // 見 easy_reading.noteTextInput（含 gate，非文章／好讀關著時為 no-op）。
+    // 序列化操作（AID 跳文／長推文）在途時一律吞掉，理由與 onKeyDown 那道相同。
+    // **排在列表好讀分派之前**：noteTextInput 自己會 _enterFunctionMode() 並排
+    // native-input，在途時那本身就是競態。isPasting 也擋（App.onPasteDone 已擋過
+    // 一層，這裡是自保：image_upload_controller 等呼叫端繞得過去）。
+    // 守護 tests/unit/serialized_op_gate.test.js。
+    var busyHint = serializedOpHint(this.bbscore);
+    if (busyHint) {
+      this.flashListHint(busyHint);
+      return;
+    }
+    // 送字給 PTT ≠ 按鍵。兩種好讀模式都是在 keydown 決定要不要切成原生鏡像
+    // （functionMode），而 IME（keydown 的 e.key 是 'Process'、keyCode 229，被
+    // keyEventFilter 擋在 onKeyDown 之外）與貼上都繞得過那道判斷 → PTT 開了推文／
+    // 搜尋 prompt，畫面卻還停在好讀長頁／累積列表視窗上，使用者看不到輸入框卻打得
+    // 進去（列表那邊的症狀是「切中文輸入法打字，整個畫面卡住」）。
+    //
+    // 列表好讀：形狀比照 App.onPasteDone —— 先問 ListSession 要不要接手，接手了就
+    // **不可以**再 _convSend。isPasting 時跳過：貼上已經在 onPasteDone 問過
+    // listSession.onPaste，這裡再問一次就是同一段文字送兩次。
+    // 見 list_session.noteTextInput／easy_reading.noteTextInput（兩者都自帶 gate，
+    // 沒接管畫面時為 no-op／回 false）。
+    // 同 onKeyDown：IME 送字也是「使用者送了 byte」，原生鏡像下同樣收不到。
+    if (this.bbscore && this.bbscore.noteListNativeInput)
+      this.bbscore.noteListNativeInput();
+    var textOwner = listOwnerOf(this.bbscore);
+    if (!isPasting && textOwner && textOwner.noteTextInput(text))
+      return;
     if (this.bbscore.easyReading)
       this.bbscore.easyReading.noteTextInput();
     // Normalization lives in string_util.normalizePasteText so the list easy
@@ -915,19 +1079,35 @@ TermView.prototype = {
     this._convSend(text);
   },
 
+  // 觸控板水平手勢／瀏覽器返回鍵的**唯一出口**：合成一個「使用者按了這個鍵」再走
+  // 既有的 onKeyDown 分派鏈。絕對不可以自己 view._send('[D') —— 左方向鍵在三
+  // 種 render 分支下語意不同（原生直送／文章好讀要先收狀態機／列表好讀必須走
+  // ListSession 的 {class:'leave'} 序列化交易），那套分派已經存在於鍵盤路徑，
+  // 裸送 byte 在列表好讀底下就是「在序列化交易中途插隊」（v5 封閉互動禁止）。
+  //
+  // 三條硬規則（守護 tests/unit/term_view_send_key_as_user.test.js）：
+  //  1. **cancelable: true 絕不可省**。整條鏈靠 e.defaultPrevented 判斷「上游有沒
+  //     有接手」；cancelable 為 false 時 preventDefault() 是 no-op ⇒ easyReading／
+  //     listSession 明明接手了，_keyboard 還會再送一次 [D。（已實測：對一個
+  //     從未 dispatch 的合成事件呼叫 preventDefault，Chromium／Firefox／jsdom 三
+  //     者的 defaultPrevented 都會變 true，這是 DOM 標準行為。）
+  //  2. 合成事件的 e.code 是空字串、isTrusted 為 false、target 為 null。目前鏈上
+  //     只有 term_keyboard.altRemapCharCode 讀 e.code，它已寫成 `e.code || ''`。
+  //     **日後在鏈上新增讀 e.code／e.target／e.isTrusted 的邏輯就會靜默壞掉。**
+  //  3. 用 this.onKeyDown(ev) **直接呼叫**，不要 dispatchEvent：#t 上已掛了 keydown
+  //     listener，dispatch 會讓同一個事件跑兩次分派。
+  sendKeyAsUser: function(keyName) {
+    this.onKeyDown(new KeyboardEvent('keydown', { key: keyName, cancelable: true }));
+  },
+
   onKeyDown: function(e) {
-    // AID navigation in flight: serialized machine keys own the wire — a user
-    // key would race them (typeahead, protocol §2). Swallow with a banner.
-    if (this.bbscore.aidNavigation && this.bbscore.aidNavigation.active) {
+    // 序列化操作（AID 跳文／長推文）在途：程式化的鍵序列擁有這條線路，使用者的鍵
+    // 會與它競態（typeahead，協定 §2）。吞掉並給提示——條件與提示文字四條入口共用，
+    // 見 serialized_op_gate.js。
+    var busyHint = serializedOpHint(this.bbscore);
+    if (busyHint) {
       e.preventDefault();
-      this.flashListHint('AID 跳文中，請稍候…');
-      return;
-    }
-    // 長推文送出中：同一條理由（X → 型別 → 內容 → y 的配對不能被插隊）。進度
-    // 遮罩會讓 shouldAcceptInput() 先擋下大部分按鍵，這裡是同條件的自保。
-    if (this.bbscore.longPush && this.bbscore.longPush.active) {
-      e.preventDefault();
-      this.flashListHint('長推文送出中，請稍候…');
+      this.flashListHint(busyHint);
       return;
     }
     // "返回原文" hotkey (pref aidNavBackKey, default F9). Claimed BEFORE every
@@ -965,7 +1145,6 @@ TermView.prototype = {
     }
     if (this.useEasyReadingMode && this.buf.startedEasyReading &&
         !this.buf.easyReadingFunctionMode) {
-      this.easyReadingKeyDownKeyCode = e.keyCode;
       this.bbscore.easyReading._onKeyDown(e);
       if (e.defaultPrevented)
         return;
@@ -975,9 +1154,16 @@ TermView.prototype = {
     // native (idle / list functionMode) this hook never fires, so every key
     // (Enter included) reaches PTT unchanged, which is what makes the native
     // mirror correct by construction.
-    if ((this.buf.listRenderMode === 'buffer' || this.buf.listRenderMode === 'frozen') &&
-        this.bbscore.listSession) {
-      this.bbscore.listSession.onKeyDown(e);
+    // 文章列表／看板列表共用這條分派；哪一個 session 接手由 buf.listRenderOwner
+    // 決定（App.activeListSession 是唯一真相源）。
+    // **無條件**先記一筆「使用者送了 byte」：原生鏡像期間 listOwnerOf 回 null，
+    // 而那正是「非導覽操作完成後自動切回好讀」最需要知道使用者手停了沒的時候
+    // （少了它會在使用者於原生 prompt 打字時把畫面搶回好讀）。只記時間戳。
+    if (this.bbscore && this.bbscore.noteListNativeInput)
+      this.bbscore.noteListNativeInput();
+    var keyOwner = listOwnerOf(this.bbscore);
+    if (keyOwner) {
+      keyOwner.onKeyDown(e);
       if (e.defaultPrevented)
         return;
     }
@@ -1216,21 +1402,27 @@ TermView.prototype = {
   // mouse_regions.clickableColStart），但**條件**不同：底色只要停在可點的列上就給，
   // pointer 還要 mouseLeftClick 也開著。底色的 gate 在 applyCursorHighlight
   // （唯一真相源），這裡只 gate 總開關與 pointer。
+  // 捲動視口吃不吃使用者輸入，由滑鼠 gating 的單一真相源決定（同 App.mouseGates，
+  // 只是 term_view 這邊在 render 途中拿不到 App）。
+  _listWheelGates: function() {
+    return resolveMouseGates({
+      useMouseBrowsing: this.buf.useMouseBrowsing,
+      mouseWheel: this.mouseWheel,
+      mouseWheelSmoothScroll: this.mouseWheelSmoothScroll
+    });
+  },
+
   onListMouseMove: function(row, col) {
     var hover = -1;
     if (this.buf.useMouseBrowsing && this.buf.listRenderMode === 'buffer') {
-      var ls = this.bbscore && this.bbscore.listSession;
+      var ls = listOwnerOf(this.bbscore);
+      // body ＝ header 之後的整段序列，所以 body index 直接是序列位置。
       var idx = row - LIST_HEADER_ROWS;
-      // row === buf.rows ＝ 平滑捲動時視口底部露出的那一小條（overscan 列，
-      // 渲染 index 24）。它一樣是使用者看得到、點得到的列 ⇒ 底色也要標得到，
-      // 「可點範圍＝標示範圍」的合約才成立（docs/mouse.md）。
-      if (ls && row === this.buf.rows) {
-        var ovWin = ls.getWindowView();
-        if (ovWin && ovWin.overscanAbs != null) hover = row;
-      } else if (ls && idx >= 0 && idx < this.buf.rows - 4) {
-        var win = ls.getWindowView();
-        // body[idx] == null ＝ 短頁的空白補列，沒有文章可點。
-        if (win && win.body[idx] != null) hover = row;
+      if (ls && idx >= 0) {
+        var view = ls.getListView();
+        // idx >= seq.length ＝ 短板補到 bodyRows 的空白列（或 footer），
+        // 沒有文章可 hover。
+        if (view && idx < view.seq.length) hover = row;
       }
     }
     // 左側退出帶（cols 0..EXIT_COL_END）：與原生列表同一個手勢，同樣**不看
@@ -1532,9 +1724,15 @@ TermView.prototype = {
   // 這一幀 buf 第 row 列**真正被畫出來**的節點的 offset（相對 `.main` —— 它是
   // position:relative，也就是 #cursor 的 containing block ⇒ 兩者同一個座標系）。
   //
-  // 只在格線幀（_gridRender）才有意義：好讀累積長頁的 srow 是長頁列號，與 buf.cur_y
-  // 毫無關係，拿它當錨會錨到隨機一列（那種幀游標本來就整個隱藏，但 #t 還是會讀，
-  // 所以這裡要擋在源頭）。量不到就回 null，由 cursorOffsets 退回舊算術。
+  // 兩道守門，**不等價**，缺一不可：
+  //   _gridRender   ── `.main` 裝的是不是固定格線的一整螢幕。
+  //   _srowIsBufRow ── 這一幀畫出去的 srow 是不是 buf 的列號。
+  // 好讀累積長頁兩者皆否；**列表好讀視窗是格線幀（_gridRender=true）但 srow 是
+  // 「整段序列」的 index**，只看 _gridRender 就會錨到 .listBodyView 深處、通常已
+  // 捲出視野的一列 ⇒ rect.top 大負數 ⇒ #t 被寫到視窗外（2026-08「切中文輸入法
+  // 打字，整個畫面卡住」）。那種幀游標本來就整個隱藏，但 #t 還是會讀，所以要擋在
+  // 源頭。量不到就回 null，由 cursorOffsets 退回舊算術、由 _cellClientRect 退回
+  // `.main` 左下角。守護：tests/unit/row_anchor.test.js。
   //
   // **每次呼叫都現量，不做跨呼叫快取**：layout 會變的時機不只重繪與改字級（延遲載入
   // 的圖片落地、pref 切換 CSS class、字型落地都會），任何以「幀序號」為鍵的快取都會
@@ -1542,7 +1740,7 @@ TermView.prototype = {
   // 一次 offset 讀取，成本落在游標移動這個頻率上，可以接受。
   // 同一次 updateCursorPos 之內由呼叫端把結果傳給 updateInputBufferPos，不重複量。
   _rowAnchor: function(row) {
-    if (!this._gridRender) return null;
+    if (!this._gridRender || !this._srowIsBufRow) return null;
     var cont = this.mainContainer;
     var el = cont
       ? cont.querySelector('[type="bbsrow"][srow="' + row + '"]')
@@ -1576,7 +1774,8 @@ TermView.prototype = {
   // **不要改用 #cursor 的 rect 當錨**：#cursor 基底 CSS 是 display:none，靠
   // body.blink--active 每秒 toggle ⇒ 有一半時間量到全 0。
   //
-  // 沒有可錨的列（好讀累積長頁：格線座標在那裡沒有意義，_rowAnchor 回 null）時
+  // 沒有可錨的列（好讀累積長頁：格線座標在那裡沒有意義；列表好讀視窗：srow 是序列
+  // index，不是 buf 列號 —— 兩者 _rowAnchor 都回 null）時
   // **不要把框留在 -100000px**：那會讓 OS 的候選字清單跑到瀏覽器自選的角落。改停在
   // `.main` 可視區的左下角 —— 也就是原生輸入列將要出現的位置（任何送得出去的字都會
   // 先讓 easy_reading 進 functionMode 鏡像原生，屆時就改吃精確錨點）。這裡用的是
@@ -2041,7 +2240,14 @@ TermView.prototype = {
       // 功能鍵按鈕：這條路不經 computeAnnotations（見 term_ui.renderOverlayRow），
       // 故在這裡自己解析。gate 與 _renderScreenLines 那邊一致。
       var fnKeys = null;
-      if (this.mouseFunctionKeys && this.buf.useMouseBrowsing && this.onFunctionKey) {
+      // isCursorOnInputField 這一條與 _renderScreenLines 同一個事實，見那裡的說明
+      // （輸入欄開著時 `[Y/n]` 會變成兩顆送不出去的按鈕）。
+      if (
+        this.mouseFunctionKeys &&
+        this.buf.useMouseBrowsing &&
+        this.onFunctionKey &&
+        !this.buf.isCursorOnInputField()
+      ) {
         var parsed = parseFunctionKeys(statusChars);
         if (parsed) {
           var onFunctionKey = this.onFunctionKey;
@@ -2068,7 +2274,7 @@ TermView.prototype = {
   // 而 selectedPusher 進了 annotationsKey ⇒ 點一下推文列就讓整份好讀累積長頁全量
   // 重算（含每個 run 的 buildMergedCommentChars）＋每一列節點重建。兩個症狀：
   //   1. 每個 inlinePreviewSlot 被 disposeNode 收掉重建，新 slot 的 pinned=null
-  //      ⇒ minHeight 歸零 ⇒ 圖片／影片佔位盒塌陷成 0 高，等 IntersectionObserver
+  //      ⇒ 佔位高度歸零 ⇒ 圖片／影片佔位盒塌陷成 0 高，等 IntersectionObserver
   //      → mount → onLoad → ResizeObserver 這串非同步流程才撐回來（使用者回報：
   //      合併推文的空白區閃爍、隱約看到別行推文）。
   //   2. 節點抽換發生在雙擊的第二個 mousedown **之前** ⇒ 瀏覽器的雙擊選詞落在已被
@@ -2154,10 +2360,16 @@ TermView.prototype = {
       }
     }
     mergeListPage(this._listNumMap, this._listPinnedMap, entries);
-    // Row cap: evict the end farthest from the selection so redraw cost stays
-    // bounded (a few hundred rows ≈ the native feel). The session must clear
-    // the matching edge flag — demand re-fetches an evicted segment later.
-    var ev = evictListBuffer(this._listNumMap, ls ? ls._selectedNum : null, MAX_LIST_ROWS);
+    // Row cap: evict the end farthest from the **viewport** so redraw cost stays
+    // bounded (a few hundred rows ≈ the native feel). 樞紐是視口不是選取——
+    // 游標可以被捲出視野很遠，用它當樞紐會把使用者眼前那一段丟掉（見
+    // evictListBuffer 的註解）。
+    // The session must clear the matching edge flag — demand re-fetches later.
+    var ev = evictListBuffer(
+      this._listNumMap,
+      ls ? ls.evictPivot() : null,
+      MAX_LIST_ROWS
+    );
     if (ls && ev.evictedUp) ls.noteEvicted(-1);
     if (ls && ev.evictedDown) ls.noteEvicted(1);
     // Contiguity guard: the window must never span pages we skipped over (far
@@ -2207,8 +2419,8 @@ TermView.prototype = {
   buildListWindowLines: function() {
     var ls = this.bbscore && this.bbscore.listSession;
     if (!ls || !this._listHeaderRows || !this._listFooterRow) return null;
-    var win = ls.getWindowView();
-    if (!win) return null;
+    var view = ls.getListView();
+    if (!view) return null;
     var listLines = this.buf.listLines || [];
     var out = [
       this._listHeaderRows[0],
@@ -2224,65 +2436,57 @@ TermView.prototype = {
     // stale).
     var lastReadTitle = ls._lastReadTitle;
     this._listCursorRow = -1;
-    for (var i = 0; i < win.body.length; ++i) {
-      var abs = win.body[i];
-      var srcRow = abs == null ? null : listLines[abs];
+    // body ＝**整段序列**（上限 MAX_LIST_ROWS≈300 列），捲動交給瀏覽器。
+    var seq = view.seq;
+    for (var i = 0; i < seq.length; ++i) {
+      var abs = seq[i];
+      var srcRow = listLines[abs];
+      if (!srcRow) {
+        out.push(this._blankListRow());
+        continue;
+      }
       var isLastRead = false;
-      if (srcRow && lastReadTitle != null) {
+      if (lastReadTitle != null) {
         if (srcRow._subject === undefined) srcRow._subject = subjectOfListRow(srcRow);
         isLastRead = srcRow._subject === lastReadTitle;
       }
-      if (!srcRow) {
-        out.push(this._blankListRow());
-      } else if (abs === win.cursorAbs) {
+      if (abs === view.cursorAbs) {
         var cur = cloneRow(srcRow);
         labelListCursor(cur);
         if (isLastRead) paintLastReadListRow(cur);
         // 虛擬游標的**渲染列號**（header 固定 3 列）→ 游標底色的上色目標。
         // frozen 不重算，沿用這份快照的值，與 _listWindowLines 同生命週期。
+        // 全序列渲染後這個值可以 ≥ 23，也可能指向一列**目前捲在視野外**的節點
+        // ——那正是網頁式游標語意要的（底色跟著它捲出去）。
         this._listCursorRow = LIST_HEADER_ROWS + i;
         out.push(cur);
       } else if (isLastRead) {
-        var lr = cloneRow(srcRow);
-        paintLastReadListRow(lr);
-        out.push(lr);
+        // 上色後的 clone 依附在來源列物件上快取：map 是整列替換（mergeListPage
+        // 的 numMap.set），所以 row 物件一換 memo 自動失效。沒有它，同主題的每
+        // 一列都會在每一幀重建節點（300 列 × 30ms 一幀）。
+        if (!srcRow._lastReadPainted) {
+          var lr = cloneRow(srcRow);
+          paintLastReadListRow(lr);
+          srcRow._lastReadPainted = lr;
+        }
+        out.push(srcRow._lastReadPainted);
       } else {
         out.push(srcRow);
       }
     }
+    // 短板／剛 seed：補 blank 列到 bodyRows，維持 24 列的畫面外觀（補列不產生
+    // 額外的可捲距離——內容高恰好等於視口高）。
+    var bodyRows = this.buf.rows - 4;
+    while (out.length - LIST_HEADER_ROWS < bodyRows) out.push(this._blankListRow());
     out.push(this._listFooterRow);
-    // 平滑捲動的 overscan 列：視口捲掉頂端 frac px 之後，底部會空出同樣高度 ⇒
-    // 多畫下一列補滿。**放在 footer 後面**（渲染 index 24）是刻意的：footer 的
-    // data-row 必須維持 23（外部契約，見 render_dom_equivalence 的 golden）。
-    // render 端（src/render/screen.js#_patchRows）會把它排進 body 視口裡。
-    if (win.overscanAbs != null) {
-      var ovRow = listLines[win.overscanAbs];
-      if (!ovRow) {
-        out.push(this._blankListRow());
-      } else if (lastReadTitle != null && ovRow._subject === lastReadTitle) {
-        var ovLr = cloneRow(ovRow);
-        paintLastReadListRow(ovLr);
-        out.push(ovLr);
-      } else {
-        out.push(ovRow);
-      }
-    }
     this._listWindowLines = out;
     return out;
   },
 
   // One shared blank TermChar row (default attrs) for short-page filler.
   _blankListRow: function() {
-    if (this._listBlankRow) return this._listBlankRow;
-    var src = this._listHeaderRows[0];
-    var row = cloneRow(src);
-    for (var i = 0; i < row.length; ++i) {
-      row[i].ch = ' ';
-      row[i].isLeadByte = false;
-      row[i].resetAttr();
-    }
-    this._listBlankRow = row;
-    return row;
+    if (!this._listBlankRow) this._listBlankRow = blankRowLike(this._listHeaderRows[0]);
+    return this._listBlankRow;
   },
 
   // Clear the list-accumulation maps (fresh board entry / board switch rebuild).
@@ -2293,6 +2497,110 @@ TermView.prototype = {
     this._listFooterRow = null;
     this._listWindowLines = null;
     this._listBlankRow = null;
+  },
+
+  // ---- 看板列表（BoardListSession）的累積與視窗 -------------------------------
+  // 與上面那組（文章列表）平行、**緩衝完全獨立**：兩者的 cleanup 會互相清空對方
+  // 的 map，共用一份就會在「進板 → ← 回看板列表」時互踩（handoff §6.4）。
+  // 渲染輸出（_listWindowLines / _listCursorRow）則刻意共用 —— 那是「這一幀畫了
+  // 什麼」的事實，clientToPos／applyCursorHighlight／複製選取都靠它，一次只有一個
+  // 擁有者在畫，共用才不會有兩套座標。
+
+  // 把當前畫面上的看板列表頁累積進 buf.brdListLines（升冪＝原生的上到下）。
+  // 看板編號是 1-based 絕對位置且分頁對齊（board.c:1710-1716）⇒ 跨頁零重疊，
+  // 不需要文章列表那套 findPageOverlap／置底 map／last-read 還原。
+  accumulateBoardListLines: function() {
+    var buf = this.buf;
+    if (!this._brdNumMap) this._brdNumMap = new Map();
+    var rowTexts = [];
+    for (var r = 0; r < buf.rows; ++r) rowTexts.push(buf.getRowText(r, 0, buf.cols));
+    var nums = boardListRowNums(rowTexts, buf.rows);
+    var bs = listOwnerOf(this.bbscore);
+    for (var i = BRD_HEADER_ROWS; i <= buf.rows - 2; ++i) {
+      if (nums[i] == null) continue;
+      var row = cloneRow(buf.lines[i]);
+      // 把 `%7d` 序號欄由解析出的編號重寫一次：server 的游標 `>` 蓋著 cell 0，
+      // 存進 map 的列必須長得跟乾淨的原生列一模一樣（游標由 render 端自己畫）。
+      relabelListCursorRow(row, nums[i]);
+      // 整列覆蓋：重繪過的頁帶著最新的未讀 `ˇ` / 標記 `D`，要取代舊快照。
+      this._brdNumMap.set(nums[i], row);
+    }
+    // 列數上限 + 連續段守門，與文章列表同一組純函式（key 換成看板編號）。
+    // 樞紐是**視口**不是選取（游標可以被捲出視野很遠，見 evictListBuffer 的註解）。
+    var ev = evictListBuffer(this._brdNumMap, bs ? bs.evictPivot() : null, MAX_LIST_ROWS);
+    if (bs && ev.evictedUp) bs.noteEvicted(-1);
+    if (bs && ev.evictedDown) bs.noteEvicted(1);
+    var pr = pruneListToSegment(this._brdNumMap, bs ? bs.prunePivot() : null);
+    if (bs && pr.prunedUp) bs.noteEvicted(-1);
+    if (bs && pr.prunedDown) bs.noteEvicted(1);
+    var flat = flattenListBuffer(this._brdNumMap, EMPTY_PINNED_MAP);
+    buf.brdListLines = flat.lines;
+    buf.brdListLineNums = flat.nums;
+    // 只在「長得像乾淨看板列表」的活幀更新 header/footer 快取：跳號回應會先把
+    // 底列清成 prompt，污染快取就會讓視窗畫出半條 footer。
+    if (
+      (rowTexts[0] || '').indexOf('【看板列表】') === 0 &&
+      (rowTexts[2] || '').indexOf('編號') >= 0
+    ) {
+      this._brdHeaderRows = [
+        cloneRow(buf.lines[0]),
+        cloneRow(buf.lines[1]),
+        cloneRow(buf.lines[2])
+      ];
+    }
+    if ((rowTexts[buf.rows - 1] || '').indexOf('選擇看板') >= 0)
+      this._brdFooterRow = cloneRow(buf.lines[buf.rows - 1]);
+  },
+
+  // 組出這一幀的畫面：快取的 header 3 列 ＋ **整段序列**（捲動交給瀏覽器的
+  // `.listBodyView` 視口）＋ 快取的 footer。游標那一列是 clone 後畫上半形 `>`
+  // （labelListCursor，與 pttbbs STR_CURSOR 同形）。header/footer 快取或緩衝還沒
+  // 建立時回 null，呼叫端會退回原生鏡像。
+  buildBoardListWindowLines: function() {
+    var bs = listOwnerOf(this.bbscore);
+    if (!bs || !this._brdHeaderRows || !this._brdFooterRow) return null;
+    var view = bs.getListView();
+    if (!view) return null;
+    var lines = this.buf.brdListLines || [];
+    var out = [
+      this._brdHeaderRows[0],
+      this._brdHeaderRows[1],
+      this._brdHeaderRows[2]
+    ];
+    this._listCursorRow = -1;
+    for (var i = 0; i < view.seq.length; ++i) {
+      var src = lines[view.seq[i]];
+      if (!src) {
+        out.push(this._blankBoardListRow());
+        continue;
+      }
+      if (i === view.cursorPos) {
+        var cur = cloneRow(src);
+        labelListCursor(cur);
+        this._listCursorRow = BRD_HEADER_ROWS + i;
+        out.push(cur);
+      } else out.push(src);
+    }
+    // 短清單：補 blank 列到 bodyRows，維持 24 列外觀（補列不產生額外可捲距離）。
+    var bodyRows = this.buf.rows - 4;
+    while (out.length - BRD_HEADER_ROWS < bodyRows) out.push(this._blankBoardListRow());
+    out.push(this._brdFooterRow);
+    this._listWindowLines = out;
+    return out;
+  },
+
+  _blankBoardListRow: function() {
+    if (!this._brdBlankRow) this._brdBlankRow = blankRowLike(this._brdHeaderRows[0]);
+    return this._brdBlankRow;
+  },
+
+  // 進入／離開看板列表、或整份重建時清掉累積（BoardListSession._resetBuffer）。
+  resetBoardListAccumulation: function() {
+    this._brdNumMap = null;
+    this._brdHeaderRows = null;
+    this._brdFooterRow = null;
+    this._brdBlankRow = null;
+    this._listWindowLines = null;
   },
 
   // Like hideEasyReadingOverlays but does NOT clear buf.pageLines. Used by the

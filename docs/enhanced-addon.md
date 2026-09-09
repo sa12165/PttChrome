@@ -157,6 +157,26 @@
   `mergeSameAuthorComments:false` 鎖舊行為。**pusher 解析勿用 textContent 正則**（樓號徽章數字會混進
   文字），一律讀 `data-pusher`。
 
+### 推文區塊行距（`commentBlockSpacing`，預設開）
+
+- 做什麼：文章好讀累積長頁裡，推文塊之間拉開 `margin-top: 0.55em`；同作者合併塊**內部**改用
+  `line-height: 1.3`（＝每則多 0.3em）⇒ 內緊外鬆，同一人的連續推文自成一組。
+- 純 CSS：`src/css/main.css` 的 `#mainContainer.commentSpacing` 兩條規則 ＋
+  `render/screen.js#_setCommentSpacing`（同 `_setLightsOn`／`_setImagesEnlarged` 的形狀，
+  容器 class 決定樣式、**不重建任何一列**）。刻意**不進** `annotationsKey`。
+- **掛 class 的判準是 `enhance.stableRows`，不是 `easyReading && pageState===3`**：functionMode
+  原生鏡像與「防黑守門」兩條 fallback 也帶 `easyReading:true`／`pageState:3`，畫的卻是活的 24 列
+  buffer；那裡多出任何高度就打破「原生鏡像期間畫面必須不可捲」的不變量 ⇒ 復發「推文時游標戳出
+  反白輸入匡」（`docs/easy-reading.md`）。
+- **禁止**在這組規則用 `letter-spacing`／`padding`／`font-weight`（等寬格線位移 ⇒ `.wpadding` 寬度
+  契約、`colFromClientX` 的推文列點擊欄位判定、`.floorBadge` 零寬盒全壞）、`margin-bottom`
+  （會推離 `#easyReadingLastRow`）、以及改 `.main` 的 `line-height`（那是 `setTermFontSize` 的
+  inline style）。
+- 測試：`tests/unit/comment_spacing_css.test.js`（CSS 契約＋上述禁令）、
+  `tests/unit/comment_spacing_class.test.js`（容器 class 的六種情形，含 **stableRows 缺席 ⇒ 不掛**
+  的回歸鎖）、`comment_merge.offline.spec.js`「推文區塊行距」（真幾何：
+  `outerGap > innerGap > 0`，關掉即兩者收斂回 0）。
+
 ## 自動修復斷掉的 URL（`src/js/url_fix.js`）
 作者把 URL 弄壞（插空白／漏 scheme／副檔名被空白斷開）→ 既有 `TermBuf.uriRegEx`（要求 scheme、不容空白）
 **完全偵測不到** → 不可點、不自動開圖。本功能**不改寫原文**，偵測後在原文那一列**下方加一行**修復版可點連結；
@@ -183,8 +203,8 @@
     `screen_annotations#computeAnnotations` 一律套 `applyAiFix` → **AI 關 ⇒ gray 全部不修**，AI 判 `true` 才放行。
     守護 `url_fix.test.js`「句號誤判標成 gray」＋`tests/unit/url_fix_ai_render.test.js`＋
     `tests/e2e/offline/url-fix-gray.offline.spec.js`。
-  - 取捨：保守設計，漏冷門 TLD 換取近零誤判。**文章內文的跨列斷開 URL 仍 out of scope**
-    （逐列偵測；內文沒有「輸入欄寫滿」這種訊號）；**推文**的跨列斷開由下節的 `url_wrap.js` 承接。
+  - 取捨：保守設計，漏冷門 TLD 換取近零誤判。跨列斷開的 URL 由另外兩個模組承接：**推文**走
+    `url_wrap.js`（下節），**內文**走 `body_wrap.js`（下下節）。
     2026-08 起再加一項：無 scheme 無 path 的斷開裸網域（`www . a .com`）未開 AI 時不修。
 - 渲染：`screen_annotations#computeAnnotations` **逐列**（含內文非推文列，獨立於 `annotateComment`）算 `fixedUrls` 掛進 ann →
   `buildRow` 參數 → `link_segment.build()` 在 inline-preview 區塊後產生 `.fixedUrlLine`
@@ -226,6 +246,59 @@
 - 守護測試：`tests/unit/url_wrap.test.js`（三訊號逐條＋78 欄整合＋IP 板 `fieldEnd`）、
   `tests/unit/comment_merge.test.js`（`fieldEnd`／`breaks`）、
   `tests/unit/merge_comment_render.test.js`「跨行連結接合」。
+
+## 內文跨行連結（`src/js/body_wrap.js`）
+同一個坑換到**文章內文**（使用者 2026-08-30 回報，素材 `tests/e2e/cassettes/pttbug-body-urlwrap.json`）：
+```
+08/30/2026 06:06:19 ※ 文章網址: https://www.ptt.cc/bbs/PttBug/M.1788041180.A.
+404.html
+```
+逐列偵測兩層都只看得到殘段 ⇒ `articleTargetFromAnchor` → `parseArticleUrl` 回 `null` ⇒ 右鍵的
+**「複製文章代碼」「複製文章 deep link」整組消失**，「複製連結網址」也只複製到壞網址，
+`isImageLikeUrl` 判不出圖 ⇒ hover／行內預覽一併失效。
+
+**與 `url_fix` / `url_wrap` 的呈現方式相反**：內文這裡**不補 `↳` 修復行**，而是讓連結本身跨行
+成立 —— 兩列的殘段各自包成一個 `<a class="y">`，`href` 都是接好的完整網址。用一般連結的
+`class="y"` 是刻意的：底線樣式、hover 預覽、`pttchrome.isAnchorTarget`、右鍵的 `contextOnUrl`
+全部原樣沿用，消費端一行都不用改。
+
+**三個訊號缺一不可 ＋ 一道反向守門**（與 `url_wrap` 對稱，只有「左邊寫滿」的來源不同）：
+1. **左列寫滿**：URL 字元一路到 `maxcol` 為止，且 `maxcol+1` 不是 URL 字元。`maxcol` 由 pmore
+   算式推導（`pmoreMaxCol()`，`pmore.c:1447-1456`，80 欄 ⇒ **77**），**不寫死**。折行符號 `\`
+   落在 `maxcol+1`，因為反斜線不在 `URL_CHAR_RE` 內 ⇒ 這個條件自然成立。
+2. **右列續上**：下一列的 col 0 就是 URL 字元（中間有空白就不是續行）。
+3. **併起來是合法 URL**：共用 `url_join.validateJoined`（TLD 允許清單＋host 後只能空或 `/` 路徑；
+   無 scheme 又無 path 直接排除）⇒ `gray` 恆為 false，永遠不進 AI 閘門。
+- **反向守門**：左片段自己就以媒體副檔名收尾 ⇒ 剛好寫滿的完整網址，不接。
+- **列型守門**：兩列都不得是推文列／被黑名單隱藏的列（推文的跨行由 `url_wrap` 負責）。
+- 為什麼「寫滿 maxcol」單看很弱、合起來卻夠：pmore 是**逐字元**硬折行（不斷詞，`pmore.c:1836-1900`）
+  ⇒「URL 字元跑到 maxcol、下一列 col 0 接著仍是 URL 字元」在折行情形下**必然**是同一個 token 被切開。
+- 超長網址跨 3 列以上會繼續延伸（中間列必須整列 col 0..maxcol 都是 URL 字元）。
+
+**為什麼在標註層而不是 `term_buf`**：`updateCharAttr` 的 `line.uris` / `fullurl` 是逐列語意（且已有
+既知的座標脫勾問題，見該檔 KNOWN 註解），而且它跑在活的 24 列 buffer 上；好讀模式的左列可能來自
+更早、已經快照進 `buf.pageLines` 的那一頁。跨列資訊只有 `computeAnnotations` 手上齊全。
+
+**接線細節（改之前先讀）**：
+- pass 放在逐列迴圈之後、caption／run 兩個裝飾 pass **之前**，**只寫 `result[row]`、絕不碰
+  `base[row]`**（同 `applyFunctionKeys` 的規則：`base` 的參考身分是 `captionCache`/`runCache` 的鍵）。
+- **刻意每幀全掃、不吃增量**：斷點可能剛好落在 append 邊界（左列在上一幀就算完、`from` 之後不會
+  再跑到它），只掃新列必漏接。第一個條件是單一格子的 `isUrlCell`，幾乎所有列瞬間出局。
+- **重疊排除**（`applyWrapUrlRange`）：落在範圍內的 `mentions`/`aids`/`giveaways`/`bareDomains`
+  一律丟掉。左列殘段本來就被 `uriRegEx` 標了所以其他偵測器自己會避開，**右列的殘段沒有**
+  （`404.html` 對 `uriRegEx` 完全不成立）⇒ 這條必須自己補，不然同一段文字會被包成兩個 `<a>`。
+- 渲染端 `link_segment.js` 的 `_wrapUrl` 是範圍型候選（開/關邊界機制同 `_bareDomain`），兩條額外規則：
+  **範圍內抑制 `isStartOfURL`/`isEndOfURL` 的切段**（不抑制的話左列殘段會被 term_buf 的舊邊界切開、
+  拿回那個壞 `fullurl`）、**行內預覽 slot 只掛在 `preview:true` 的最後一段**（一條網址只開一張圖）。
+- 沿用 pref `enableAutoFixUrl`（不加新 pref）。合併推文塊那條 render 分支**不傳** `wrapUrls`。
+- 限制：**非好讀模式**下若斷點跨頁（左列是該頁最後一列），兩列不同時在 buffer 裡 ⇒ 不接；
+  好讀累積成 `buf.pageLines`，相鄰列一定拿得到 ⇒ 正常運作。
+- 共用原語（`URL_CHAR_RE` / `isUrlCell` / `validateJoined`）抽在 `src/js/url_join.js`，與 `url_wrap.js` 共用。
+- 守護測試：`tests/unit/body_wrap.test.js`（三訊號逐條＋折行符號＋3 列鏈＋`pmoreMaxCol` 算式）、
+  `tests/unit/screen_body_wrap_render.test.js`（兩列同一個 href／只有一個 slot／不是 ↳ 那條路）、
+  `tests/e2e/offline/body_url_wrap.offline.spec.js`（右鍵選單的兩個文章選項回來了）。
+- **那卷素材的版面是 PTT 端的資料 bug，不是新 spec**：`bbs.c:1523-1532` 的格式字串是
+  `"※ 文章網址: %s\n"`，前面沒有時間戳，也不該在 col 78 斷開。不可據此對「※ 文章網址」這行特判。
 
 ## 跨行 AID 接合（`src/js/aid_wrap.js` ＋ `aid_parse.parseBoardSuffix`）
 同一個坑、被切斷的東西換成文章代碼。**兩種切法走不同的程式路徑，別混為一談**：
@@ -323,11 +396,79 @@ host 兩邊問的是不同問題）。session key 也分開（`prompt_api.js` �
 - **驗證為何 OFF（CONFIRMED 2026-06 實測，外部事實）**：純前端無可行探測法——unavatar 免費版每日僅 25 次（`X-Rate-Limit-Limit:25`）且 `<img>` `onerror` 無法區分 404 與 429 → 限流期會把存在帳號誤標 invalid；直連 x.com 存在/不存在 HTTP **都回 200**（SPA）；官方 API 需付費 bearer 且無瀏覽器 CORS；syndication 端點 ACAO 鎖 `platform.twitter.com`。
   - **唯一可行路＝自建 worker**：server-side 用**一般瀏覽器 UA** `fetch('https://x.com/<handle>')`，存在帳號 HTML `<title>Name (@handle) / X`、不存在 title 空（facebookexternalhit/Twitterbot UA 一律回 404，**勿用**）。worker 回小 JSON＋Cloudflare KV 快取；前端只快取明確「不存在」、429/錯誤不快取。風險：X 對 Cloudflare 出口 IP 可能另眼相待，部署後需實測。
 
+## 開燈：隱藏文字（`src/js/hidden_text.js` ＋ `src/js/pmore_pref.js`）
+
+PTT 慣例把「雷」用低亮度黑字寫在黑底上（`ESC[30m`），讀者按 `\` 切 pmore 的色彩顯示模式
+「開燈」。本專案把它做成浮動按鈕 —— 但**只有一半救得回來**（server 端事實見
+`docs/pttbbs-screen-protocol.md` §14.2 `PFTERM_DISABLE_HIDDEN_MESSAGE`）：
+
+| 軌 | 條件 | 意義 | 處理 |
+|---|---|---|---|
+| **A** | `fg === bg` 且該格**有字** | DBCS（中文）與帶 BLINK 的半形沒被 server 擦掉 | **純 CSS 提亮**（容器 class `.lightsOn`），可標示 |
+| **B** | `fg === bg` 且該格是空白，且滿足 run 門檻 | server 已擦成空白，**內容根本沒到瀏覽器** | 只能替使用者切 rawmode 讓 server 重送 |
+
+- **判準只有一條 `fg === bg`**（經 `TermChar.getColor()`，已把 bright/invert 攤平），一條式涵蓋
+  `ESC[30m`／`ESC[30;40m`／`ESC[34;44m`／`ESC[37;47m`／`ESC[7;30;40m`。
+  **刻意不涵蓋 `ESC[1;30m`**（fg=8 深灰）—— 那是 pmore 進設定頁時 grayout 整片上半畫面用的，
+  判準寫成 `fg===0` 會在每次按 `\` 時整頁誤判。**不要加「顏色相近」的模糊判定。**
+- **軌 B 的 run 門檻依背景色分兩組**（單一數字不是漏抓就是誤報，`ERASED_RUN_MIN_*`）：
+  `bg === 0`（黑底＝PTT 文章常態）**≥ 2 格**；`bg !== 0`（彩底）**≥ 8 格**。
+  - 黑底取 2 的根據：`fg=0/bg=0` 的空白**只可能**來自 server 明確送過 `ESC[30m`；`ESC[K` 擦出來的格
+    走 `copyFromNewChar()` → `resetAttr()` ⇒ fg=7/bg=0，**不繼承當前 SGR**，不會製造假訊號。
+  - 彩底取 8 的根據：文章狀態列開頭有 **2 格 fg=7/bg=7**（`ESC[0;47m` 之後），門檻 8 正好擋掉它。
+    **這也是「掃描不必特別排除狀態列」的原因** —— 排除最後一列會破壞好讀累積長頁的逐列獨立性。
+  - **不要為了「簡單」把黑底也設成 8**：實測真樣本一個是 9 格（`abc test2`）、一個是 60 格（隱藏網址），
+    但短的隱藏字串很常見。
+- **偵測掛在 `computeAnnotations` 的 `PAGE_READING` 分支**，與 `imageCaptionBlockCount` 同一條路，
+  只掃 `[from, n)` 並純累加成 `result.hasLitHidden` / `hasErasedHidden`（計數存進回傳的 cache）。
+  **不需要**像 `hasSteamgifts` 那樣「首次翻 true 就全量重算」：那個是逐列偵測的**輸入**，這兩個只是輸出。
+- **軌 A 的提亮是純 CSS，零渲染改動**：`.lightsOn .q0.b0 … .q7.b7 { color:#ffd43b; text-shadow:… }`
+  （`color.css` 檔尾，specificity (0,3,0) 蓋得過 `.work-mode-active .q0` 與 `.cursorBrighten .q0` 的 (0,2,0)）。
+  - **只准用不影響 layout 的屬性**（`color`／`text-shadow`）：`font-weight`／`letter-spacing`／`padding`
+    一律禁止，等寬格線一位移 `.wpadding` 的寬度契約（`term_view.fixedResize`）跟著壞。
+  - **用 `text-shadow` 不用 `background-color`**：隱藏文字那列的尾隨空白多半在同一個 `ESC[30m` 區段裡，
+    背景色會把一大片空白一起塗亮；text-shadow 對沒有字形的空白格完全不顯示。
+  - **提亮色不可用 `#808080`**（與 `1;30` 深灰撞色）。
+  - class 掛在 `#mainContainer`（`ScreenController._setLightsOn`），沿用 `_setImagesEnlarged` 的形狀 ⇒
+    toggle 是 O(1)、不重建任何一列、不碰 golden 快照、不失效兩層快取。**刻意不在
+    `word_segment.build()` 依 `fg===bg` 加 class**：那會改動核心渲染鏈的 DOM 輸出 ⇒ 整份 golden 要重跑。
+  - 旁證：「上班模式」開啟時隱藏中文本來就隱約可見（`.work-mode-active .q0{color:#111827}` 而 `.b0`
+    沒被覆寫 ⇒ 深藍灰 on 黑），隱藏英數字仍完全看不見 —— 正是上表的必然結果。
+- **軌 B 的送鍵序列（`App.onLightsRawMode`）**：`\` → 等**畫面內容**確認設定頁（`rawModePrefRowVisible`
+  ＝出現「色彩顯示方式」列）→ 才送 `3`（`pmore.c` 的 `case '3'` 直選並立即 return，**不需要 Enter**）。
+  - **兩個 byte 絕不可以一次送**（typeahead 會吞掉中間那一幀）；**第一步沒成功就絕不送數字鍵**
+    （`3` 落回文章按鍵是 pmore 的「跳至第 N 頁」，會把使用者彈到別的地方）。
+  - 第一步走 `CommandQueue`（`kind: 'lights-pref'`）；**第二步刻意不再排一條 queue 命令** ——
+    EasyReading 的 `screenSettled` listener 註冊在 listSession（＝驅動 `queue.onSettle` 的那個）**之前**，
+    所以「文章回來」那一幀 `_evalFunctionModeExit` 比 `queue.onDone` 先跑；此時若還有命令在飛，
+    `easy_reading._send` 的 `_wireBusy` 閘門會把 `reenterFromTop` 的 Home 直接丟掉 ⇒ 整篇重讀失效。
+  - 送鍵前先 `easyReading._enterFunctionMode()`（好讀關著時是 no-op），否則設定頁畫在原生 24 列上、
+    好讀長頁原封不動 ⇒ 使用者看不到它。
+  - 之後由 `easy_reading` 的「離開 pmore 設定頁 ⇒ 整篇重讀」接手（`docs/easy-reading.md`）。
+- **按鈕出現條件**（`ScreenController._syncOverlays`，bottom:160）：`pageState === PAGE_READING` 且
+  （`hasLitHidden || hasErasedHidden || 燈已經亮著`）。第三項不可省：軌 B 切成純文字之後畫面上再也
+  偵測不到隱藏文字，少了它按鈕會消失、使用者關不掉燈。**原生模式（好讀關閉）也要出現** —— 隱藏文字
+  在原生一樣看不見。
+- **狀態的兩半**：`_lightsOn`（軌 A 的 CSS 開關，per-article，`articleId` 變即重置）與
+  `enhance.rawMode`（軌 B，來自 `easyReading._rawMode`）。**軌 B 不隨換文章還原**：`bpref` 是
+  pmore 的 process 層全域、跨文章持續到登出（§14.1 Q10），所以下一篇文章的按鈕直接顯示成「關燈」。
+  刻意不在離開文章時自動還原 —— 那必須在**離開之前**送 `\`（列表畫面的 `\` 是別的鍵），會拖慢每一次離開文章。
+- **`_rawMode` 的已知落差**：使用者自己按 `1`/`2`/`3` **直選**時 pmore 直接 return、不重畫選項列 ⇒
+  `parseRawModeFromPrefRow` 讀到的仍是按鍵前的值，按鈕標籤會落後一步（只影響標籤：再點一次
+  只是重送一遍同樣的模式，無其他後果）。`\` 循環那條路會逐次重畫選項列，跟得上。
+- **刻意不做**：(a) 不加 pref 開關（比照黑名單右鍵快速新增，靠「偵測到才出現按鈕」自我 gating）；
+  (b) 軌 B 用「純文字」(2) 而不是「原始ANSI控制碼」(1)——後者把每個控制碼印成可見字元，畫面完全不能讀；
+  (c) 軌 B 切換後**不標示**「哪些字是被開燈的」——兩種模式的行號／斷行都可能不同，沒有可靠的對位資訊。
+- 守護：`tests/unit/hidden_text.test.js`（每條對應一個實測樣本）、`lights_on_css.test.js`、
+  `lights_on_render.test.js`、`lights_on_raw_mode.test.js`、`pmore_pref_screen.test.js`、
+  `easy_reading_pmore_pref.test.js`、`tests/e2e/offline/lights_on.offline.spec.js`。
+
 ## 設定（`PrefModal.jsx`）
 pref keys（`DEFAULT_PREFS`，存 localStorage `pttchrome.pref.v1`）。套用見 `pttchrome.onPrefChange`
 （`showFloorNumbers`/`blacklist`→`view.*`+`redraw(true)`）。i18n 鍵在 zh_TW/en_US `options_*`。
 
 **「增強功能」分頁**：`showFloorNumbers`(true)、`mergeSameAuthorComments`(true)、
+`commentBlockSpacing`(true)、
 `highlightAuthorComments`(true)、`enableAutoFixUrl`(true)、`enableXMentionLink`(true)、
 `enableBareDomainLink`(true)、`blacklist`/`titleBlacklist`("" 換行)。
 
@@ -525,6 +666,10 @@ axios/tippy/GM_config/國旗 IP 查詢(外部 osk2.me:9977 已失效)、滑鼠�
 - **送鍵（或任何副作用）不可寫在 `console.log` 的字串運算式裡**。`easy_reading._onViewUpdated` 曾寫成 `console.log("send:" + keys + " -> " + this._maybeSendPageDown(keys, false))` —— 哪天把 log 包進 `if (TRACE)` 就會連好讀唯一的翻頁動力一起關掉。每幀日誌現由 `util.js` 的 `TRACE`（= `process.env.DEVELOPER_MODE`）在**呼叫端**包住，dev/e2e 照印、prod 由 bundler 整段消除。
 - **逐列加工走單一純函式 `comment_parse.annotateComment`**，勿為某路徑另寫一份（好讀/原生曾各複製一份而發散出 bug）。逐列狀態用每圈新物件 `const ann={}`，**勿用函式作用域 `var`**（JS `var` 不每圈重設 → 非推文列繼承前列 floor/authorId 範圍，畫出整條色塊或樓號溢出到空白/※編輯/內文）。守護 `comment_parse.test.js`。
 - **`parseListAuthor` 欄位需實機校準**（cols 17–28 @ C_Chat）；PTT 改版位移會先讓守護測試 `enhance.spec.js` 紅。
+- **列表黑名單標註不可只信 `pageState`／`inListContext` —— 每一列都要先過 `comment_parse#isListShapedRow`**（2026-09-05 使用者回報「發文介面出現黑名單髒資料」，錄製檔 `ptt-debug-20260905-122522`）。兩層守門**同時都是黏的**：`term_buf.setPageState` 沒有 reset 分支（那是刻意的，見 `docs/pttbbs-screen-protocol.md` §5.1），從列表叫出來的整頁畫面（Ctrl-P 發文、板規、精華區…）會**沿用**列表的 `pageState = 2`；`term_view._inBoardListContext` 又只在 pageState 1/3 才清掉。而逐列解析本身零設防：`parseListTitleRaw` 對任何長度 > 29 的列都回傳 col≥29 的整段文字。
+  現場：發文分類列「種類：1.閒聊 2.問題 … 7.Vtub 8.自介 (1-8或不選)」的 col≥29 是「26夏 5.心得 6.情報 7.Vtub 8.自介 …」⇒ 使用者標題黑名單裡的 `vtub` 命中 ⇒ 整列被 `blacklistNoticeText` 換成「（本文已被黑名單） vtub」，把使用者正在看的分類提示蓋掉。**命中與否純看欄位對齊**（同畫面的 `[Vtub]` 板規列剛好落在 col 21 而逃過），所以症狀是「多黑名單命中的版塊最容易發生」的隨機髒資料。
+  **判準要嚴：先要求合法 userid 作者欄，再要求編號或 ★**。單用編號會漏接——`parseListArticleNumLoose` 是 `^(\d+)\b`，板規的「1. 不得…」會回 1 而放行。同一道閘門也修掉**真實列表畫面**上的同型誤命中（表頭「編號 日期 作者 標題」與 footer「文章選讀 (y)回應(X)推文(^X)轉錄」以前會被關鍵字如「轉錄」吃掉，golden 快照裡它們身上那組假的 `data-list-title` 就是證據）。`list_session#visibleListIndices` 必須同步同一道閘門（不變量 10）。守護：`comment_parse.test.js` 的 `isListShapedRow`、`screen_dropHidden.test.js` 兩個新 describe、golden `list_native_fnkeys` / `list_easy_reading_scrolled`。
+  第二層（防禦性）：`term_view._renderScreenLines` 在畫面 row2 找不到「編號」表頭時清掉 `_inBoardListContext`。**刻意不用 footer 當判準**——`v 設定已讀未讀` 那類 overlay 只重畫最後一列，表頭仍在，黏性語意才守得住。
 - **要算「逐列欄位位置（col）」一律走 `TermChar[]`，勿掃 `rowToText` 後字串**。Big5 DBCS **trail byte 可能=0x40(`@`)**（其他 ASCII 標點同理）→ 掃字串會在中文內誤命中、且 string index ≠ TermChar col（DBCS 佔 2 cols）。逐列遇 `isLeadByte` 跳 2 格、只在單 byte ASCII 比對（同 `rowToText` 走訪）。實例：`mention_parse.detectMentions`（X @帳號），守護有「trail byte 0x40 不誤判」case。
 - **額外連結偵測器（`bare_domain`／`aid_parse`／`mention_parse`）一律要排除「已被 `uriRegEx` 標成 URL」的格子**，統一走 `src/js/term_url_flag.js` 的 `isTermUrlCell`／`rangeInTermUrl`（假 cell 沒有 `isPartOfURL` → 回 false，不影響純邏輯測試）。它們是在**同一批 cell** 上再掃一次找主偵測器看不見的形狀，一旦在 URL 內命中，`LinkSegmentBuilder` 就會在那個 col 切開 segment ⇒ 一條網址被拆成好幾個 `<a>`、中段換成別的 href。實例（使用者 2026-08 回報）：`https://…/PttChrome/#Browsers/1gU3wwNZ` 的 `#Browsers` 恰是合法 AIDc 形狀（`#` 前非 AID 字元、8 個 AID 字元、第 9 格非 AID 字元）→ 底線只畫到 `#Browsers`、尾段 `/1gU3wwNZ` 不是連結、滑鼠停在中段狀態列顯示 `…/PttChrome/#`（那是 `.aidLink` 的 `href="#"`）。同型還有 `https://x.com/@jack` 的 `@handle`。守護：`aid_parse.test.js`／`mention_parse.test.js` 的「已被 uriRegEx 標記的 URL 內不產生候選」＋ `tests/e2e/offline/url-fragment-aid.offline.spec.js`（真 uriRegEx 設旗標，unit 只能餵假旗標）。
 - **`LinkSegmentBuilder.readChar` 對 `'\n'` 提前 return，範圍型連結的關閉邊界必須在那裡一併清掉**。範圍型（`_mention`/`_aid`/`_giveaway`/`_bareDomain`）靠 `i === endCol` 關閉，而合併推文塊的 `'\n'` 分支走在那些檢查之前 ⇒ `endCol` 落在換行 cell 上時**永遠關不掉**，狀態外溢到後續每一行（整塊被畫底線、href 全是上一行那個連結；使用者 2026-08 回報 `duk.tw`）。`comment_merge` 會剝掉每則的行尾空白，所以「範圍結束＝換行前一格」是**常態不是邊角**。清空要在 `saveSegment()` **之後**（那一段仍須用當下狀態包成 `<a>`）；候選字元類都不含 `'\n'`，故無條件清空安全。守護 `row_render.test.js`「行尾裸網域不得外溢到後續行」。
@@ -613,7 +758,8 @@ axios/tippy/GM_config/國旗 IP 查詢(外部 osk2.me:9977 已失效)、滑鼠�
 - **live e2e 的看板選擇會互相污染**：AID 返回測試要開列表好讀（大量 prefetch）並反覆進出，
   跑在 `C_Chat` 上會改掉該板的 server 游標（`getkeep`）與 `currtitle`，後面用 `C_Chat` 的
   `enhance`／`easy-reading` 測試就會開到別篇文章——症狀是**單獨跑全綠、整包跑必紅**（而且紅的位置每次不同）。
-  它也不能跑在 `Test` 板：那裡幾乎只有置底公告，`read.c:404` 的 FIXME 讓置底文的 AID 搜尋失手。
+  它也不能跑在 `Test` 板：那裡幾乎只有置底公告，一般編號文章少到選不出穩定樣本
+  （置底文的 AID 搜尋本身是通的，見 `aid_navigation#aidSearchLanded`）。
   現用 `movie`。同理，測試若改了 `enableEasyReadingList` 這種 `resetSession` 不會還原的 pref，必須自己在 finally 還原。
 - **在測試/工具裡直接餵 cassette 進 `TermBuf` 後讀 `getRowText`，必須先讓事件回圈跑一拍**（unit 用 `vi.advanceTimersByTime(300)`、瀏覽器用 `await sleep(120)`）：`isLeadByte` 只在 buf 的 update pass（notify 30ms + settle 50ms）才標記，沒跑完就讀會拿到**未轉碼的 Big5 位元組**（症狀：整片 `§@ªÌ` 亂碼，看起來像編碼表沒載）。
 - **終端機的任何祖先都不可有 `user-select: none`**（issue #22，2026-08 實測）。Firefox 判定

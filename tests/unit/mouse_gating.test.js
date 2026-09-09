@@ -10,6 +10,7 @@ const ALL_ON = {
   mouseMiddleClick: 1,
   mouseWheel: 1,
   mouseWheelSmoothScroll: true,
+  mouseBackNav: 1,
 };
 
 describe("總開關", () => {
@@ -21,6 +22,9 @@ describe("總開關", () => {
     expect(g.middleClick).toBe(0);
     expect(g.wheel).toBe(false);
     expect(g.wheelSmoothScroll).toBe(false);
+    // 返回攔截一樣歸總開關管：關掉之後不疊 history sentinel，瀏覽器的上一頁
+    // （含觸控板左滑手勢）回到原本的行為＝真的離站。
+    expect(g.backNav).toBe(0);
     // 總開關關掉時左鍵／指標／提示帶全滅 ⇒ 沒有誤觸要防，防誤觸也一併關掉
     // （推文列的 pusher 高亮因此退回整列可點）。
     expect(g.misclickGuard).toBe(false);
@@ -35,6 +39,35 @@ describe("總開關", () => {
     expect(g.middleClick).toBe(1);
     expect(g.wheel).toBe(true);
     expect(g.wheelSmoothScroll).toBe(true);
+    expect(g.backNav).toBe(1);
+  });
+});
+
+// 2026-09「點空白處關框」與「複合鍵逐鍵可點」**刻意不開新 pref**（使用者定案 D1）：
+// 前者沿用 leftClick、後者沿用 mouseFunctionKeys。多一顆 checkbox ＝ gating 表／
+// pref schema／設定頁欄位／雲端同步 schema 全部要跟著動，而使用者要關掉時關總開關
+// 就有了。這條鎖住「沒有第八個欄位」。
+describe("D1：關框與複合鍵沿用既有 pref，resolveMouseGates 不得多欄位", () => {
+  test("回傳欄位就是這八個，一個不多", () => {
+    expect(Object.keys(resolveMouseGates(ALL_ON)).sort()).toEqual([
+      "backNav",
+      "cursorIcon",
+      "leftClick",
+      "middleClick",
+      "misclickGuard",
+      "move",
+      "wheel",
+      "wheelSmoothScroll",
+    ]);
+  });
+
+  test("關框跟著 leftClick 走（App.mouse_click 的 gate 就是它）", () => {
+    expect(resolveMouseGates({ ...ALL_ON, mouseLeftClick: false }).leftClick).toBe(
+      false,
+    );
+    expect(
+      resolveMouseGates({ ...ALL_ON, useMouseBrowsing: false }).leftClick,
+    ).toBe(false);
   });
 });
 
@@ -83,6 +116,30 @@ test("缺值一律當關閉，不會意外發鍵", () => {
   expect(g.misclickGuard).toBe(false);
   expect(g.middleClick).toBe(0);
   expect(g.wheel).toBe(false);
+  expect(g.backNav).toBe(0);
+});
+
+// 返回攔截**刻意不掛在 mouseWheel 底下**：mouseWheel 的語意是「垂直滾輪＝上下
+// 頁」，綁進去會讓「我不要滾輪翻頁」的人連退出手勢一起失去。
+describe("瀏覽器返回（含觸控板左滑手勢）", () => {
+  test("滾輪關掉時照樣生效", () => {
+    const g = resolveMouseGates({ ...ALL_ON, mouseWheel: 0 });
+    expect(g.wheel).toBe(false);
+    expect(g.backNav).toBe(1);
+  });
+
+  test("設定頁存成字串時照樣可用", () => {
+    expect(resolveMouseGates({ ...ALL_ON, mouseBackNav: "1" }).backNav).toBe(1);
+    expect(resolveMouseGates({ ...ALL_ON, mouseBackNav: "0" }).backNav).toBe(0);
+  });
+
+  // 手勢與側鍵現在是同一條實作（history sentinel）⇒ 只有一個旗標，不可能單獨
+  // 開關其中一種。舊的 swipeX / backButton 兩格已刪除。
+  test("舊的兩個 gate 不復存在", () => {
+    const g = resolveMouseGates(ALL_ON);
+    expect(g.swipeX).toBeUndefined();
+    expect(g.backButton).toBeUndefined();
+  });
 });
 
 describe("滾輪平滑捲動（列表好讀模式）", () => {

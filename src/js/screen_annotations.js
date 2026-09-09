@@ -13,11 +13,13 @@ import {
   parseListTitleRaw,
   matchTitleBlacklist,
   isDeletedListRow,
+  isListShapedRow,
   blacklistNoticeText,
   FloorCounter,
 } from "./comment_parse";
 import { detectFixableUrls } from "./url_fix";
 import { detectWrappedUrls } from "./url_wrap";
+import { detectBodyWrappedUrls, applyWrapUrlRange } from "./body_wrap";
 import { detectWrappedAids } from "./aid_wrap";
 import { detectBareDomains } from "./bare_domain";
 import { detectMentions } from "./mention_parse";
@@ -32,6 +34,7 @@ import {
 } from "./comment_merge";
 import { parseFunctionKeys } from "./footer_keys";
 import { mergeRunKey } from "./screen_annotate_cache";
+import { detectHiddenRow } from "./hidden_text";
 
 // PttChrome pageState (see term_buf.js#setPageState): 2 = board list, 3 = reading.
 export const PAGE_LIST = 2;
@@ -258,6 +261,20 @@ export function computeAnnotations(
       reuse = null;
       from = 0;
     }
+    // 「開燈」偵測（軌 A／軌 B，見 js/hidden_text.js）。逐列獨立 ⇒ 純累加即可，
+    // **不必**像 hasSteamgifts 那樣「首次翻 true 就全量重算」：那個是逐列偵測的
+    // 輸入（會改變前面每一列的判定），這兩個只是輸出。
+    // 掃 chars 而不是 texts —— 判準是顏色。成本 O(新增列 × 80)，比同一個分支裡
+    // 已經在跑的兩次 groupImageCaptionBlocks（全量）便宜得多。
+    let litRows = reuse ? reuse.litRows : 0;
+    let erasedRows = reuse ? reuse.erasedRows : 0;
+    for (let row = from; row < n; ++row) {
+      const hid = detectHiddenRow(lines[row]);
+      if (hid.lit) ++litRows;
+      if (hid.erased) ++erasedRows;
+    }
+    result.hasLitHidden = litRows > 0;
+    result.hasErasedHidden = erasedRows > 0;
     // Floor numbers are shown only in easy reading, where the FloorCounter walks
     // the whole accumulated article (accurate). The native per-page counter resets
     // every page-down → inaccurate, so no floorCounter is passed there and
@@ -366,6 +383,40 @@ export function computeAnnotations(
       base[row] = r;
     }
     for (let row = 0; row < n; ++row) result[row] = base[row];
+    // 內文跨行連結（src/js/body_wrap.js）：被切成兩列的網址，兩列都渲染成同一條
+    // <a>（href 是接好的完整網址）。逐列偵測兩層都只看得到殘段 ⇒ 只有這裡（手上
+    // 有整份 lines）做得到。
+    //
+    // **只寫 result[row]，絕不碰 base[row]**——與 applyFunctionKeys 同一條規則：
+    // base 的參考身分是 captionCache / runCache 的快取鍵。
+    //
+    // **刻意每幀全掃、不吃增量**：斷點可能剛好落在 append 邊界（左列在上一幀就
+    // 算完、from 之後不會再跑到它），只掃新列必漏接。第一個條件就是單一格子的
+    // isUrlCell，幾乎所有列瞬間出局，成本與同樣每幀全掃的 groupSameAuthorRuns /
+    // groupImageCaptionBlocks 同級。
+    //
+    // 放在 caption / run 兩個裝飾 pass **之前**：它們用 {...result[row], ...extra}
+    // 疊上去會保留 wrapUrls；而某一對 (r-1, r) 的判定在 pageLines append-only 之下
+    // 不會改變，所以被烘進那兩個快取也安全。
+    if (autoFixUrl) {
+      const isSkipRow = (row) => {
+        const a = base[row];
+        return !!(a && (a.pusher !== undefined || a.hidden));
+      };
+      const wrapped = detectBodyWrappedUrls(lines, isSkipRow);
+      for (let k = 0; k < wrapped.length; ++k) {
+        const w = wrapped[k];
+        for (let i = 0; i < w.parts.length; ++i) {
+          const p = w.parts[i];
+          result[p.row] = applyWrapUrlRange(result[p.row], {
+            startCol: p.startCol,
+            endCol: p.endCol,
+            href: w.href,
+            preview: p.preview,
+          });
+        }
+      }
+    }
     const domainCands = baseDomainCands.slice();
     const fixCands = baseFixCands.slice();
     // 開啟合併時把分組結果寫進 annotation：圖行掛 mergeBlock（render 成兩欄
@@ -536,6 +587,8 @@ export function computeAnnotations(
         base,
         floorCounter: ctx.floorCounter,
         hasSteamgifts,
+        litRows,
+        erasedRows,
         domainCands: baseDomainCands,
         fixCands: baseFixCands,
         captionCache,
@@ -560,6 +613,16 @@ export function computeAnnotations(
     //     改被刪除樣式；好讀暫時切回原生也走此路 → 不再變回反黑.)
     for (let row = 0; row < lines.length; ++row) {
       const text = rowToText(lines[row]);
+      // 這一列必須先「長得像列表列」才准跑黑名單／才准掛 data-list-*。
+      // 上面那兩個輸入（pageState、inListContext）都是**黏的**，從列表叫出來的
+      // 整頁畫面（Ctrl-P 發文、板規、精華區…）會整份繼承它們 ⇒ 板規／分類提示列
+      // 的 col≥29 一旦含到使用者的標題關鍵字就被換成通知列（2026-09-05 錄製檔：
+      // 「種類：… 7.Vtub 8.自介」被 vtub 命中）。判準見 comment_parse#isListShapedRow。
+      // 順帶修掉**真實列表畫面**上的同一類誤命中：表頭「編號 日期 作者 標題」與
+      // footer「文章選讀 (y)回應(X)推文(^X)轉錄」以前也會被關鍵字（如「轉錄」）吃掉。
+      // 逐列獨立性不受影響（只看該列自己的 chars），所以
+      // annotationsAreRowIndependent 不必跟著改。
+      if (!isListShapedRow(text)) continue;
       const deleted = isDeletedListRow(text);
       // Quick-add blacklist (right-click menu) needs every visible row's author
       // and raw-case title, independent of whether any blacklist is set yet —

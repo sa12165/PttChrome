@@ -22,6 +22,7 @@ import { buildRow } from "./row";
 import {
   createMergeImageCaptionButton,
   createMergeImageCaptionAiButton,
+  createLightsOnButton,
 } from "./merge_buttons";
 import { createSignatureTask } from "./signature_task";
 import React from "react";
@@ -44,6 +45,7 @@ import {
   destroyCaptionAi,
 } from "../js/caption_ai";
 import { domainKey, fixKey } from "../js/url_ai_logic";
+import { MFDISP_RAW_PLAIN } from "../js/pmore_pref";
 import {
   classifyBrokenUrls,
   classifyDomains,
@@ -101,6 +103,13 @@ export class ScreenController {
     this._hoverPos = { left: undefined, top: undefined };
     // 好讀自動開圖「一鍵放大全部圖片至視窗寬度」；點任一張內嵌預覽圖切換。
     this._imagesEnlarged = false;
+    // 開燈（隱藏文字提亮）。**只是軌 A 的 CSS 開關**——軌 B（server 已擦掉的內容）
+    // 由 App 切 pmore rawmode 處理，狀態在 enhance.rawMode，不在這裡。與
+    // imagesEnlarged 同生命週期：同篇 page-down 保留、換文章（articleId 變）重置。
+    this._lightsOn = false;
+    // 推文區塊行距的容器 class（pref commentBlockSpacing）。每幀由 _render 推導，
+    // 這裡只是欄位種子（見 _setCommentSpacing 的 DOM 同步守衛）。
+    this._commentSpacing = false;
     // 好讀「圖左字右合併」三態：null（關）→ "imageFirst" → "captionFirst" → null。
     // 與 imagesEnlarged 同生命週期——同篇 page-down 保留、換文章／退出再進
     // （articleId 變）才重置，所以不會「換到沒按鈕的文章卻還開著、關不掉」。
@@ -135,6 +144,14 @@ export class ScreenController {
     this._captionAiEnabledSeen = null;
     this._availabilityToken = 0;
 
+    // 列表好讀的捲動視口（見 _ensureBodyView）。它一旦建立就常駐 controller，
+    // listener 只掛一次；`onListScroll` 由 term_view 接到 ListSession.onDomScroll。
+    this._bodyView = null;
+    this.onListScroll = null;
+    this._onListScroll = () => {
+      if (this.onListScroll) this.onListScroll();
+    };
+
     // 事件委派：點到內嵌預覽圖（.hyperLinkPreview）即切換整頁圖片放大/縮小。
     // hover 預覽的 OnHover img 無此 class，不受影響。
     this._onContainerClick = this._onContainerClick.bind(this);
@@ -146,6 +163,7 @@ export class ScreenController {
 
     this._mergeButton = null;
     this._aiButton = null;
+    this._lightsButton = null;
     this._hoverHost = null;
 
     this._initAiTasks();
@@ -227,7 +245,14 @@ export class ScreenController {
     const articleId = props.enhance && props.enhance.articleId;
     const prevArticleId = prev && prev.enhance && prev.enhance.articleId;
     if (prev && articleId !== prevArticleId) {
-      this._imagesEnlarged = false;
+      // 走唯一入口：直接賦值欄位會漏掉容器 class（＝圖片尺寸的真正決定者）與
+      // 存活中 slot 的 sizeMode，下一篇就會一開場就是大圖。
+      this._setImagesEnlarged(false);
+      // 開燈的 CSS 態同樣走唯一入口（直接賦值會漏掉容器 class）。**軌 B 不會被
+      // 這裡還原**：pmore 的 bpref 是 per-connection 全域，下一篇文章仍是純文字
+      // 模式，所以按鈕會依 enhance.rawMode 直接顯示成「關燈」（刻意，見
+      // docs/handoff 決策 D6 → docs/enhanced-addon.md）。
+      this._setLightsOn(false);
       this._mergeCaption = null;
       // AI 結果是 per-article 的：換文章一律丟掉（spanKey 只保證同一篇內唯一；
       // domainKey 含整列文字，舊判斷也沒有沿用價值）。
@@ -298,6 +323,11 @@ export class ScreenController {
     this._annotations = [];
     this._liveSlots.clear();
     if (this._hoverHost) unmountFrom(this._hoverHost);
+    if (this._bodyView) {
+      this._bodyView.removeEventListener("scroll", this._onListScroll);
+      this._bodyView = null;
+    }
+    this.onListScroll = null;
     this.container.removeEventListener("click", this._onContainerClick);
     this.container.removeEventListener("mousemove", this._onContainerMouseMove);
     this.container.remove();
@@ -400,14 +430,80 @@ export class ScreenController {
     this._refocusTerminal();
   }
 
+  // 開燈鈕：軌 A 的 CSS 立刻生效（同步、零延遲），軌 B 只在偵測到「被 server 擦掉
+  // 的隱藏內容」時才動 —— 那要請 App 替使用者切 pmore 的色彩顯示模式並重讀整篇
+  // （見 pttchrome.jsx#onLightsRawMode）。關燈則把切過的模式切回預設格式化。
+  _toggleLights() {
+    const enhance = this.props && this.props.enhance;
+    const ann = this._annotations || [];
+    const next = !this._lightsActive();
+    this._setLightsOn(next);
+    const switchRawMode = enhance && enhance.onLightsRawMode;
+    if (switchRawMode) {
+      if (next) {
+        if (ann.hasErasedHidden) switchRawMode(MFDISP_RAW_PLAIN);
+      } else if (enhance.rawMode === MFDISP_RAW_PLAIN) {
+        switchRawMode(0);
+      }
+    }
+    this._syncLightsButton();
+    this._refocusTerminal();
+  }
+
+  // 按鈕上顯示的「燈亮著嗎」。軌 B 切過模式之後畫面上已經沒有隱藏文字可提亮，
+  // 但燈確實是亮的 —— 兩軌任一成立就算亮，否則使用者會找不到關燈的路。
+  _lightsActive() {
+    const enhance = this.props && this.props.enhance;
+    return !!(
+      this._lightsOn ||
+      (enhance && enhance.rawMode === MFDISP_RAW_PLAIN)
+    );
+  }
+
+  // 開燈不需要重建任何一列：容器 class 決定樣式（同 imagesEnlarged 的形狀）。
+  _setLightsOn(next) {
+    const domInSync = this.container.classList.contains("lightsOn") === next;
+    if (this._lightsOn === next && domInSync) return;
+    this._lightsOn = next;
+    this.container.classList.toggle("lightsOn", next);
+  }
+
+  _syncLightsButton() {
+    if (!this._lightsButton) return;
+    this._lightsButton.update(this._lightsActive());
+  }
+
   // imagesEnlarged 不需要重建任何一列：容器 class 決定圖片尺寸，佔位盒只要知道
   // 現在是哪個模式（分模式各記一筆高度，見 lazy_media.recordSlotHeight）。
   _setImagesEnlarged(next) {
-    if (this._imagesEnlarged === next) return;
+    // 早退守衛同時看 DOM：欄位對、class 卻沒跟上（有人繞過本入口直接改欄位）時
+    // 不可早退，否則會靜默停在不同步狀態。
+    const domInSync =
+      this.container.classList.contains("imagesEnlarged") === next;
+    if (this._imagesEnlarged === next && domInSync) return;
     this._imagesEnlarged = next;
     this.container.classList.toggle("imagesEnlarged", next);
     const mode = next ? "enlarged" : "normal";
     for (const slot of this._liveSlots) slot.setSizeMode(mode);
+  }
+
+  // 推文區塊行距（pref commentBlockSpacing）：同 lightsOn／imagesEnlarged 的形狀 ——
+  // 容器 class 決定樣式，不重建任何一列，也不進 annotationsKey。
+  //
+  // **判準是 stableRows 而不是 easyReading && pageState===3**：functionMode 原生鏡像
+  // 與「防黑守門」兩條 fallback 也帶著 easyReading:true / pageState:3，畫的卻是活的
+  // 24 列 buffer（見 js/screen_annotations.js 的 annotationsAreRowIndependent 註解）。
+  // 那裡多出任何高度就打破「原生鏡像期間畫面必須不可捲」的不變量 ⇒ 復發「推文時
+  // 游標戳出反白輸入匡」（docs/easy-reading.md）。stableRows 只在 term_view 渲染
+  // buf.pageLines 的兩個呼叫點為真，正好就是「文章好讀累積長頁」。
+  // 守護：tests/unit/comment_spacing_class.test.js
+  _setCommentSpacing(next) {
+    // 早退守衛同時看 DOM（同 _setImagesEnlarged）：欄位對、class 沒跟上時不可早退。
+    const domInSync =
+      this.container.classList.contains("commentSpacing") === next;
+    if (this._commentSpacing === next && domInSync) return;
+    this._commentSpacing = next;
+    this.container.classList.toggle("commentSpacing", next);
   }
 
   // 版面**寬度**改變的唯一入口（字級／視窗 resize 走 term_view.setTermFontSize，
@@ -446,6 +542,15 @@ export class ScreenController {
       onHyperLinkMouseOut: this.onHyperLinkMouseOut,
     });
     const stableRows = !!(enhance && enhance.stableRows);
+    this._setCommentSpacing(
+      !!(
+        enhance &&
+        enhance.commentBlockSpacing &&
+        enhance.easyReading &&
+        enhance.pageState === PAGE_READING &&
+        stableRows
+      ),
+    );
     const prevCache = this._cache;
     const reusable =
       stableRows &&
@@ -732,6 +837,9 @@ export class ScreenController {
       aids: ann && ann.aids,
       giveaways: ann && ann.giveaways,
       bareDomains: ann && ann.bareDomains,
+      // 內文跨行連結（src/js/body_wrap.js）。**上面的 mergeCommentRun 合併分支同樣
+      // 不傳**：推文的跨行接合由 url_wrap.js 走 fixedUrls，這條只管內文列。
+      wrapUrls: ann && ann.wrapUrls,
       // 功能鍵按鈕。**上面的 mergeCommentRun 合併分支刻意不傳**：那條路的 chars 是
       // comment_merge.buildMergedCommentChars 重組的新序列，原列的 col 範圍全部失效
       // （同理它對 mentions/aids 也改用 m.* 而非 ann.*）。功能鍵列永遠不是推文列。
@@ -767,11 +875,15 @@ export class ScreenController {
   // 把容器的列區塊調成 `nodes` 的樣子。逐位置比對＋就地搬移：沒變的節點原封不動
   // 留在 DOM 裡（好讀累積頁的常態是純 append，這裡就只會做 appendChild）。
   //
-  // 列表好讀的平滑捲動（enhance.listScroll）多一層：body 那 20 列住在一個固定高度、
-  // overflow:hidden 的視口節點裡，用它的 scrollTop 表達**次列位移**（畫面因此停得住
-  // 半列的位置）。header/footer 留在容器直系子層 ⇒ 不會跟著捲、也不必靠不透明背景
-  // 去蓋住捲進來的內容。列節點本身完全沒變（data-row／內容／快取都一樣），只是換了
-  // 父節點。
+  // 列表好讀（enhance.listScroll）多一層：**整段緩衝**（過濾後序列，上限
+  // MAX_LIST_ROWS≈300 列）都畫進一個固定高度（＝原本 body 那 20 列）的捲動視口
+  // 節點，捲動本身交給瀏覽器 —— 與文章好讀模式同一套引擎。header/footer 留在
+  // 容器直系子層 ⇒ 不跟著捲、也不必靠不透明背景去蓋住捲進來的內容。列節點本身
+  // 完全沒變（data-row／內容／快取都一樣），只是換了父節點。
+  //
+  // body 的範圍＝`[bodyStart, nodes.length-1)`：footer 恆是最後一列（它的
+  // data-row 因此會隨序列長度變動，那是對的——data-row 的定義就是「傳給
+  // <Screen> 的 lines index」，見 term_view._renderScreenLines）。
   _patchRows(nodes) {
     const ls = this.props.enhance && this.props.enhance.listScroll;
     // 列區塊的右邊界＝第一個浮層節點（浮層永遠排在最後）。取 isConnected 的那個：
@@ -782,34 +894,68 @@ export class ScreenController {
       this._patchInto(this.container, nodes, stop);
       return;
     }
-    const bodyEnd = ls.bodyStart + ls.bodyRows;
+    const bodyEnd = Math.max(ls.bodyStart, nodes.length - 1);
     const bodyNodes = nodes.slice(ls.bodyStart, bodyEnd);
-    // overscan 列排在 footer 之後（term_view.buildListWindowLines 的註解說明了
-    // 為什麼不能插在 body 裡：footer 的 data-row 是外部契約）。
-    if (ls.overscan && nodes.length > bodyEnd + 1)
-      bodyNodes.push(nodes[bodyEnd + 1]);
     const view = this._ensureBodyView(ls);
     const outer = nodes
       .slice(0, ls.bodyStart)
-      .concat([view], nodes.slice(bodyEnd, bodyEnd + 1));
+      .concat([view], nodes.slice(bodyEnd));
     this._patchInto(this.container, outer, stop);
     this._patchInto(view, bodyNodes, null);
-    view.scrollTop = ls.offsetPx || 0;
   }
 
   // 列表好讀 body 的捲動視口。高度＝body 列數 × 列高（版面總高不變：它取代的就是
-  // 那 20 列），內容多一列時由 overflow:hidden 裁掉。
+  // 那 20 列），內容比它高的部分就是可捲距離。
+  //
+  // `scrollable=false`（交易 frozen／pref 關掉原生捲動）走 `overflow:hidden`：
+  // hidden 的元素**仍是 scroll container**，scrollTop 與 scrollTo() 照常有效，
+  // 只是使用者輸入捲不動它。這是「吞掉捲動」的唯一可行做法 —— window 上的 wheel
+  // listener 在 Chrome 是 passive-by-default，preventDefault() 是 no-op
+  // （見 pttchrome.jsx#mouse_scroll）。
   _ensureBodyView(ls) {
-    if (!this._bodyView) this._bodyView = el("div", { class: "listBodyView" });
+    if (!this._bodyView) {
+      this._bodyView = el("div", { class: "listBodyView" });
+      this._bodyView.addEventListener("scroll", this._onListScroll, {
+        passive: true,
+      });
+    }
     const h = (ls.viewportPx || 0) + "px";
     if (this._bodyView.style.height !== h) this._bodyView.style.height = h;
+    const ov = ls.scrollable ? "auto" : "hidden";
+    if (this._bodyView.style.overflowY !== ov)
+      this._bodyView.style.overflowY = ov;
     return this._bodyView;
   }
 
-  // 次列位移的快路徑（term_view → ListSession._setScrollFrac）：捲動沒有跨列時
-  // 只有 scrollTop 變，整幀重繪是白工（滾輪動畫是每幀觸發的）。
-  setListScrollOffset(px) {
+  // ---- 列表好讀的捲動存取（唯一入口）----------------------------------------
+  // ListSession 一律透過這幾支動 DOM，不直接碰節點：jsdom 沒有 Element.scrollTo，
+  // 而捲動語意的 unit 測試全都在 jsdom 下跑。
+  // 視口節點現在還在 DOM 上嗎。它是常駐快取（切到文章／原生鏡像時被 _patchRows
+  // 移出容器，物件本身留著），而 **detached 節點的 scrollTop 恆為 0** —— 那是
+  // 「沒有資訊」，不是「捲到最上面」。ListSession 的 captureScrollAnchor 必須靠
+  // 這一支分辨兩者，否則退出文章那一幀會把錨定到緩衝最舊的一列。
+  hasListViewport() {
+    return !!(this._bodyView && this._bodyView.isConnected);
+  }
+
+  getListScrollTop() {
+    return this._bodyView ? this._bodyView.scrollTop : 0;
+  }
+
+  getListViewportPx() {
+    return this._bodyView ? this._bodyView.clientHeight : 0;
+  }
+
+  setListScrollTop(px) {
     if (this._bodyView) this._bodyView.scrollTop = px || 0;
+  }
+
+  scrollListTo(px, behavior) {
+    const v = this._bodyView;
+    if (!v) return;
+    if (behavior === "smooth" && typeof v.scrollTo === "function")
+      v.scrollTo({ top: px || 0, behavior: "smooth" });
+    else v.scrollTop = px || 0;
   }
 
   _patchInto(parent, nodes, stop) {
@@ -848,6 +994,16 @@ export class ScreenController {
     // 連按鈕都不出現，行為與沒這功能時完全相同。
     this._probeAiAvailability(enhance);
     const showCaptionAiButton = !!(showMergeButton && this._aiReady);
+    // 開燈鈕：文章頁偵測到隱藏文字就出現（**原生模式也要**——隱藏文字在原生一樣
+    // 看不見）。第三個條件是燈已經亮著：軌 B 切成純文字之後畫面上再也偵測不到
+    // 隱藏文字，少了它按鈕會消失、使用者關不掉燈。
+    const showLightsButton = !!(
+      enhance &&
+      enhance.pageState === PAGE_READING &&
+      (annotations.hasLitHidden ||
+        annotations.hasErasedHidden ||
+        this._lightsActive())
+    );
 
     const wanted = [];
     if (showMergeButton) {
@@ -870,6 +1026,13 @@ export class ScreenController {
         this._captionAi ? this._aiPending : 0,
       );
       wanted.push(this._aiButton.el);
+    }
+    if (showLightsButton) {
+      if (!this._lightsButton) {
+        this._lightsButton = createLightsOnButton(() => this._toggleLights());
+      }
+      this._lightsButton.update(this._lightsActive());
+      wanted.push(this._lightsButton.el);
     }
     if (this._hoverPreview !== undefined) {
       if (!this._hoverHost) this._hoverHost = el("div", null);

@@ -83,6 +83,9 @@
   "cmenu_addTitleBlacklist": {
     "message": "加入標題黑名單 ..."
   },
+  "cmenu_markReadUnread": {
+    "message": "此篇（含）以前設為已讀、以後設為未讀"
+  },
   "titleBlacklistModal_title": {
     "message": "加入標題黑名單"
   },
@@ -128,6 +131,15 @@
   },
   "longPushModal_tooMany": {
     "message": "共 #n# 則，過程可能要好幾分鐘（PTT 有推文冷卻）。確定要送出嗎？"
+  },
+  "longPushModal_uploadImage": {
+    "message": "插入圖片"
+  },
+  "longPushModal_uploadHint": {
+    "message": "可直接把圖片拖進來、貼上截圖，或按「插入圖片」選檔，上傳完的網址會插在游標處。"
+  },
+  "longPushModal_urlTooLong": {
+    "message": "圖片網址比單則推文上限還長，可能會被切成兩則（圖就開不起來）。建議改用短網址或分開推。"
   },
   "longPushModal_confirm": {
     "message": "開始送出"
@@ -290,6 +302,18 @@
   "mergeImageCaptionAi_pending": {
     "message": "AI 校正中…剩"
   },
+  "lightsOn_on": {
+    "message": "開燈（顯示隱藏文字）"
+  },
+  "lightsOn_off": {
+    "message": "關燈"
+  },
+  "lightsOn_switchedPlain": {
+    "message": "已切換為「純文字」顯示模式並重新讀取——PTT 伺服器不會把隱藏的英數字送給瀏覽器，只能請它重送一次。畫面顏色會暫時消失，按「關燈」即可還原。"
+  },
+  "lightsOn_switchFailed": {
+    "message": "開燈失敗：叫不出 PTT 的色彩顯示模式設定頁，請稍後再試。"
+  },
   "debugRecord_start": {
     "message": "錄製"
   },
@@ -306,6 +330,9 @@
   },
   "options_mergeSameAuthorComments": {
     "message": "合併連續同作者推文成一段 (僅好讀模式，顯示時間與樓層範圍)"
+  },
+  "options_commentBlockSpacing": {
+    "message": "推文區塊加大行距 (僅好讀模式，同作者合併的推文自成一組)"
   },
   "tooltip_ai": {
     "message": "以下功能使用瀏覽器內建的裝置端 AI（Chrome Prompt API）。推論完全在你的電腦上進行，內容不會傳到任何伺服器。目前僅 Chrome 148+ 桌面版支援，且模型首次啟用需下載數 GB。"
@@ -520,6 +547,18 @@
   "options_enableEasyReadingList": {
     "message": "啟用文章列表好讀模式 (實驗性，黑名單真正隱藏)"
   },
+  "options_enableBoardListSmoothScroll": {
+    "message": "啟用看板列表平滑捲動 (實驗性，我的最愛／分類看板)"
+  },
+  "tooltip_enableBoardListSmoothScroll": {
+    "message": "把「我的最愛」與「分類看板」子分類的看板列表累積成一整段，捲動直接交給瀏覽器（與文章列表好讀同一套）。「全部看板」「熱門看板」與按 c 的新文章模式維持原生的一次一頁。"
+  },
+  "options_enableListNativeAutoResume": {
+    "message": "非導覽操作完成後自動切回好讀／平滑捲動"
+  },
+  "tooltip_enableListNativeAutoResume": {
+    "message": "在列表按下非導覽鍵（搜尋、標記、推文、設定已讀…）時，操作完成、畫面靜下來就自動切回好讀模式。只移動游標的鍵（[ ] = \\ + - < > , . { } t，看板列表的 t v V）更是全程不切原生。關掉＝停在原生模式，要開啟文章或離開看板才回好讀。"
+  },
   "options_easyReadingEndSwitchNative": {
     "message": "好讀模式按熱鍵跳到文末並切回原生模式"
   },
@@ -698,10 +737,16 @@
     "message": "文章好讀模式維持瀏覽器捲動，不受這個設定影響。"
   },
   "options_mouseWheelSmoothScroll": {
-    "message": "文章列表好讀模式平滑捲動"
+    "message": "列表好讀模式平滑捲動"
   },
   "tooltip_mouseWheelSmoothScroll": {
-    "message": "文章列表的好讀模式下，滾輪像一般網頁那樣平滑捲動：依滾動距離連續移動、停得住半列，觸控板的細微滑動也跟得上；關閉則一格滾輪翻一整頁。原生（非好讀）的列表畫面翻頁由 PTT 主機決定，一律是整頁翻。"
+    "message": "文章列表好讀模式與看板列表平滑捲動下，滾輪直接交給瀏覽器捲動，與文章好讀模式完全一致：慣性、觸控板的細微滑動、捲動設定都跟系統一樣；關閉則一格滾輪翻一整頁。原生（非好讀）的列表畫面翻頁由 PTT 主機決定，一律是整頁翻。"
+  },
+  "options_mouseBackNav": {
+    "message": "瀏覽器「上一頁」／觸控板左滑"
+  },
+  "tooltip_mouseBackNav": {
+    "message": "把瀏覽器的「上一頁」改成 PTT 的左方向鍵＝退出文章／回上一層。來源包含觸控板兩指左滑（用的是瀏覽器原生的返回手勢，所以返回箭頭、跟手、半途放開取消都跟其他網站一模一樣）、滑鼠側鍵、Alt+← 或 ⌘[、工具列的上一頁按鈕。觸控板手勢能不能用取決於系統設定（macOS：系統設定 → 觸控式軌跡板 → 更多手勢 → 在頁面間滑動）。要真的離開本站請關掉分頁，或在沒有東西可退的畫面連做兩次上一頁。"
   },
   "options_mouseBrowsing": {
     "message": "滑鼠瀏覽"
@@ -764,7 +809,7 @@
       '核心畫面（文章列表／文章／兩者的好讀模式）改寫為純 JavaScript DOM，不再經過 React——BBS 畫面每收到一頁就整份重畫，React 在這條路徑上只剩成本；設定頁等週邊介面仍是 React',
       '升級 React 19（bundled、function component + hooks）',
       '棄用 Bootstrap / react-bootstrap，UI 元件改用 Mantine（暗色預設、可切換主題）',
-      '建置工具：Vite 8（Rolldown 核心，取代 webpack + Babel）、Yarn 4；測試框架 Vitest 4（取代 Jest）',
+      '建置工具：Vite 8（Rolldown 核心，取代 webpack + Babel）、Yarn 4；測試框架 Vitest 5（取代 Jest）',
       '移除 jQuery 與 hammerjs，全部原生 API，無 CDN 程式庫依賴',
       'Firebase npm modular SDK（lazy chunk）＋ App Check 防護',
       '測試基建：Playwright E2E、Firebase Emulator Suite（Docker）整合測試、離線 byte-cassette 重放測試',
@@ -815,6 +860,9 @@
   },
   "imageUpload_insertedSend": {
     "message": "已插入圖片網址"
+  },
+  "imageUpload_insertedTarget": {
+    "message": "已插入圖片網址 (長推文輸入框)"
   },
   "imageUpload_insertedClipboard": {
     "message": "網址已複製 (目前不在推文列或編輯器)"

@@ -69,6 +69,7 @@ function makeSession({ count = 40, pinned = 0, queue } = {}) {
       flushPending() {},
       flushPendingKind() {},
       expedite() {},
+      hasKind: () => false,
       enqueue(cmd) {
         enqueued.push(cmd);
       },
@@ -125,6 +126,13 @@ function collectLegs() {
   }
   {
     const { s, enqueued } = makeSession();
+    // IME 送字（ASCII 即可，u2b 對 <0x80 直接透傳、不需 Big5 表）
+    s.noteTextInput("ab");
+    enqueued[0].onDone({});
+    push("text-input", enqueued);
+  }
+  {
+    const { s, enqueued } = makeSession();
     s._enqueuePrefetch(false, "fill");
     push("prefetch", enqueued);
   }
@@ -167,6 +175,7 @@ describe("列表好讀：機器鍵的 \\f 契約與快速失敗預算", () => {
       "jump-number",
       "leave-board",
       "leave-sync-jump",
+      "native-input",
       "native-key",
       "native-sync-jump",
       "open-enter",
@@ -181,8 +190,26 @@ describe("列表好讀：機器鍵的 \\f 契約與快速失敗預算", () => {
 
   test("keys 形如 <數字>\\r 的每一腿都掛 fullRepaint（零回應跳號的唯一解）", () => {
     const jumps = legs.filter((l) => /^[0-9]+\r$/.test(l.cmd.keys));
-    expect(jumps.length).toBe(8);
+    // 2026-09-05：jump-end／jump-home 從 99999999\r／1\r 改成原生 End／Home
+    // （下一條測試接手），所以這裡從 9 腿降到 7 腿。
+    expect(jumps.length).toBe(7); // 入口數 × 各自的 sync/jump 腿
     for (const { label, cmd } of jumps)
+      expect([label, cmd.kind, cmd.fullRepaint]).toEqual([label, cmd.kind, true]);
+  });
+
+  // Home/End 直通原生鍵（read.c:893-902）。原生 End 在游標已經在底端時**零回應**
+  // （live-tested），Home 在頂端同理 ⇒ 這兩腿的 fullRepaint 不是保險而是必要條件，
+  // 少了它就只能等到逾時。open-pinned-end 走同一條路。
+  test("Home/End 送原生鍵且必掛 fullRepaint", () => {
+    const natives = legs.filter(
+      (l) => l.cmd.keys === '\x1b[1~' || l.cmd.keys === '\x1b[4~'
+    );
+    expect(natives.map((l) => l.cmd.kind).sort()).toEqual([
+      "jump-end",
+      "jump-home",
+      "open-pinned-end",
+    ]);
+    for (const { label, cmd } of natives)
       expect([label, cmd.kind, cmd.fullRepaint]).toEqual([label, cmd.kind, true]);
   });
 
@@ -193,7 +220,7 @@ describe("列表好讀：機器鍵的 \\f 契約與快速失敗預算", () => {
 
   test("會凍畫面的前景交易一律 250/600/1200", () => {
     const background = new Set(["prefetch-anchor-down", "prefetch-down"]);
-    const longLived = new Set(["native-key", "native-paste"]);
+    const longLived = new Set(["native-key", "native-paste", "native-input"]);
     for (const { label, cmd } of legs) {
       if (background.has(cmd.kind) || longLived.has(cmd.kind)) continue;
       expect([label, cmd.kind, cmd.timeoutMs]).toEqual([label, cmd.kind, 250]);
@@ -214,10 +241,16 @@ describe("列表好讀：機器鍵的 \\f 契約與快速失敗預算", () => {
     }
   });
 
-  test("native-key 例外：維持長窗（它不凍畫面，只負責撐住 functionMode 的吸收）", () => {
-    const nk = legs.find((l) => l.cmd.kind === "native-key").cmd;
-    expect(nk.timeoutMs).toBe(3000);
-    expect(nk.fullRepaint).toBeUndefined(); // bytes 是使用者任意輸入，不附 \f
+  test("native-key／native-input 例外：維持長窗（不凍畫面，只撐住 functionMode 的吸收）", () => {
+    for (const kind of ["native-key", "native-input"]) {
+      const cmd = legs.find((l) => l.cmd.kind === kind).cmd;
+      expect([kind, cmd.timeoutMs]).toEqual([kind, 3000]);
+      // 2026-09-03 起**一律尾附 \f**：PTT 完全忽略某個鍵時（無權限、MODE_SELECT
+      // 下的 Ctrl-D…）是零 byte 零 settle，命令只能等滿 3000ms 才 timeout ⇒ 使用者
+      // 盯著原生畫面發呆 3 秒，「操作完成後自動回好讀」也無從觸發。\f 保證必有
+      // 一幀（協定 §6：igetch 全域攔截，getdata/vgets/pmore/編輯器一律吃這條）。
+      expect([kind, cmd.fullRepaint]).toEqual([kind, true]);
+    }
   });
 });
 
