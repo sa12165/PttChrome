@@ -151,7 +151,7 @@ https://www.ptt.cc/bbs/Browsers/M.1786265274.A.5E3.html
 命中後把網址改寫成本站的分享連結（把「看板名／檔名」原樣接在 `#` 後面）：
 
 ```
-https://abccbaandy.github.io/PttChrome/#$1
+https://sa12165.github.io/PttChrome/#$1
 ```
 
 於是：
@@ -159,7 +159,7 @@ https://abccbaandy.github.io/PttChrome/#$1
 ```
 https://www.ptt.cc/bbs/Browsers/M.1786265274.A.5E3.html
         ↓ 套件改寫
-https://abccbaandy.github.io/PttChrome/#Browsers/M.1786265274.A.5E3.html
+https://sa12165.github.io/PttChrome/#Browsers/M.1786265274.A.5E3.html
         ↓ 本站的文章分享連結（deep link）功能接手
 自動切換到該看板 → 開啟該篇文章
 ```
