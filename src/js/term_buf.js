@@ -4,15 +4,18 @@ import { Event } from './event';
 import { ColorState } from './term_ui';
 import { u2b, b2u, parseStatusRow, parseListRow } from './string_util';
 import { cjkUrlExtension } from './url_cjk';
+import { trimUrlTailLength } from './url_trim';
 import { ringBell } from './bell';
-import cursorBack from '../cursor/back.png';
+import { MOUSE_CURSOR_URLS } from './mouse_cursors';
 import {
   ACT_NONE,
   ACT_EXIT_ARTICLE,
   CUR_BACK,
+  isEdgeCursor,
   resolveMouseRegion,
   cursorCss
 } from './mouse_regions';
+import { MouseReportState } from './mouse_report';
 import { resolveDismiss } from './screen_dismiss';
 
 // Quiet period (ms) after the last redraw window before pageState is promoted to
@@ -22,6 +25,13 @@ import { resolveDismiss } from './screen_dismiss';
 // only captures the final stable value once PTT stops sending. See
 // docs/easy-reading.md (settle 後判斷). Tunable; raise if slow links premature-settle.
 const SETTLE_MS = 50;
+
+// DEC 2026 Synchronized Output 的保險絲：收到 BSU（`ESC[?2026h`）卻遲遲等不到
+// ESU（`ESC[?2026l`）時，最多壓住畫面這麼久就強制補畫。會發生的情境是連線中斷在
+// 一幀中間、或 server 端異常。取 250ms 的理由：正常情況下同一幀的位元組塊間隔遠
+// 小於它（一幀被 3072-byte OBUFSIZE 拆開而已），而 CommandQueue 的軟逾時是 3000ms
+// （command_queue.js）⇒ 保險絲永遠先動，不會讓「畫面卡住」惡化成「命令逾時」。
+const SYNC_SAFETY_MS = 250;
 
 const termColors = [
   // dark
@@ -228,6 +238,9 @@ export function TermBuf(cols, rows) {
   });
   this.tempMouseCol = 0;
   this.tempMouseRow = 0;
+  // 指標壓在 <a>／我們自己的浮動按鈕上（App.onMouse_move 傳進來）。它們是元素層的
+  // 可點物件，在點擊優先權表上贏過滑鼠瀏覽 ⇒ 邊緣翻頁的提示帶要讓位。
+  this._overAnchor = false;
   // 滑鼠停在哪一格代表什麼動作（mouse_regions 的 ACT_*）與它的目標列。
   // 改版前是 0..14 的 mouseCursor 數字，同時兼任「長什麼樣」與「點了做什麼」。
   this.mouseAction = ACT_NONE;
@@ -308,6 +321,23 @@ export function TermBuf(cols, rows) {
   // TWICE, and the second (cursor-only, zero content rows) settle must still
   // reach the ListSession/CommandQueue — its screen is the complete response.
   this._settleCursorMoved = false;
+
+  // ---- DEC 2026 Synchronized Output（BSU/ESU）------------------------------
+  // PTT 從 2026-09 起把每個 doupdate() 包在 `ESC[?2026h` … `ESC[?2026l` 之間
+  // （mbbsd/pfterm.c:817-823, 1074-1075）。我們只拿它**擋畫面**（BSU 期間不重繪，
+  // ESU 一到補一次），**不拿它當 settle**——理由見 tests/unit/term_buf_sync_update.js
+  // 開頭與 docs/easy-reading.md：一個 logical page 對應多個 doupdate()，而且
+  // `!ft.dirty` 早退路徑會吐零內容的 BSU/ESU 對，ESU 的常態語意是「server 回去等
+  // 按鍵了」而非「這一頁畫完了」。
+  // 沒收到 2026 的環境（登入畫面、舊 server、其他站台）`inSyncUpdate` 恆 false
+  // ⇒ 下面的 early-return 永不命中 ⇒ 行為與加這段之前逐字相同。
+  this.syncUpdateEnabled = true; // 程式層 kill switch（無 UI；e2e/console 可關）
+  this.inSyncUpdate = false;
+  this._syncSafetyTimer = null;
+
+  // XTerm SGR 滑鼠回報的模式狀態（主機用 ESC[?1000h 這類序列宣告）。
+  // `enabled` 由 pref mouseServerReport 寫入（App.onPrefChange），預設關。
+  this.mouseReport = new MouseReportState();
 
   this.viewBufferTimer = 30;
 
@@ -521,6 +551,12 @@ TermBuf.prototype = {
         while ( (res = this.uriRegEx.exec(s)) !== null ) {
           if (!uris)   uris = [];
           var uriEnd = res.index + res[0].length;
+          // 結尾的句尾標點／不成對括號屬於句子不屬於 URL（src/js/url_trim.js）。
+          // 必須在 CJK 延伸判定**之前**縮：被砍掉的那個 `)` 本來就會讓
+          // cjkUrlExtension 的「前導必須是 / 或 =」守門拒絕延伸，先縮才問得對。
+          // 縮 uriEnd 就等於同時縮 uri[1] ⇒ partOfURL / endOfURL / fullurl 三者
+          // 自動一致（它們全部由 uri[0]..uri[1] 推導，見下方寫旗標那一段）。
+          uriEnd -= trimUrlTailLength(res[0]);
           var cjkExt = '';
           // CJK path extension (Big5 branch only: non-ASCII byte pairs were
           // replaced by \xab\xcd above, so uriRegEx always stops right before
@@ -891,7 +927,61 @@ TermBuf.prototype = {
     }
   },
 
+  // BSU（`ESC[?2026h`）：server 宣告「這一幀我還沒寫完」。壓住重繪直到 ESU。
+  beginSyncUpdate: function() {
+    if (!this.syncUpdateEnabled) return;
+    this.inSyncUpdate = true;
+    // 撤掉已排定的 30ms debounce：不撤的話它會在幀中途醒來畫出半幀，正是這整段
+    // 要修掉的東西。內容不會遺失（changed/posChanged 仍為 true），ESU 會補畫。
+    clearTimeout(this.timerUpdate);
+    this.timerUpdate = null;
+    // 刻意用布林不用巢狀計數：pfterm 的 rawbegin/rawend 嚴格成對且不遞迴
+    // （pfterm.c:817/1075），計數只會讓「掉了一個 ESU」從「這一幀晚 250ms」
+    // 惡化成「永久鎖死」。連續兩個 BSU 只是重新起算保險絲。
+    clearTimeout(this._syncSafetyTimer);
+    this._syncSafetyTimer = setTimeout(() => {
+      this._syncSafetyTimer = null;
+      this.endSyncUpdate();
+    }, SYNC_SAFETY_MS);
+  },
+
+  // ESU（`ESC[?2026l`）：這一幀寫完了，補畫一次。
+  endSyncUpdate: function() {
+    clearTimeout(this._syncSafetyTimer);
+    this._syncSafetyTimer = null;
+    if (!this.inSyncUpdate) return; // 落單的 ESU（例如重連收到後半句）＝ no-op
+    this.inSyncUpdate = false;
+    // 零內容的 sync frame（pfterm 的 !ft.dirty 早退路徑，PTT 每次回去等按鍵都會
+    // 送一對）不該產生任何重繪 ⇒ 只有真的有東西變才補。
+    if (this.changed || this.posChanged) this.queueUpdate(true);
+  },
+
+  // 連線層級的終端機模式重設。TermBuf/AnsiParser 一個頁面只建一次（pttchrome.jsx），
+  // onClose 只重建 conn ⇒ 這些跨連線的狀態必須顯式清掉，否則上一條連線斷在一幀
+  // 中間就會讓新連線的畫面一直被壓住。
+  resetTerminalModes: function() {
+    clearTimeout(this._syncSafetyTimer);
+    this._syncSafetyTimer = null;
+    this.inSyncUpdate = false;
+    this.mouseReport.reset();
+  },
+
+  // AnsiParser 的 DECSET/DECRST 轉發（`ESC[?1000h` 這類）。
+  handleDECSET: function(mode) {
+    this.mouseReport.handleDECSET(mode);
+  },
+
+  handleDECRST: function(mode) {
+    this.mouseReport.handleDECRST(mode);
+  },
+
   queueUpdate: function(directupdate) {
+    // BSU 期間不排重繪。注意這道閘門刻意放在 queueUpdate 而**不是** notify：
+    // queueUpdate 是所有 server 寫入路徑的共同出口，而 notify() 另有本地重繪的
+    // 直呼者（easy_reading / list_session / board_list_session 的 _forceRepaint
+    // 系列）——本地重繪不可以被 server 的 BSU 擋住。
+    if (this.inSyncUpdate)
+      return;
     if (this.timerUpdate)
       return;
 
@@ -958,6 +1048,12 @@ TermBuf.prototype = {
     // 閃爍游標抑制（autoHideBlinkCursor）：changed / posChanged 兩個分支各有 early
     // return，notify 是兩者唯一的共同匯流點，所以在這裡每幀無條件重算一次。
     if (this.view) this.view.refreshCursorVisibility();
+
+    // 同一個理由掛在同一個位置：畫面（或只有游標）變了之後，用快取的滑鼠座標把
+    // 「點下去做什麼」重算一次 —— 上面的 clearHighlight() 才剛把它清成 none，而
+    // 滑鼠可能整段時間都沒有物理移動。**必須排在 setPageState() 之後**（讀本幀的
+    // 新 pageState），也涵蓋只有游標 park escape 的幀（inputPrompt／dismiss 都看游標）。
+    this.refreshMouseAction();
 
     if (this.view.blinkOn) {
       this.view.blinkOn = false;
@@ -1291,6 +1387,21 @@ TermBuf.prototype = {
     });
   },
 
+  // pageState 1 底下有兩種完全不同的畫面：看板列表（mbbsd/board.c#show_brdlist）
+  // 與主功能表（mbbsd/menu.c）。它們的 Home/End 在 PTT 端語意相反 —— 看板列表是
+  // 「第一個／最後一個看板」（board.c:1830,1768），主功能表卻是「下一項／上一項」
+  // （menu.c:508,517，與 PGUP/PGDN 同一組）⇒ 邊緣翻頁區只能給前者。
+  //
+  // 指紋只看標題列，出處 board.c:1279 的 `【看板列表】`（board_list_parse
+  // .classifyBoardListScreen 的第一條判斷也是它）。只有 pageState 1 會問，其餘畫面
+  // 一格都不掃。getRowText 在這條路上是安全的：notify 先 view.update()（redraw →
+  // updateCharAttr 設好 isLeadByte）才 refreshMouseAction。
+  isBoardListScreen: function() {
+    if (this.pageState !== 1) return false;
+    var title = this.getRowText(0, 0, this.cols);
+    return typeof title === 'string' && title.indexOf('【看板列表】') === 0;
+  },
+
   // 滑鼠移到 (tcol, trow)：算出這一格的語意、更新游標底色列、換滑鼠指標、開關
   // 文章左側的退出提示帶。決策本身在純函式 mouse_regions.resolveMouseRegion
   // （逐格的行為表與依據見那裡與 docs/mouse.md），這裡只負責套用。
@@ -1299,22 +1410,53 @@ TermBuf.prototype = {
   // 與 server 的真實 24 列並不對應，一律由 term_view.onListMouseMove 處理
   // （App.onMouse_move 分流）；這裡再擋一次，涵蓋 resetMousePos 這類不經 App 的
   // 呼叫者。
-  onMouse_move: function(tcol, trow){
+  onMouse_move: function(tcol, trow, overAnchor){
     if (this.listRenderMode === 'buffer' || this.listRenderMode === 'frozen')
       return;
     this.tempMouseCol = tcol;
     this.tempMouseRow = trow;
+    // 指標壓在 <a> 上（連結／功能鍵按鈕）＝元素層贏，邊緣提示帶讓位。快取起來讓
+    // refreshMouseAction（重畫後的重算，滑鼠沒動）也看得到同一個事實。
+    this._overAnchor = !!overAnchor;
 
+    var region = this._resolveMouseRegionAt(tcol, trow);
+
+    this.mouseAction = region.action;
+    this.mouseActionRow = region.row;
+    // setter 會轉呼叫 view.applyCursorHighlight（唯一套用入口）。**只有這裡**
+    // 會寫 nowHighlight，因為 row >= 0 時它等於宣告「滑鼠取得底色優先權」——
+    // 詳見 refreshMouseAction。
+    this.nowHighlight = region.highlightRow;
+
+    this._applyMousePointer(region);
+  },
+
+  // 這一格的滑鼠語意（純查詢，不寫任何狀態）。onMouse_move 與 refreshMouseAction
+  // 共用；兩者的**套用範圍不同**，故刻意分成 resolve / apply 兩段。
+  _resolveMouseRegionAt: function(tcol, trow) {
     // 空列判斷只有列表用得到，其餘畫面不必掃 80 格。
-    var lineEmpty = (this.pageState === 2 || this.pageState === 4) ?
-      this.isLineEmpty(trow) : false;
+    // trow 來自 App.clientToPos，它**不 clamp**（指標移到終端機上／下方時會超出
+    // 0..rows-1），而 refreshMouseAction 每幀都會走到這裡 ⇒ 先擋掉越界，否則
+    // isLineEmpty 會 deref undefined 把整條 notify 炸斷。
+    var lineEmpty =
+      (this.pageState === 2 || this.pageState === 4) &&
+      trow >= 0 && trow < this.rows ?
+        this.isLineEmpty(trow) : false;
 
-    var region = resolveMouseRegion({
+    return resolveMouseRegion({
       pageState: this.pageState,
       col: tcol,
       row: trow,
       rows: this.rows,
+      cols: this.cols,
       lineEmpty: lineEmpty,
+      // 邊緣翻頁區（頂列 Home／底列 End／右緣與文章上下半翻頁），跟著總開關走。
+      edgePaging: !!(
+        this.useMouseBrowsing && this.view && this.view.mouseEdgePaging
+      ),
+      // pageState 1 的兩種畫面在 PTT 端的 Home/End 語意相反，只有看板列表能用
+      // （見 mouse_regions.listEdgeRegion 的註解）。
+      boardList: this.isBoardListScreen(),
       // 防誤觸（可點區＝底色區的起始欄）跟著總開關走，見 resolveMouseGates。
       misclickGuard: !!(
         this.useMouseBrowsing && this.view && this.view.mouseMisclickGuard
@@ -1323,29 +1465,62 @@ TermBuf.prototype = {
       inputPrompt: this.isCursorOnInputField(),
       // 框開著（pressanykey／vmsg／輸入欄）⇒ 整片是「點空白處關框」的目標，
       // 只換指標。**送鍵不在這條路上**（見 App.mouse_click 的說明）。
-      dismiss: this.dismissTarget()
+      dismiss: this.dismissTarget(),
+      // 滑鼠已交給 PTT ⇒ 整個畫面沒有任何我們自己的滑鼠語意（排在最前面的早退）。
+      serverMouse: !!(
+        this.mouseReport.isActive() &&
+        this.view && this.view.mouseServerReport
+      )
     });
+  },
 
-    this.mouseAction = region.action;
-    this.mouseActionRow = region.row;
-    // setter 會轉呼叫 view.applyCursorHighlight（唯一套用入口）。
-    this.nowHighlight = region.highlightRow;
-
-    // 指標圖示與左側提示帶都是「這裡點下去會做什麼」的提示 ⇒ 跟著左鍵開關走，
-    // 與底色（滑鼠移動）各自獨立。
+  // 指標圖示與左側提示帶都是「這裡點下去會做什麼」的提示 ⇒ 跟著左鍵開關走，
+  // 與底色（滑鼠移動）各自獨立。
+  _applyMousePointer: function(region) {
     var affordance =
       !!(this.useMouseBrowsing && this.view && this.view.mouseLeftClick);
     if (this.BBSWin) {
       this.BBSWin.style.cursor = cursorCss(region.cursor, {
-        backUrl: cursorBack,
-        iconsEnabled: affordance
+        urls: MOUSE_CURSOR_URLS,
+        // 邊緣區的圖示不跟 mouseLeftClick（見 mouse_regions.isEdgeCursor）：那個
+        // 區域是另一顆 pref 管的，區域在、提示就要在。
+        iconsEnabled: affordance || isEdgeCursor(region.cursor)
       });
     }
+    // 邊緣翻頁區的提示帶。null ＝收掉；region.hintBand 只有 mouseEdgePaging 開著時
+    // 才可能非 null（resolveMouseRegion 已 gate 過），所以這裡不必再問一次 pref。
+    // 壓在 <a> 上時一律收掉：那顆按鈕／連結才是真正會發生的事（見 App.onMouse_move）。
+    if (this.view && this.view.setEdgeHintBand)
+      this.view.setEdgeHintBand(this._overAnchor ? null : region.hintBand);
     if (this.view && this.view.setExitAffordance) {
       // 用 **cursor** 當單一真相（不逐一列舉 action）：文章與列表／選單的退出帶
       // 是同一個手勢、同一個 back 指標，日後再多一種退出 action 也不會漏列舉。
       this.view.setExitAffordance(affordance && region.cursor === CUR_BACK);
     }
+  },
+
+  // server 重畫之後，用**快取的滑鼠格座標**重算「點下去做什麼」。
+  //
+  // 為什麼需要：notify 的每個 changed 幀都會 clearHighlight()，把 mouseAction 清成
+  // none；而重算原本只由真實 mousemove 觸發（resetMousePos 不在 notify 路徑上）
+  // ⇒ 使用者點掉「請按任意鍵繼續」後指標停在原地不動時，下一次點擊讀到的是 none，
+  // 整個落進 App.onMouse_click 的 `default: //do nothing`。
+  //
+  // **不可以碰 nowHighlight**：它的 setter 在 row >= 0 時會以 'mouse' 為來源呼叫
+  // view.applyCursorHighlight ＝宣告滑鼠取得底色優先權。每個重畫幀都宣告一次的話，
+  // _highlightMover 會永遠是 'mouse'，鍵盤再也搶不回光棒（fddf274 修掉的那個 bug）。
+  // 底色維持原行為：重畫幀由 clearHighlight() 讓出，交回鍵盤游標列。
+  // 守護：tests/unit/term_buf_mouse_refresh.test.js、cursor_highlight_arbitration.test.js。
+  refreshMouseAction: function() {
+    if (!this.useMouseBrowsing) return;
+    // 列表好讀畫的是 ListSession 的虛擬視窗，座標與 server 的真實列不對應
+    // （同 onMouse_move 的守門），一律交給 term_view.onListMouseMove。
+    if (this.listRenderMode === 'buffer' || this.listRenderMode === 'frozen')
+      return;
+    var region = this._resolveMouseRegionAt(this.tempMouseCol, this.tempMouseRow);
+    this.mouseAction = region.action;
+    this.mouseActionRow = region.row;
+    this._applyMousePointer(region);
   },
 
   resetMousePos: function() {
@@ -1370,6 +1545,7 @@ TermBuf.prototype = {
     this.mouseAction = ACT_NONE;
     this.mouseActionRow = -1;
     if (this.view && this.view.setExitAffordance) this.view.setExitAffordance(false);
+    if (this.view && this.view.setEdgeHintBand) this.view.setEdgeHintBand(null);
   }
 };
 

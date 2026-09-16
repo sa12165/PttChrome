@@ -61,6 +61,49 @@ source 裡的 `ANSI_COLOR(...)` 字面。實例見 §9 水球。
   `redrawwin()` 在 pfterm ＝ flippage + clrscr + `fterm_rawclear()` + markdirty。
 - 滾動 |scrollcnt| ≥ t_lines-3 也退化成全屏重繪（screen.c doupdate 開頭；pfterm 有對應的 scroll 最佳化）。
 
+## 1.1 DEC 私有序列（2026-09 新增，全部 CONFIRMED）
+
+PTT 公告 2026-09-08 預告、約 09-20 上線。**server 吐的 DEC 私有序列全集只有下列十條**
+（`grep -rn '"\[?' 3rd_script/pttbbs` 的全部結果）：`?2026h/l`、`?1000h/l`、`?1002h/l`、
+`?1003h/l`、`?1006h/l`。沒有 `?25`（游標顯示）、`?1049`（alt screen）、`?7`（autowrap）。
+
+### Synchronized Output（DEC 2026 / BSU・ESU）
+
+| 事實 | 出處 |
+|---|---|
+| `DEC_SYNC_BEGIN` = `ESC [ ? 2 0 2 6 h`、`DEC_SYNC_END` = `ESC [ ? 2 0 2 6 l`（source 寫成 `ESC_STR "[?2026h"`） | `mbbsd/pfterm.c:53-54`（commit `961c6239`） |
+| 包住**整個 `doupdate()`**：首行 `fterm_rawbegin()`、尾端 `fterm_rawcursor(); fterm_rawend();` | `pfterm.c:817-823, 1074-1075` |
+| **`!ft.dirty` 早退路徑也吐完整 BSU/ESU 對** ⇒ 存在**零內容 sync frame** | `pfterm.c:824-829` |
+| 游標 park 被刻意移進 sync block 內、ESU 之前；`fterm_rawflush()` 從 `rawcursor` 移到 `rawend` ⇒ **每幀 flush 次數不變** | `pfterm.c:2164-2176, 2259-2264` |
+| 登入畫面不送（`do_term_init` 在 `oklogin` 之後） | `mbbsd/mbbsd.c:1548-1554` |
+
+**最重要的一條推論：ESU 不是「一頁」的邊界。**
+`refresh()` 在 mbbsd 被呼叫 51 處，而且 `dogetch()` 每次回去等按鍵前都會再叫一次
+（`mbbsd/io.c:451-452` 的 `while (vbuf_is_empty(pvin)) { refresh(); … }`）⇒ **一個 logical page
+對應多個 `doupdate()`**，而且其中很多是零內容的。ESU 的常態語意是「server 回去等鍵了」。
+⇒ client 可以拿它**擋畫面**（防撕裂），**不可以**拿它當 settle（會把 `command_queue` 的
+expect 餘掉）。本專案的實作見 `term_buf.js#beginSyncUpdate` 與 `docs/easy-reading.md`。
+
+### 滑鼠回報協定（XTerm SGR）
+
+| 事實 | 出處 |
+|---|---|
+| 三種模式的實際字串：CLICK=`?1003l?1000h?1006h`、DRAG=`?1003l?1002h?1006h`、TRACK=`?1003h?1006h`、關閉=`?1000l?1002l?1003l?1006l` | `mbbsd/term.c:79-118`（commit `f0e6df74`） |
+| `term_init()` **無條件**呼叫 `term_enable_mouse(MOUSE_MODE_CLICK)` ⇒ 沒有 `UF_MOUSE` 的人收到**關閉四連** ⇒ **每個 session 都會收到 DEC 序列** | `term.c:136` |
+| `UF_MOUSE`（`0x00004000`）**預設關**，設定項「MOUSE 啟用滑鼠支援」 | `include/uflags.h:22`、`mbbsd/user.c:452-455`（commit `5b41008d`） |
+| 改設定後會重送 | `mbbsd/mbbsd.c:527`、`mbbsd/user.c:552` |
+| 入站解析**只認 SGR**（`csi_prefix == '<'`），且**不看 `UF_MOUSE`** ⇒ 只要 client 送，server 一定當按鍵收 | `common/sys/vtkbd.c:299-326` |
+| `KEY_MOUSE`(0x0501) **目前沒有任何消費者**；只有 `KEY_MOUSE_RELEASE` 在 `io.c:262` 被丟成 `KEY_INCOMPLETE` | `include/vtkbd.h:130-131` |
+| 任何非 `KEY_INCOMPLETE` 的鍵會更新 `currutmp->lastact` ⇒ **若實作 1003 motion 回報，使用者永不 idle** | `mbbsd/io.c:231-240` |
+
+⇒ client 實作回報時的三條：預設關、只實作 1000+1006（**不送 motion**）、
+`sgr` 初值必須是 false。實作見 `src/js/mouse_report.js`。
+
+### 連線底層換 NIOS
+
+`68fc0976 refactor(io): Unify io.c and nios.c` —— **純 server 端 I/O 重構，無 wire 協定改變**，
+只有時序／緩衝特性可能不同。client 無需針對它做任何事。
+
 ## 2. 時序不變量 → client 三推論
 
 | 不變量 | 出處 |
@@ -166,6 +209,27 @@ entry 列欄位（`readdoent`，`mbbsd/bbs.c`）——逐欄依 printf 序列推
 指紋** `comment_parse#isListShapedRow` —— 就是本節說的「要再問指紋」。細節見
 `docs/enhanced-addon.md` 踩坑 A。
 
+**沿用的另一面：子選單根本沒有分支可命中（2026-09-11 修，CONFIRMED 讀碼）**。`setPageState` 判 MENU
+只有兩條路——row0 開頭是 `【主功能表】`/`【分類看板】`/`【精華文章】`，或 `parseListRow(末列)`。而
+`menu.c#domenu` 開出來的子選單 row0 是各自的標題（`(X)yz 系統資訊區`＝`【工具程式】`、
+`(U)ser 個人設定區` 等同理），**只剩 `parseListRow` 這一條**。它的 regex 從 fork 以來比對的是
+`[%d/%d 星期XX %d:%02d] … [呼叫器]%s` —— **那個格式 pttbbs 史上不存在**
+（`git -C 3rd_script/pttbbs log -S'星期' -- mbbsd/menu.c` 零筆；`str_pager_modes` 第二項也不是「打開」
+而是「開啟」）⇒ 恆為 false 的死碼 ⇒ **所有子選單的 `pageState` 都是從主功能表繼承來的**。
+兩個使用者可見的症狀（錄製檔 `ptt-debug-20260910-171017`）：
+
+- 子選單 →「查看系統資訊」（`pressanykey` ⇒ 5）→ 關框回子選單 ⇒ **黏在 5** ⇒
+  `resolveMouseRegion` 的 `switch` 走 `default` ⇒ 滑鼠瀏覽整個失效（實錄：重畫後 9.6 秒的
+  `send` 快照仍是 5），要走到判得出來的畫面才恢復。
+- 讀完一篇按 `←` 回子選單（黏在 3）再開下一篇 ⇒ settled edge 是 `3→3`，不在
+  `nextEasyReadingState` 的來源集 `{1,2}` ⇒ 好讀「有時」不自動啟用。
+
+修法是把 `parseListRow` 校準回真實的 `show_status`（**不是**加 reset 分支，沿用仍然是刻意的）。
+守護：`tests/unit/term_buf_page_state.test.js`、`tests/unit/string_util.test.js`。
+**這一輪真正的教訓是測試面的**：當時的 unit fixture 是照著同一個錯誤假設手寫的，於是
+「程式錯 ＋ 測試錯」互相背書，一條恆假的指紋全綠躺了很久。**畫面指紋的 fixture 一律要來自
+pttbbs source 或線上實測位元組，不可與被測程式共用同一個假設。**
+
 ## 6. `\f`（Ctrl+L）確定性交易依據（v5 新增，全部 CONFIRMED）
 
 - **igetch 全域熱鍵**：`Ctrl('L')` → `redrawwin()+refresh()` 後 `continue`（`mbbsd/io.c` igetch switch）——`\f` 永不回傳給呼叫者，等同「插入一幀全幅重繪」。`vkey()`＝`igetch()`（io.c `vkey`），故**所有走 vkey 的輸入點都吃這條**。
@@ -222,6 +286,17 @@ Read()  bbs.c:4640-4657
   if (mr != READ_NEXT) pressanykey();  ← bbs.c:4654 ★「按任意鍵繼續」那張畫面
   i_read(...)                          → 文章列表
 ```
+
+**進板時這張畫面「有時候有、有時候沒有」是 by design**（CONFIRMED @ `bbs.c:23/4646/4657`）：
+gate 是 `currbid != bnote_lastbid`，而 `bnote_lastbid` 是**行程內的 static cache**
+（`static int bnote_lastbid = -1`，只在 `b_notes` 編輯進板畫面時 `bbs.c:4053` 重設成 -1）
+⇒ **同一連線第二次進同一個板就不再顯示**，直接落在文章列表。
+⇒ client 端「開板之後畫面會是什麼」**不可以假設是文章列表**：第一次進是
+`pmore` 的進板畫面或「請按任意鍵繼續」，第二次進才是文章列表。看板列表平滑捲動
+就踩過這個坑（守門寫成「落點是文章列表才保留緩衝」⇒ 手測時好時壞，
+見 `docs/board-list-smooth-scroll.md` §4.3 別名守門）。分類看板的**群組看板**
+（`BRD_GROUPBOARD`）遞迴進另一份 `choose_board` 之前也跑同一段
+（`board.c:1992-1998`，gate 換成 `time4_lt(now, bupdate)`）。
 
 `(b)進板畫面` 走 `read_comms[]` 的 `{ 0, b_notes }`（`bbs.c:4601`），`b_notes` 是同一段
 （`bbs.c:4061-4081`，`mr==-1` 時另印「本看板尚無進板畫面。」）。
@@ -314,7 +389,7 @@ Read()  bbs.c:4640-4657
 | client | 官方出處 | 契約 |
 |---|---|---|
 | `parseStatusRow` | `pmore.c#mf_display_footer` ＋ `more.c#common_pmore_footer_handler` | part1 `"  瀏覽 第 %1d[/%1d] 頁 (%3d%%) "`（頁碼**無位數上限**，實錄已見 540/540）；part2 `" 目前顯示: 第 %02d~%02d 行"`／**`" 顯示範圍: %d~%d 欄位, %02d~%02d 行"`（`mf.xpos>0` 左右捲動）**；**part3 完全不比對**——它會整段消失（見 §13 P5），要求它會讓整列失配 → 掉出 pageState 3 → 好讀累積頁被清空。`bpref.oldstatusbar` 的 `"  瀏覽 P.%d(%d%%)  "` 目前**不支援**（非預設） |
-| `parseListRow` | `menu.c#show_status` | `"[%d/%d 星期XX %d:%02d]"` ＋ `"%-14s"`（today_is，**緊接 `]` 無空格**）＋ `" 線上%d人, 我是%s"` ＋ `"\t[呼叫器]%s "`；呼叫器狀態 5 種＝`var.c#str_pager_modes`：關閉／打開／拔掉／防水／好友 |
+| `parseListRow` | `menu.c:302-322#show_status` | `"%d/%d周%c%c %d:%02d"`（`myweek="日一二三四五六"`，**沒有中括號、沒有「星期」**）＋ `"%-14s"`（today_is，緊接時間，補的是**位元組**寬度）＋ `" 線上%d人,我是%s,呼叫器%s"`（**半形逗號、前後無空格**）＋ `"\t(h)說明"`（靠右，**不比對**）；呼叫器狀態 5 種＝`var.c:118-125#str_pager_modes`：關閉／**開啟**／拔掉／防水／好友。**這是 `menu.c#domenu` 子選單唯一的指紋**（見下方踩坑） |
 | `parseWaterball` | `mbbsd.c#show_call_in` | 見 §9 |
 | `parsePushInitText`（消費者：`image_upload.js`） | `bbs.c#recommend`／`angel.c` | `您覺得這篇文章 `；`FormatCommentString` 的輸入 prompt「→ id:」**無行尾時間戳** |
 | `comment_parse.COMMENT_RE` | `comments.c#FormatCommentString`＋`common/bbs/names.c#is_validuserid` | `<attr><推/噓/→><空格>ESC[33m<id>ESC[m:<msg 補到 maxlength>ESC[m<tail>`；id 長度 **2..IDLEN(12)**、首 isalpha 其餘 isalnum；`BRD_ALIGNEDCMT` 時 id 以 `%-*s` 補到 12 寬（故 `:` 前可有空格）；tail＝`[%15s ]MM/DD HH:MM`（`Cdate_mdHM` ＝ `"%m/%d %H:%M"`，IP 僅 `BRD_IPLOGRECMD`／guest） |
@@ -486,6 +561,17 @@ PTT 私有 commit，不在公開 repo）。**觸發門檻無從得知**，但**�
 | 4 | 確認列 …` 確定[y/N]:`（"確定"前的空格是格式的一部分） | `y\r`。`sizeof(ans)==2` ⇒ 只吃一個字元，原始碼的 `:w`／`zz` 分支**打不進去**（死碼） |
 | 5 | 寫檔 → `return FULLUPDATE` | — |
 
+**所有擋人判斷都在步驟 3 的 `getdata` 之前完成**（`bbs.c:2845-2941`：`BRD_NORECOMMEND`／
+`CheckPostPerm2`／guest／`BN_ONLY_OP_CAN_ADD_COMMENT`／已刪除文／`get_board_restriction_reason`／
+`BRD_NOFASTRECMD`／同分鐘 >60 則／檔案過大／`check_cooldown`），一律 `vmsg` ＋
+`return FULLUPDATE` ⇒ **送一個 X 就問得到「這篇推不推得了」**，而且答案是 PTT 自己的字。
+兩個讓「白按一次」成立的事實：`lastrecommend = now` 只在**成功寫檔後**才更新
+（`bbs.c:3144`），`check_cooldown()` 唯讀（`bbs.c:4344`）⇒ 按了 X 再 Ctrl-C 取消，
+不會害下一次被降級成 → 或被冷卻擋下。唯一的足跡是 `recommend_in_minute++`
+（`bbs.c:2909`，在檢查之前遞增，上限 60/分鐘）。
+消費端：`src/js/long_push_session.js#startPreflight`，設計見 `docs/long-push.md`
+「探路（preflight）」。
+
 **1a / 1b / 1c 是 `if / else if / else` 互斥**：client 必須讀畫面才知道要不要送型別鍵。
 在 1b/1c 送 `1` ⇒ 那個 1 直接變成推文內容。**第 2 則起 90 秒內一定走 1c**（板主
 `MODE_BOARD` 除外），這是連續推文最容易炸的地方。
@@ -648,7 +734,7 @@ server 送的是編碼後的 ANSI，client 看不到 flag，只看得到結果�
 | P5 | footer part3 **會整段不印**，兩層來源：`mf_display_footer` 印完 part2 後 `if (avail <= 0) return;`（連 footer_handler 都不呼叫）；`common_pmore_footer_handler` 最後 `else while (width-- > w) outc(' ');`（連 VERYSHORT 都塞不下）。觸發條件＝part1+part2 太寬（多位數頁碼／六位數行號／xpos 的「顯示範圍」分支） | `pmore.c#mf_display_footer`、`more.c`(461) |
 | P6 | 每次回應結尾游標 park 在 `(rows-1, cols-1)`；footer 是 **per-cell patch**（實錄 `ESC[24;11H3 ESC[24;37H44~66 ESC[24;80H`）⇒ **半畫幀的 footer 是上一頁的舊值**，游標也還沒 park | `pfterm.c#fterm_rawcursor`(2144)、`tests/e2e/cassettes/stock-end.json` step2 |
 | P7 | **goto-line 是確定性的絕對定位**：`:` → `pageMode = (ch != ':') == 0` → `getdata_buf(b_lines-1, 0, PMORE_MSG_GOTO_LINE「跳至第幾行: 」, buf, 8, DOECHO)` → `i = atoi(buf)` → `if (i-- > 0) mf_goto(i)` → `mf.disps = mf.start; mf.lineno = 0; mf_forward(N-1)` ⇒ 送 `:N\r` 後 **footer 的 `S` 恰為 N**（超過末頁被 `maxdisps` 夾住只會更小）。`;` 與 `1`-`9` 走**頁**模式。輸入緩衝 **8 bytes**。prompt 期間底部列是 `跳至第幾行: `，**不匹配 footer 格式** | `pmore.c` goto 區塊（`case '1'..'9'/';'/':'`）、`mf_goto`(1067)、`PMORE_MSG_GOTO_LINE`(147) |
-| P8 | **畫面沒變就零 bytes**：`refresh` 走 `doupdate` 逐 cell diff，結尾 `fterm_rawcursor` → `fterm_rawmove_opt`（已在該位置則不輸出）⇒ **已在第 1 行時再送 Home（`mf_goTop`）可能完全沒有回應**。任何以 Home 當 request/response 交易的路徑都要先確認 `S > 1` | `pfterm.c#doupdate`／`fterm_rawmove_opt`、`mf_goTop`(1046) |
+| P8 | **畫面沒變就零「畫面回應」**：`refresh` 走 `doupdate` 逐 cell diff，結尾 `fterm_rawcursor` → `fterm_rawmove_opt`（已在該位置則不輸出）⇒ **已在第 1 行時再送 Home（`mf_goTop`）可能完全沒有回應**。任何以 Home 當 request/response 交易的路徑都要先確認 `S > 1`。**2026-09 修訂：不再是「零 bytes」** —— DEC 2026 同步輸出讓每個 `doupdate()` 都吐一對 `ESC[?2026h/l`（連 `!ft.dirty` 早退路徑也吐，見 §1.1）⇒ 線上固定 16 bytes。但那兩條序列在 client 端不寫任何一格、不動游標 ⇒ **不 re-arm settle timer**，所以所有建立在這條上的 client 推論（「零回應只能等 timeout」⇒ `fullRepaint: true` 附 `\f`）**結論不變**。判準要改用「有沒有 settle」而不是「有沒有 byte」 | `pfterm.c#doupdate`／`fterm_rawmove_opt`、`mf_goTop`(1046)；§1.1 |
 
 client 端推論（改這段 code 前先讀）：
 
@@ -775,3 +861,161 @@ underline** ⇒ reverse 更早就被攤平成 fg/bg 互換），所以擦除條�
   停在置底列**之前**。要「跳到末頁」就該用原生 End。
 - **游標已經在落點上時 PTT 一個 byte 都不送**（live-tested）。這正是舊 client 繞去跳號的理由，
   現在由 §6 的 `\f` 解決：交易送「鍵 ＋ Ctrl-L」，igetch 的全域熱鍵保證回一個完整幀。
+
+## 11.7 吃「真游標那一列」的 Ctrl 鍵（2026-09-13 CONFIRMED @ read.c / board.c）
+
+列表好讀的本地導覽（T1）是零網路的，**server 的真實游標長期落後選取**（通常停在背景
+prefetch 的落點）。所以任何「對游標所在那一列動作」的鍵，代送前一定要先跑
+`native-sync-jump` 腿。判準是**這個鍵會不會吃真游標**，不是「它是不是 Ctrl」——
+下面這張表就是查詢入口，新增鍵時先在這裡對一次，別靠猜。
+
+### 文章列表（`mbbsd/read.c#i_read_key`）
+
+| 鍵 | 行 | 實作 | 吃真游標？ |
+|---|---|---|---|
+| `Ctrl-Q` | :904 | `my_query(headers[locmem->crs_ln - locmem->top_ln].owner)` | **是**（查詢作者） |
+| `Ctrl-S` | :911 | `getuser(headers[crs_ln - top_ln].owner, &muser)` | **是**（使用者設定，需 `PERM_ACCOUNTS`） |
+| `Ctrl-T` | :957 | `TagThread(currdirect)`（註解自承 copy from `case 't'`） | **是** |
+| `Ctrl-D` | :970 | `TagPruner(bid)`；`MODE_SELECT` 下拒絕 | **是** |
+| `Ctrl-C` | :950 | `ClearTagList()`（全域） | 否，但 FULLUPDATE 只重畫當前頁 ⇒ 緩衝其他頁 tag 殘留，歸 T3-B |
+| `Ctrl-F` / `Ctrl-B` | :880 / :886 | 翻頁同義鍵 | 否（刻意不納白名單，維持與瀏覽器快捷鍵的分界） |
+
+### 看板列表（`mbbsd/board.c`）
+
+| 鍵 | 行 | 實作 | 吃真游標？ |
+|---|---|---|---|
+| `Ctrl-S` | :1890 | 看板設定 | **是** |
+| `Ctrl-T` | :2044 | `fav_remove_all_tag()` | 否（sync 無害，照走同一條序列） |
+| `Ctrl-W` | :1731 | `whereami()` | 否 |
+| `Ctrl-P` | :2050 | `paste_taged_brds(class_bid)` | 否 |
+
+### 連帶：Alt remap
+
+`Alt+A~Z` 是**本 app 自己造的送鍵入口**，送出的 byte 與 `Ctrl+A~Z` 完全相同
+（§11.8）⇒ 語意上與上表同一格。`Alt+T` 在文章列表就是 `read.c:957` 的 `Ctrl('T')`。
+
+**代送路徑與是哪個 byte 無關**：`list_session._beginPassthroughBytes` /
+`board_list_session._beginPassthroughBytes` 一律先比 `_selectedNum !== _serverNum`
+再決定要不要排 sync 腿 ⇒ 26 個字母全部自動享有。**上面兩張表是查詢入口（「為什麼
+需要 sync」），不是白名單，新增鍵不需要動它。**
+
+**2026-09-13 之前這兩類鍵都跳過 sync 腿**（症狀：搜尋作者後按 `Ctrl-Q` 查到別人，按 `←`
+退出後選取也跟著跑掉）。根因、守則與守護測試見 `docs/easy-reading-list.md` 不變量 12。
+
+---
+
+## 11.8 Alt 當 Ctrl：全字母 remap 的依據（2026-09-15 CONFIRMED）
+
+`Alt`（macOS 的 `Option`）＝ PTT 的 `Ctrl`，涵蓋 26 個字母。不變量：
+
+> **`Alt+<letter>` 送出的 byte 與 `Ctrl+<letter>` 逐位元相同；差別只在誰先接手。**
+> Alt **繞過 app 自己的 UI 快捷鍵**（複製／全選／貼上 —— OS 另有入口），
+> 但**不繞過**「app 代替 PTT 管狀態」的模擬（好讀的 `^F`/`^B`/`^H`，見下）。
+
+動機：macOS 上好幾顆 `Ctrl` 組合根本按不出來（Cocoa 文字系統把 `Ctrl-Y` 綁成 yank、
+`Ctrl-A`/`Ctrl-E` 綁成行首行尾），逐顆救火沒有盡頭。實作：`src/js/term_keyboard.js` 的
+`ALT_REMAP_LETTERS` / `isAltRemapEvent`。
+
+### 為什麼協定上安全
+
+`common/sys/vtkbd.c` 的解析器只認三類輸入：裸 ASCII 控制碼（`vtkbd.h:81`
+`Ctrl(c) = c & 0x1F`）、`ESC [ …`（CSI）、`ESC O …`（SS3）。
+
+* **沒有任何 modifier 語意**：`ESC[1;5A`（Ctrl+方向鍵）的 modifier 參數被直接丟棄，
+  只當普通 `KEY_UP`（`vtkbd.c:336-340`，註解自承）。
+* 唯一的 **ESC-prefix（Meta）語意在 `mbbsd/edit.c`**（`io.c:318-320` 把第二個 byte
+  塞進全域 `KEY_ESC_arg`，只有 `edit.c:3679/3761/3790` 讀它）：`ESC X` ＝ 存檔離開、
+  `ESC q` ＝ 不存檔離開等 Emacs 風 Meta 命令。
+* **本 client 從不送 ESC-prefix** ⇒ Alt→Ctrl 撞不到任何既有解析。
+
+⇒ **反過來才危險**：若讓 Alt 走終端機慣例送 `ESC + 字元`，在編輯器裡會直接命中
+edit.c 的 Meta 表，其他畫面則是「裸 ESC 沒有 timeout，會把使用者的下一個按鍵吃掉」
+（`vtkbd.c:145-160` 進 `VKSTATE_ESC` 後一律等下一個 byte）。**不要這樣做。**
+
+### 控制碼別名（這幾顆的 `^X` 形式另有身分）
+
+| byte | 別名 | PTT 端 | source |
+|---|---|---|---|
+| `^H` 0x08 | Backspace | 文章：上一頁／`READ_PREV`；列表：`select_read(RS_NEWPOST)` | `pmore.c:2678`、`read.c:775` |
+| `^I` 0x09 | Tab | `board_digest`（精華區） | `bbs.c#read_comms` |
+| `^J` 0x0A | LF | **整個被忽略**（`return KEY_INCOMPLETE`） | `io.c:327`、`vtkbd.h:87` |
+| `^L` 0x0C | FF | `redrawwin()`；也是本 app 的 `fullRepaint` byte（§6） | `read.c:770`、`io.c:242-248` |
+| `^M` 0x0D | CR | `KEY_ENTER`（開文／送出） | `vtkbd.h:86,88`、`read.c:987` |
+
+`^J` 是零 byte 零 settle ⇒ 靠 `_beginPassthroughBytes` 尾附的 `\f` 才不會空等 3s
+timeout。這正是該機制存在的理由，**不需要為它做特例**。
+
+### 「系統 > 我們」怎麼達成：零黑名單
+
+**不維護瀏覽器快捷鍵表、不做平台偵測。** 靠一個事實：瀏覽器**保留**的快捷鍵根本不會
+把 keydown 送到頁面，收不到就不會 remap。規則因此簡化成「收得到的 Alt+字母就 remap」。
+
+例外只有一種：**收得到 keydown、但 `preventDefault` 之後瀏覽器仍有動作**（雙重觸發）。
+那種字母才進 `term_keyboard.js` 的 `ALT_REMAP_EXCLUDE`。
+
+量測頁：`tools/alt-key-probe.html`（dev-only，`yarn start` 後用**自己的**瀏覽器開
+`/tools/alt-key-probe.html`）。**Playwright 量不到**：CDP 的 `Input.dispatchKeyEvent`
+不經過 browser chrome 的快捷鍵分派，量到的永遠是「都收得到、preventDefault 都有效」
+的假綠。頁面跑**兩趟**（Pass 1 不攔＝這顆原本會發生什麼；Pass 2 攔＝還會不會發生），
+沒有 Pass 1 就分不出「preventDefault 有效」與「這顆本來就沒快捷鍵」。
+
+#### 量測結論
+
+| 環境 | 狀態 | 雙重觸發的字母 |
+|---|---|---|
+| Chrome 152 / Windows 10 | **已量**（2026-09-14） | 無 |
+| Firefox / Windows | **未量** | — |
+| Chrome・Safari / macOS | **未量**（需要一台 Mac） | — |
+
+現值：`ALT_REMAP_EXCLUDE = ''`（零排除表）。**改它必須同步更新這張表。**
+
+**Chrome / Windows 的完整結果**：26 個字母 `keydown` **全部到得了頁面**，`e.key` 都是
+小寫字母、`e.code` 都是 `Key<L>`、`keyCode` 都是 65–90，**零組字事件**，Pass 2 全部
+`否`（preventDefault 攔得住）。
+
+⚠️ **但「零排除表」不等於「Chrome 沒用到 Alt」，這個區別很重要**：
+
+* **`Alt+D` / `Alt+E` / `Alt+F` 的 Pass 1 是「有反應」**（網址列／選單），也就是它們屬於
+  **可覆寫**快捷鍵 —— 頁面先收到、不攔才輪到瀏覽器。我們攔下來 ⇒ 這三顆在本站被
+  PTT 拿走（`^D` TagPruner、`^E` manage_post、`^F` 下頁）。**這是使用者 2026-09-15
+  明確拍板的取捨**（「全部 26 個字母」＋「Alt+D 照常 remap」），不是量測結果自然導出的。
+  要還給瀏覽器就把字母加進 `ALT_REMAP_EXCLUDE`。
+* 其餘 23 顆 Pass 1「無」＝ Chrome 本來就沒綁，攔不攔都一樣。
+* **「瀏覽器保留、頁面收不到 keydown」那一類在 Chrome/Windows 的 Alt+字母裡一個都沒有**
+  （`Ctrl+T`/`Ctrl+N`/`Ctrl+W` 那種保留鍵是 Ctrl 組合，不在本表範圍）。所以「系統 > 我們」
+  在這個環境其實是靠**我們選擇不攔**來達成的，不是靠事件收不到。換到 Firefox
+  （`Alt+F/E/V/S/B/T/H` 是選單存取鍵）結論可能不同，量了才知道。
+
+### macOS 的 dead key（未實證，靠三道防線死守）
+
+`Option` 是**組字修飾鍵**：US 佈局的 `⌥E`/`⌥I`/`⌥N`/`⌥U` 是組合重音的 dead key，
+Chrome 對它們的 keydown 回報 **keyCode 229**（Firefox 有時是 0）—— 與真 IME 組字一模
+一樣的訊號。`term_view` 的入口守門本來看到 229 就丟掉，會同時壞兩件事：
+
+1. `Alt+E/I/N/U` 變啞巴鍵；
+2. 沒有人跑到 `preventDefault` ⇒ 組字照開，`é/î/ñ/ü` 從 `compositionend` →
+   `onInput` → `onTextInput` → `_convSend` **漏進 PTT**。
+
+三道防線（`src/js/term_view.js`）：`acceptsKeyEvent` 對 Alt remap 開 229/0 例外、
+`onCompositionStart` 不設 `isComposition`、`onInput` 不放行。後兩道用**時間窗**
+（`ALT_COMPOSITION_SUPPRESS_MS`）而非一次性旗標 —— 組字事件不保證會來（Windows 上
+根本不來），旗標沒有正確的清除時機。守護 `tests/unit/term_view_alt_composition.test.js`。
+
+`e.key` 在 mac 上全部失真，唯一還原得了的欄位是 `e.code`。四種形態（`altRemapCharCode`
+的註解有完整清單）：組字輸出（`⌥V` → `√`）、dead key（`e.key === 'Dead'`）、
+`'ß'.toUpperCase() === 'SS'`（長度 2）、`'µ'.toUpperCase()` 是希臘大寫 `Μ` 不是 ASCII `M`。
+
+### 不做 parity 的例外：好讀模式的 `^F`/`^B`/`^H`
+
+這三顆**不裸送給 server**。`pmore.c:2564/2573/2678` 的 `Ctrl('F')/Ctrl('B')/Ctrl('H')`
+直接移動 pmore 的頁指標，而好讀模式的狀態機自己在驅動 PageDown 累積長頁 ⇒ 裸送會讓
+server 的頁指標被移走而長頁不知道（症狀：翻頁跳格／重複段落）。Ctrl 版與 Alt 版一律由
+`easy_reading.ctrlLetterOf` 收到同一條本地模擬。
+
+### 不在範圍內
+
+* **符號鍵**（`[ ] \ @ ^ _ ?`）：`CtrlShiftMap` 對它們有 upstream keyCode bug（送
+  219/220/221 而非 27/28/29，見 `docs/handoff/ctrl-punct-keycode-map.md`），且 mac 的
+  `⌥[` 也是組字鍵、要擴 `e.code` 比對到 `BracketLeft` 等，複雜度高一階。
+* **AltGr**（Windows US-International ＝ `ctrlKey+altKey`）：被 `!ctrlKey` 排除，打出的
+  字元仍走 keypress → `#t` → `onInput`。守護在 `tests/unit/alt_ctrl_remap.test.js`。

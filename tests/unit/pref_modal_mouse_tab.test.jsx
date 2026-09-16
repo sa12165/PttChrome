@@ -108,8 +108,10 @@ describe("設定頁：滑鼠分頁", () => {
       "mouseBrowsingHighlight",
       "mouseLeftClick",
       "mouseMisclickGuard",
+      "mouseEdgePaging",
       "mouseFunctionKeys",
       "mouseWheelSmoothScroll",
+      "mouseServerReport",
     ].forEach((name) => expect(field(panel, name)).toBeTruthy());
     // Mantine Select 的 input 沒有 name，用 legend 驗欄位在場。
     expect(panel.textContent).toContain(i18n("options_mouseMiddleClick"));
@@ -123,6 +125,8 @@ describe("設定頁：滑鼠分頁", () => {
     expect(field(panel, "mouseLeftClick")).toBeChecked();
     expect(field(panel, "mouseMisclickGuard")).toBeChecked();
     expect(field(panel, "mouseFunctionKeys")).toBeChecked();
+    expect(field(panel, "mouseEdgePaging")).toBeChecked();
+    expect(DEFAULT_PREFS.mouseEdgePaging).toBe(true);
     expect(DEFAULT_PREFS.mouseMisclickGuard).toBe(true);
     expect(DEFAULT_PREFS.mouseFunctionKeys).toBe(true);
     expect(DEFAULT_PREFS.useMouseBrowsing).toBe(true);
@@ -131,6 +135,9 @@ describe("設定頁：滑鼠分頁", () => {
     // 平滑捲動預設開（新 key ⇒ 既有使用者也吃得到這個預設）
     expect(field(panel, "mouseWheelSmoothScroll")).toBeChecked();
     expect(DEFAULT_PREFS.mouseWheelSmoothScroll).toBe(true);
+    // 把滑鼠交給 PTT：**預設關**（理由見 pref_storage.js）。
+    expect(field(panel, "mouseServerReport")).not.toBeChecked();
+    expect(DEFAULT_PREFS.mouseServerReport).toBe(false);
   });
 
   test("總開關關閉 → 每一個子項都 disabled（含中鍵與滾輪）", () => {
@@ -140,6 +147,8 @@ describe("設定頁：滑鼠分頁", () => {
     expect(field(panel, "mouseLeftClick")).toBeDisabled();
     expect(field(panel, "mouseMisclickGuard")).toBeDisabled();
     expect(field(panel, "mouseFunctionKeys")).toBeDisabled();
+    expect(field(panel, "mouseEdgePaging")).toBeDisabled();
+    expect(field(panel, "mouseServerReport")).toBeDisabled();
     panel
       .querySelectorAll("input[readonly], input[aria-haspopup='listbox']")
       .forEach((el) => expect(el).toBeDisabled());
@@ -170,6 +179,13 @@ describe("設定頁：滑鼠分頁", () => {
     fireEvent.click(field(panel, "mouseFunctionKeys"));
     closeModal();
     expect(readValuesWithDefault().mouseFunctionKeys).toBe(false);
+  });
+
+  test("關掉邊緣點擊翻頁 → 寫進 pref", () => {
+    const panel = openMouseTab();
+    fireEvent.click(field(panel, "mouseEdgePaging"));
+    closeModal();
+    expect(readValuesWithDefault().mouseEdgePaging).toBe(false);
   });
 
   test("關掉總開關 → 寫進 pref（子項的值原樣保留，重開就回到先前的組合）", () => {

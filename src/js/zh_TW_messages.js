@@ -165,11 +165,59 @@
   "longPushProgress_note": {
     "message": "取消只會停掉還沒送出的部分，已送出的推文無法收回。"
   },
+  "longPushProgress_preflight": {
+    "message": "正在向 PTT 確認能不能推文…"
+  },
+  "longPushModal_preflightCooldown": {
+    "message": "PTT 目前在推文冷卻中（大約還要 #s# 秒）。可以先打字，送出時會自動等待。"
+  },
+  "longPushModal_preflightArrow": {
+    "message": "PTT 已經決定這次推文改用 → 加註（你是作者本人，或 90 秒內推過文），選哪個類型都一樣。"
+  },
+  "longPushModal_preflightNoBoo": {
+    "message": "本板禁止噓文。"
+  },
+  "longPushError_title": {
+    "message": "無法推文"
+  },
+  "longPushError_titleSending": {
+    "message": "長推文中止"
+  },
+  "longPushError_titleCancelled": {
+    "message": "長推文已取消"
+  },
+  "longPushError_sourcePtt": {
+    "message": "以上訊息由 PTT 回報（原文照錄）"
+  },
+  "longPushError_sourceClient": {
+    "message": "以上是本程式的判斷，不是 PTT 的原文"
+  },
+  "longPushError_reason": {
+    "message": "技術原因：#r#"
+  },
+  "longPushError_sent": {
+    "message": "已送出 #n# 則。"
+  },
+  "longPushError_sentNone": {
+    "message": "一則都還沒送出。"
+  },
+  "longPushError_noRecall": {
+    "message": "已送出的推文無法收回。"
+  },
+  "longPushError_restLabel": {
+    "message": "尚未送出的內容"
+  },
+  "longPushError_copyRest": {
+    "message": "複製剩餘內容"
+  },
+  "longPushError_close": {
+    "message": "關閉"
+  },
+  "longPushError_busy": {
+    "message": "目前正在處理另一個操作，請稍候。"
+  },
   "longPushProgress_cancel": {
     "message": "取消"
-  },
-  "longPush_notArticle": {
-    "message": "請先進入文章畫面再用長推文"
   },
 
   "options_contextMenu": {
@@ -184,6 +232,12 @@
   "options_enableLongPush": {
     "message": "顯示「長推文一鍵發送」（自動分段依序推文）"
   },
+  "options_pushKeyOpensLongPush": {
+    "message": "在文章裡按 X／% 推文時，改開「長推文一鍵發送」"
+  },
+  "tooltip_pushKeyOpensLongPush": {
+    "message": "關閉後按 X 會回到 PTT 原生的單則推文。文章列表按 X 一律維持原生。"
+  },
 
   // options nav
   "options_general": {
@@ -197,6 +251,20 @@
   },
   "options_backup": {
     "message": "設定備份"
+  },
+
+  // settings search (設定頁左欄搜尋框；與下面的 quick search 無關，勿混用)
+  "options_settingsSearchLabel": {
+    "message": "搜尋設定"
+  },
+  "options_settingsSearchPlaceholder": {
+    "message": "搜尋設定…"
+  },
+  "options_settingsSearchEmpty": {
+    "message": "找不到符合的設定"
+  },
+  "options_settingsSearchHintKey": {
+    "message": "比對英文名稱"
   },
 
   // quick search (context menu)
@@ -301,6 +369,12 @@
   },
   "mergeImageCaptionAi_pending": {
     "message": "AI 校正中…剩"
+  },
+  "imageGray_on": {
+    "message": "轉成灰階（便於以圖找圖）"
+  },
+  "imageGray_off": {
+    "message": "還原色彩"
   },
   "lightsOn_on": {
     "message": "開燈（顯示隱藏文字）"
@@ -581,7 +655,7 @@
     "message": "點此後按任意鍵設定 (預設 F2)"
   },
   "options_endTurnsOnLiveUpdate": {
-    "message": "END 啟用推文即時更新 (如 Alt + r)"
+    "message": "END 啟用推文即時更新"
   },
   "options_connection": {
     "message": "連線"
@@ -661,6 +735,9 @@
   "options_termSize": {
     "message": "BBS 終端機大小"
   },
+  "tooltip_termSize": {
+    "message": "固定終端機大小：由你指定畫面的寬高 (欄數／列數)，字體自動放大縮小來填滿視窗。固定字體大小：字體維持設定值，列數改由視窗高度換算 (欄數固定 80，PTT 的內容本來就只有 80 欄寬)，視窗越高一頁看到越多列。注意：變更大小後 PTT 不會立刻重畫，要等下次換頁 (翻頁或重新進入看板) 才會填滿新增的列。"
+  },
   "options_cols": {
     "message": "寬"
   },
@@ -718,6 +795,15 @@
   "tooltip_mouseMisclickGuard": {
     "message": "開啟：列表只有點標題欄才會開文（點日期或作者欄沒反應），文章裡只有點推文的內容文字才會高亮同一個推文者 —— 左側因此空出來給「點一下離開文章」的提示帶。關閉：整條都能點。游標底色的範圍一律等於可點範圍。"
   },
+  "options_mouseEdgePaging": {
+    "message": "邊緣點擊翻頁"
+  },
+  "options_enableMouseEdgePaging": {
+    "message": "畫面邊緣點擊翻頁／跳第一頁、最後一頁"
+  },
+  "tooltip_mouseEdgePaging": {
+    "message": "列表與看板列表：最上面一列＝第一頁，最下面一列＝最後一頁，右側邊緣上半＝上一頁、下半＝下一頁。文章：上半＝上一頁、下半＝下一頁，最下面一列＝跳到文末（左側仍是離開）。滑鼠移過去時會把該區域框出來。主功能表不適用。"
+  },
   "options_mouseFunctionKeys": {
     "message": "功能鍵可點"
   },
@@ -747,6 +833,12 @@
   },
   "tooltip_mouseBackNav": {
     "message": "把瀏覽器的「上一頁」改成 PTT 的左方向鍵＝退出文章／回上一層。來源包含觸控板兩指左滑（用的是瀏覽器原生的返回手勢，所以返回箭頭、跟手、半途放開取消都跟其他網站一模一樣）、滑鼠側鍵、Alt+← 或 ⌘[、工具列的上一頁按鈕。觸控板手勢能不能用取決於系統設定（macOS：系統設定 → 觸控式軌跡板 → 更多手勢 → 在頁面間滑動）。要真的離開本站請關掉分頁，或在沒有東西可退的畫面連做兩次上一頁。"
+  },
+  "options_mouseServerReport": {
+    "message": "把滑鼠交給 PTT"
+  },
+  "tooltip_mouseServerReport": {
+    "message": "把滑鼠的點擊與滾輪直接回報給 PTT 主機（終端機標準的 XTerm SGR 協定），由 PTT 自己決定點下去要做什麼。開啟後本站自己的滑鼠行為（點標題開文、左側退出、滾輪翻頁、畫面上的功能鍵按鈕）會一併讓位；選取文字、點連結、右鍵選單不受影響。需要先在 PTT 的「個人設定區→設定使用者資料」把 MOUSE（啟用滑鼠支援）打開，主機才會要求回報。預設關閉：PTT 目前還沒有功能真的在使用滑鼠事件，現在開啟等於白白失去本站的滑鼠瀏覽。"
   },
   "options_mouseBrowsing": {
     "message": "滑鼠瀏覽"

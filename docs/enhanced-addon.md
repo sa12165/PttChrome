@@ -121,6 +121,15 @@
 - 懸掛縮排：`main.css` 給 bbsrow `padding-left: var(--merged-comment-indent)`，首則 bbsline 再以
   **負 `margin-left`** 拉回 0 欄；變數由 `render/screen.js` 依 `contentStart × forceWidth/2` inline 指定。
   **勿用 `text-indent`**——每則各自是 bbsline span，text-indent 會繼承下去把每行都往左拉。
+  - **縮排只管文字：`.inlinePreviewSlot` 以等量負 `margin-left` 豁免**（2026-09 使用者回報）。
+    自動開圖的佔位盒住在**同一個 bbsrow 裡**且是區塊盒 ⇒ 不豁免的話 containing block 先被
+    縮排扣掉一截：一般態 `margin:0.5em auto` 在變窄的盒子裡置中（左緣貼齊作者 id 欄）、
+    放大態 `width:100%` 剛好少一個縮排寬。負 margin 同時拉回左緣並補回寬度
+    （`margin-left + width(auto) = 容器寬`），故**勿改成寫死 width/padding**（字級與視窗寬一變就失準），
+    也**只能寫在 stylesheet**（runtime 改寫 slot 樣式會抑制捲動錨點補償，見
+    `render/inline_preview_slot.js` 檔頭）。與 `padding-left` 那條**成對**，少一條圖就凸出容器左緣。
+    守護：`tests/unit/merged_comment_image_css.test.js`、`comment_merge.offline.spec.js`
+    （「自動開圖不吃懸掛縮排」「放大態…填滿整個塊寬」）。
 - **勿再加回 gap 門檻**（舊 `BREAK_GAP_COLS`，2026-08 已整組拆除）。舊版猜「這則是不是打滿被截斷的續行」
   並把它與下一則串接；反查 pttbbs 證實此判斷**在畫面上無資訊量**：
   | 來源 | 事實 |
@@ -176,6 +185,38 @@
   `tests/unit/comment_spacing_class.test.js`（容器 class 的六種情形，含 **stableRows 缺席 ⇒ 不掛**
   的回歸鎖）、`comment_merge.offline.spec.js`「推文區塊行距」（真幾何：
   `outerGap > innerGap > 0`，關掉即兩者收斂回 0）。
+
+## URL 結尾修剪（`src/js/url_trim.js`）
+**一條純函式、四個消費點**：結尾的句尾標點（`. , ; : ! ?`）與**不成對**的 `) ] }` 屬於句子不屬於 URL。
+
+回報現場（2026-09-10）：
+```
+          支援，(https://vt100.net/emu/ctrlseq_dec.html)，本站
+         (https://docs.frankentui.com/render/synchronized-output)
+```
+兩行的連結都把結尾的 `)` 吃進去。**不可以靠縮字元類解決**：`(` `)` 在 path 裡合法
+（維基百科 `戈黛娃夫人_(歌手)`，反向鎖在 `url_cjk.test.js`），而且同一組 host/path 字元類
+被複製在 **5 處**（`term_buf.uriRegEx`、`url_fix.PATH` 與 `VALID_URI_RE`、`url_cjk.PATH_ASCII`、
+`url_join.URL_CHAR_RE`）—— 所以改成「算出結尾之後再修剪一次」，規則只有一份。
+
+- 規則反覆套用到收斂：右括號只在**剩餘字串裡它比對應左括號多**時才砍（`(https://a/b)` 砍、
+  `https://a/b_(c)` 保留、`https://a/b((c)))` 只砍最外面多出來那一層）；句尾標點無條件砍；
+  永不砍進 `<scheme>://` ＋ 1 個字元（`https://)` 這種退化輸入原樣留著）。引號 `'` `"`
+  **刻意不納入**（path 裡出現引號比句尾引號常見）。
+- 四個消費點：
+  | 檔案 | 位置 | 備註 |
+  |---|---|---|
+  | `term_buf.js` | `updateCharAttr` 的 exec 迴圈，算出 `uriEnd` 之後、**CJK 延伸判定之前** | 縮 `uriEnd` ＝ 縮 `uri[1]` ⇒ `partOfURL`／`endOfURL`／`fullurl` 自動一致。排在 CJK 延伸前是對的：被砍掉的那個 `)` 本來就會讓 `cjkUrlExtension` 的「前導必須是 `/` 或 `=`」守門拒絕延伸 |
+  | `url_cjk.js` | 既有的結尾標點修剪改呼叫共用函式 | 括號平衡只看延伸段自己就夠：`(https://a.com/中文)` 的左括號在 URL 之外 ⇒ 本地不成對、正確砍；`/wiki/(中文)` 兩邊都在段內 ⇒ 平衡、保留 |
+  | `url_fix.js` | `detectFixableUrls` 的 `fixed`，**排在 `fixed === original` 守門之後** | 修剪若排在前面，`(https://a.com/b)` 這種「主偵測器自己就處理得好」的列會因為修剪後不再等於原文而冒出一條重複的 ↳ 修復行。`VALID_URI_RE` 刻意**不動**（它比對的是未修剪的原文字面） |
+  | `url_join.js` | `validateJoined` 先修剪再驗，回傳值多一個 `trimmed` | **呼叫端若自己算了欄位範圍必須跟著縮**：`body_wrap` 的 `parts` 是數格子數出來的，不縮就會底線比 href 長一格（砍到最後一段整段消失時整條候選棄掉） |
+- 連帶修好的下游：同一個 `<a href>` 餵行內圖片預覽、hover 預覽、右鍵「複製文章代碼／deep link」，
+  而 `image_url_detect.RE_IMAGE_EXT` 的 `(?:$|[?#])` 錨定對 `….png)` 不成立 ⇒ 以前這類連結的
+  **預覽是靜默不出現**，不是顯示錯誤。
+- 守護：`tests/unit/url_trim.test.js`（純規則全表）、`url_cjk.test.js`（真 `TermBuf`＋`AnsiParser`
+  餵 Big5 bytes 驗旗標位置，含半形／全形括號包覆與 `_(歌手)` 反向鎖）、`url_fix.test.js`
+  （含「括號包起來的完整網址不得冒出修復行」）、`body_wrap.test.js`（`parts` 跟著縮）、
+  `tests/e2e/offline/body_url_wrap.offline.spec.js`。
 
 ## 自動修復斷掉的 URL（`src/js/url_fix.js`）
 作者把 URL 弄壞（插空白／漏 scheme／副檔名被空白斷開）→ 既有 `TermBuf.uriRegEx`（要求 scheme、不容空白）
@@ -562,6 +603,37 @@ index.jsx#onContextMenu` 開選單當下 `readValuesWithDefault()` 現讀，**�
   （暖機入口不偷下載／建完即毀）、`ui_behavior.offline.spec.js`（分頁切換＋三種 availability 的反灰）、
   `bare-domain-link.offline.spec.js`（總開關關閉時子選項開著也不推論）。
 
+### 設定搜尋（`src/js/pref_search.js` ＋ `components/ContextMenu/PrefSearchBox.jsx`）
+左欄搜尋框 → 下拉結果 → 切分頁＋捲動＋短暫高亮。**與右鍵選單的「快速搜尋」
+（`quick_search.js`）無關**，命名一律 `settingsSearch`/`prefSearch`，勿混。
+
+- **索引 `PREF_SEARCH_ITEMS` 是手動維護的第二份事實**：`PrefModal.jsx` 純 hardcode JSX、無 schema
+  可反射。漏收＝那一項**永遠搜不到**且畫面一切正常（靜默失效）⇒ 唯一防線是
+  `tests/unit/pref_search_index.test.js`（靜態掃原始碼的 `name=`／`<PrefSection legendKey=`／
+  `<PrefAnchor anchorKey=`／`{...anchor(…)}`，雙向比對＋兩語系字串存在性）。**新增設定項必須同步索引。**
+- **錨點 key ＝ `data-pref-anchor` 值**。非 pref 一律帶前綴，永不與 pref key 撞名：
+  `ui:`（沒有 `name` 的可操作項，如 `ui:theme`）、`section:`（分區）。
+- **三個 adapter 各管一種錨點**：`PrefCheckbox`（自動掛，約 45 項）、`PrefSection`（取代原本 27 份
+  重複的 `<fieldset className=…><legend>`）、`PrefAnchor`（沒有 name 的項目與「關於」頁的區塊）。
+  其餘輸入元件寫 `{...anchor("<key>")}`。
+- **比對規則只有一份**：`searchPrefSettings()` 回傳 `ranges`，UI 照切，**不得自己再比對一次**。
+  分數由高到低：當前語系標題前綴 100／子字串 90 → pref key 前綴 80／子字串 70（去駝峰後，
+  所以中文介面打 `auto` 或 `easy reading` 會命中）→ 分區或分頁名 60 → 當前語系 tooltip 50 →
+  另一語系標題 40 → 另一語系其他 30。同分先短標題、再索引順序。`matchedVia !== "title"` 時
+  `ranges` 為空（靠英文 key 命中就不畫假高亮）。
+- **`MAX_RESULTS = 8` 是刻意的**：Mantine Modal 的 `RemoveScroll` 沒傳 `shards`，會
+  `preventDefault()` 掉 portal 出去的下拉上的 wheel ⇒ 下拉**捲不動**。壓在不需捲動的高度內就沒問題
+  （鍵盤 ↑↓ 走 `scrollIntoView`，不受影響）。真要長清單的逃生門是
+  `<Modal removeScrollProps={{ shards: [dropdownRef] }}>`。
+- **Escape 的歸屬零程式碼**：`Combobox.Target` 在下拉開著時自動掛 `data-mantine-stop-propagation`，
+  而 Modal 的 Esc 攔截是 **window + capture**（自己呼叫 `stopPropagation()` 對它無效）。⇒ 下拉開著
+  按 Esc 只關下拉，關著才關設定頁。
+- 查詢字是**純 UI state，不進 `values`** ⇒ `onCloseClick` 的 `deepEqual` 仍短路，只是搜尋不會多寫一次
+  pref、也不會 ping 其他裝置。
+- 守護：`tests/unit/pref_search.test.js`（比對／排序純邏輯）、`pref_search_index.test.js`（索引覆蓋度）、
+  `pref_modal_search.test.jsx`（UI 接線＋錨點動態全覆蓋＋e2e marker 未破壞）、
+  `tests/e2e/offline/pref_search.offline.spec.js`（**真的捲到了沒** —— jsdom 沒有版面，只有這層量得到）。
+
 ## 自動登入：`src/js/auto_login.js`
 `App` constructor `new AutoLogin(this)`；`onConnect` 末尾 `start()`（async fire-and-forget）。**自走
 polling**（setTimeout 每 500ms），每 tick 直接從 `buf.getRowText` 讀整頁（**勿用
@@ -666,6 +738,12 @@ axios/tippy/GM_config/國旗 IP 查詢(外部 osk2.me:9977 已失效)、滑鼠�
 - **送鍵（或任何副作用）不可寫在 `console.log` 的字串運算式裡**。`easy_reading._onViewUpdated` 曾寫成 `console.log("send:" + keys + " -> " + this._maybeSendPageDown(keys, false))` —— 哪天把 log 包進 `if (TRACE)` 就會連好讀唯一的翻頁動力一起關掉。每幀日誌現由 `util.js` 的 `TRACE`（= `process.env.DEVELOPER_MODE`）在**呼叫端**包住，dev/e2e 照印、prod 由 bundler 整段消除。
 - **逐列加工走單一純函式 `comment_parse.annotateComment`**，勿為某路徑另寫一份（好讀/原生曾各複製一份而發散出 bug）。逐列狀態用每圈新物件 `const ann={}`，**勿用函式作用域 `var`**（JS `var` 不每圈重設 → 非推文列繼承前列 floor/authorId 範圍，畫出整條色塊或樓號溢出到空白/※編輯/內文）。守護 `comment_parse.test.js`。
 - **`parseListAuthor` 欄位需實機校準**（cols 17–28 @ C_Chat）；PTT 改版位移會先讓守護測試 `enhance.spec.js` 紅。
+- **Mantine 元件的 rest props 落在 `<input>`，不是整列外框**（`Checkbox.mjs:49,127`、`use-input-props.mjs`）。要標記／捲到／高亮「含 label 與說明文字的整列」一律用 `wrapperProps`；`Select` 更是只能靠它（`name` 會被渲染成 `<input type="hidden">`，沒有版面，`scrollIntoView` 對它無效）。
+  - **但 `wrapperProps` 裡絕不可放 `className`**：它是在 `...getStyles("root")` **之後**展開的（`Checkbox.mjs:91` vs `111`）⇒ 會把 `mantine-Checkbox-root` 整個換掉、版面爆掉。加 class 走 `classNames={{ root }}`（Styles API 是 concat，安全）。設定搜尋的錨點／高亮就是踩過這組才定案，見「設定搜尋」節。
+- **Mantine `Combobox` 預設 `keepMounted: true` + `keepMountedMode: "display-none"`**：下拉的 DOM **永遠在**，關閉時只是被加上 inline `display:none`。⇒ 測試判斷「下拉開了沒」**不能數 `role=option` 的數量**（關閉後照樣是那幾個），要看可見性（`toBeVisible()`）或 target 上的 `data-mantine-stop-propagation`。同理，全域 `querySelectorAll("[role=option]")` 會把畫面上每一個 Mantine `Select` 的選項一起撈進來——要限定在自己的 dropdown 容器內。
+- **Mantine 的鍵盤導覽讀 `event.nativeEvent.code`，不是 `event.key`**（`use-combobox-target-props.mjs`；只有 Escape 那條用 `key`）。⇒ 測試裡 `fireEvent.keyDown(el, { key: "Enter" })` **不會有任何反應**，必須一併給 `code`。
+- **Mantine 的 `Tabs.Panel` 走 React 19 `<Activity>`**（`TabsPanel.mjs:24`，`keepMountedMode` 預設 `"activity"`）：非作用分頁整塊 `display:none`。⇒ 任何「切分頁之後量版面／捲動」的動作**必須等一個 frame**（`requestAnimationFrame`），同一個 commit 裡 `scrollIntoView` 是 no-op。這與「自動登入分頁是條件渲染」是兩個各自獨立的理由，十個分頁都適用。
+- **jsdom 缺的兩個 API 已在 `tests/unit/setup.js` 補上**：`Element.prototype.scrollIntoView`（Mantine `useCombobox#selectOption` 是**非 optional** 呼叫 ⇒ 任何按方向鍵操作下拉的測試沒它就整批 TypeError）與 `document.fonts`（Mantine Textarea autosize 無條件 `document.fonts.addEventListener` ⇒ render 到「增強功能」分頁的黑名單欄位就炸）。**兩者都要先判斷全域存在**——該 setup 檔對整個 unit project 生效，其中有檔案用 `@vitest-environment node`。
 - **列表黑名單標註不可只信 `pageState`／`inListContext` —— 每一列都要先過 `comment_parse#isListShapedRow`**（2026-09-05 使用者回報「發文介面出現黑名單髒資料」，錄製檔 `ptt-debug-20260905-122522`）。兩層守門**同時都是黏的**：`term_buf.setPageState` 沒有 reset 分支（那是刻意的，見 `docs/pttbbs-screen-protocol.md` §5.1），從列表叫出來的整頁畫面（Ctrl-P 發文、板規、精華區…）會**沿用**列表的 `pageState = 2`；`term_view._inBoardListContext` 又只在 pageState 1/3 才清掉。而逐列解析本身零設防：`parseListTitleRaw` 對任何長度 > 29 的列都回傳 col≥29 的整段文字。
   現場：發文分類列「種類：1.閒聊 2.問題 … 7.Vtub 8.自介 (1-8或不選)」的 col≥29 是「26夏 5.心得 6.情報 7.Vtub 8.自介 …」⇒ 使用者標題黑名單裡的 `vtub` 命中 ⇒ 整列被 `blacklistNoticeText` 換成「（本文已被黑名單） vtub」，把使用者正在看的分類提示蓋掉。**命中與否純看欄位對齊**（同畫面的 `[Vtub]` 板規列剛好落在 col 21 而逃過），所以症狀是「多黑名單命中的版塊最容易發生」的隨機髒資料。
   **判準要嚴：先要求合法 userid 作者欄，再要求編號或 ★**。單用編號會漏接——`parseListArticleNumLoose` 是 `^(\d+)\b`，板規的「1. 不得…」會回 1 而放行。同一道閘門也修掉**真實列表畫面**上的同型誤命中（表頭「編號 日期 作者 標題」與 footer「文章選讀 (y)回應(X)推文(^X)轉錄」以前會被關鍵字如「轉錄」吃掉，golden 快照裡它們身上那組假的 `data-list-title` 就是證據）。`list_session#visibleListIndices` 必須同步同一道閘門（不變量 10）。守護：`comment_parse.test.js` 的 `isListShapedRow`、`screen_dropHidden.test.js` 兩個新 describe、golden `list_native_fnkeys` / `list_easy_reading_scrolled`。
@@ -785,6 +863,15 @@ axios/tippy/GM_config/國旗 IP 查詢(外部 osk2.me:9977 已失效)、滑鼠�
   **key 優先、code 補位**：Win/Linux 的非 QWERTY 佈局仍以實際打出的字母為準，且 `e.code` 缺失
   （合成事件）時不炸。假事件測試只寫 `key:'v'` 測不到這類 bug，必須同時給 Mac 風格的 `key`+`code`
   （`tests/unit/term_keyboard_paste.test.js`）。
+  - **2026-09-15 起 Alt 涵蓋全 26 字母**（Alt＝PTT 的 Ctrl，`docs/pttbbs-screen-protocol.md` §11.8），
+    於是四種 mac 形態全都會真的出現，不像當年 RTWV 只碰得到第一種：
+    ①組字輸出；②**dead key**（`⌥E/⌥I/⌥N/⌥U` 的 `e.key === 'Dead'`，而且 keydown 回報
+    **keyCode 229**，必須在 `term_view.acceptsKeyEvent` 開例外，否則事件在進到 remap 之前
+    就被當成 IME 丟掉、組字還會照開讓 `é/î/ñ/ü` 漏進 PTT）；③`'ß'.toUpperCase() === 'SS'`
+    （長度 2）；④`'µ'.toUpperCase()` 是**希臘大寫 Μ**(U+039C) 不是 ASCII `M`。
+  - **這條的「假事件要給 mac 形態」延伸到 session 層**：`list_session`／`board_list_session`
+    自己呼叫 `altRemapCharCode`，只寫 `key:'t'` 的 Windows 形態等於沒測到 mac
+    （`tests/unit/list_keys.test.js`、`board_list_session.test.js` 已各補一條）。
 
 ### B. BePTT 反編譯（外部參考，不可由本專案 code 反推）
 

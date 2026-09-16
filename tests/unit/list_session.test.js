@@ -21,6 +21,7 @@ import {
   visibleListIndices,
   isWaterballSettle,
 } from "../../src/js/list_session";
+import { LIST_HEADER_ROWS } from "../../src/js/list_window";
 
 const fixture = JSON.parse(
   fs.readFileSync(
@@ -31,8 +32,10 @@ const fixture = JSON.parse(
 const listRows = fixture.pageScreens[0]; // 24 decoded rows of a real C_Chat page
 
 const STATUS_ROW = "  瀏覽 第 1/8 頁 ( 12%)  目前顯示: 第 01~23 行 (←)離開 ";
+// mbbsd/menu.c:302-322#show_status 的實際輸出（見 string_util.js 的 LIST_ROW_RE 長註解；
+// 2026-09 以前這裡寫的是一個 pttbbs 史上不存在的格式，連帶這一條一直是假綠）。
 const BOARD_MENU_FOOTER =
-  "[6/14 星期六 12:34] 動態看板 線上1234人, 我是guest [呼叫器]打開 ";
+  "6/14周六 12:34 動態看板      線上1234人,我是guest,呼叫器開啟          (h)說明";
 
 // Facts builder around the captured page. Color reversal booleans default to
 // true (the capture is a clean board page); curY=3/curX=1 is the protocol §5
@@ -437,14 +440,15 @@ describe("transitionListSession (full table)", () => {
   });
 
   test("suspended", () => {
-    // v5/M4 re-seed：退文回列表不再逐行 parity 還原（_restore 家族退役），
-    // 與 functionMode 同規則——server 落點權威，落點在緩衝內續用 buffer，
+    // v5/M4 re-seed：退文回列表不再逐行 parity 還原（_restore 家族退役）。
+    // 落點在緩衝內 ⇒ resume-in-place：採用 server 游標、**不動捲動錨**
+    //（不變量 N6；文章期間視口不在 DOM 上，錨原封不動）。
     // 否則 rebuild（pinned 落點 cursorRowNum=null → landedNumInBuffer=false）。
     T(
       "suspended",
       settle("clean-list", { landedNumInBuffer: true }),
       "active",
-      ["resume-buffer"]
+      ["resume-in-place"]
     );
     T("suspended", settle("clean-list"), "active", ["resume-buffer", "rebuild"]);
     T(
@@ -621,6 +625,23 @@ describe("evictPivot（樞紐＝視口，退路才是選取）", () => {
     h.s._topNum = null;
     h.s._selectedNum = 107;
     expect(h.s.evictPivot()).toBe(107);
+  });
+
+  // 2026-09-10 回報「Home/End 有時失效」的根因之一：遠跳期間樞紐若還是
+  // 「跳之前的視口頂」，evictListBuffer 的「砍離樞紐最遠的那一端」正好把剛
+  // 落地的那一頁砍掉（緩衝吃滿 300 列時）。null ⇒ 只從小號端砍（留住 End
+  // 的板尾），1 ⇒ 只從大號端砍（留住 Home 的第 1 篇）。
+  test("遠跳在飛時樞紐改成落點那一側（與 prunePivot 同一個覆寫）", () => {
+    const h = demandSession({ numStart: 100, count: 30 });
+    h.s._topNum = 115;
+    h.s._selectedNum = 100;
+    h.s._prunePivotOverride = null; // jump-end 在飛
+    expect(h.s.evictPivot()).toBe(null);
+    expect(h.s.prunePivot()).toBe(null);
+    h.s._prunePivotOverride = 1; // jump-home 在飛
+    expect(h.s.evictPivot()).toBe(1);
+    h.s._prunePivotOverride = undefined; // 交易結束 ⇒ 回到視口
+    expect(h.s.evictPivot()).toBe(115);
   });
 });
 
@@ -1332,6 +1353,119 @@ describe("讀取中指示與凍結的收尾（旗標洩漏）", () => {
   });
 });
 
+// 遠跳落地後落點頁不在緩衝裡 ⇒ 整份重建（使用者回報「Home/End 有時失效、
+// 體感只是移到列表頂/底部」，錄製檔 ptt-debug-20260910-021827）。
+//
+// 落點頁被 evict/prune 丟掉時，onDone 的 `_setCursorPos(seq, seq.length - 1)` 會落在
+// **舊緩衝**的末列，接著 demand prefetch 用舊邊界當 anchor 跳號，連 server 游標一起
+// 拉回舊位置。樞紐與順序已修（見上面兩組），這裡守的是最後一道：真的沒進緩衝就用
+// 已驗證的 _beginJumpNumber 模式（落點頁 wholesale）收尾。
+describe("遠跳落點頁被丟掉時改成重建", () => {
+  // 落地幀的 facts：body 列的編號離 demandSession 的 100..159 極遠。
+  function landingFacts(lo, cursorNum) {
+    const facts = {
+      rows: 24,
+      curY: 5,
+      curX: 0,
+      boardName: "C_Chat",
+      cursorRowNum: cursorNum == null ? lo + 2 : cursorNum,
+      nums: new Array(24).fill(null),
+      rowTexts: new Array(24).fill(""),
+    };
+    for (let i = 3; i <= 8; ++i) facts.nums[i] = lo + (i - 3);
+    return facts;
+  }
+
+  function landEnd(h, lo, cursorNum) {
+    h.s._requestEnd();
+    const cmd = h.enqueued[h.enqueued.length - 1];
+    cmd.onSend();
+    const facts = landingFacts(lo, cursorNum);
+    // 落點指紋：停在 entry 區、且不在舊底邊之前（不變量）。
+    expect(cmd.expect({}, facts)).toBe(true);
+    return { cmd, facts };
+  }
+
+  test("End：落點編號不在 buffer ⇒ _rebuild(landed, 'down')", () => {
+    const h = demandSession({ numStart: 100, count: 60 });
+    h.s._topNum = 150;
+    h.s._selectedNum = 155;
+    const spy = vi.spyOn(h.s, "_rebuild").mockImplementation(() => {});
+    const { cmd, facts } = landEnd(h, 9000);
+    cmd.onDone();
+    expect(spy).toHaveBeenCalledWith(facts, "down");
+    expect(h.s._edgeDown).toBe(true);
+  });
+
+  test("End：落點頁真的在 buffer 裡 ⇒ 不重建（保住累積的緩衝）", () => {
+    const h = demandSession({ numStart: 100, count: 60 }); // 100..159
+    h.s._topNum = 150;
+    h.s._selectedNum = 155;
+    const spy = vi.spyOn(h.s, "_rebuild").mockImplementation(() => {});
+    // 緩衝底端本來就是板尾：落點頁 154..159 整頁都已經在 buffer 裡。
+    const { cmd } = landEnd(h, 154, 159);
+    cmd.onDone();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  test("Home：第 1 篇不在 buffer ⇒ _rebuild(landed, 'up')", () => {
+    const h = demandSession({ numStart: 100, count: 60 });
+    h.s._topNum = 110;
+    h.s._selectedNum = 115;
+    const spy = vi.spyOn(h.s, "_rebuild").mockImplementation(() => {});
+    h.s._requestHome();
+    const cmd = h.enqueued[h.enqueued.length - 1];
+    cmd.onSend();
+    const facts = landingFacts(1);
+    facts.cursorRowNum = 1;
+    expect(cmd.expect({}, facts)).toBe(true);
+    cmd.onDone();
+    expect(spy).toHaveBeenCalledWith(facts, "up");
+    expect(h.s._edgeUp).toBe(true);
+  });
+
+  // _rebuild 的 `edge` 必須在 _demandDownIfWindowShort **之前**生效：板上沒有置底文時
+  // _seedAnchors 確認不了邊界 ⇒ 會在真板尾送一個零回應的 PgDn
+  //（docs/easy-reading-list.md「滿版落點不得探測」）。
+  describe("_rebuild 的 edge 參數", () => {
+    // 讓 stub 的 notify 模擬 accumulate：重建清掉緩衝後把「落點短頁」填回去。
+    function shortLandingSession(lo) {
+      const h = demandSession({ numStart: 100, count: 60 });
+      const mkRow = (n) => {
+        const t = (" " + n + " + 2 6/14 someoneA     □ [閒聊] 文章 " + n).padEnd(80);
+        return [...t].map((ch) => ({ ch, isLeadByte: false }));
+      };
+      h.termBuf.notify = () => {
+        if (h.termBuf.listLineNums.length) return;
+        for (let n = lo; n < lo + 6; ++n) {
+          h.termBuf.listLineNums.push(n);
+          h.termBuf.listLines.push(mkRow(n));
+        }
+      };
+      return h;
+    }
+
+    test("edge='down'：板尾落點不得再往下探測", () => {
+      const h = shortLandingSession(9000);
+      h.s._rebuild(landingFacts(9000), "down");
+      expect(h.s._edgeDown).toBe(true);
+      expect(
+        h.enqueued.filter((c) => (c.kind || "").indexOf("prefetch") === 0)
+      ).toEqual([]);
+    });
+
+    test("不帶 edge（一般 rebuild）短頁仍要往下補頁", () => {
+      const h = shortLandingSession(9000);
+      h.s._rebuild(landingFacts(9000));
+      expect(h.s._edgeDown).toBe(false);
+      const pf = h.enqueued.filter(
+        (c) => (c.kind || "").indexOf("prefetch") === 0
+      );
+      expect(pf.length).toBeGreaterThan(0);
+    });
+  });
+});
+
 describe("visibleListIndices (mirrors Screen#computeAnnotations PAGE_LIST)", () => {
   const rows = [
     " 350024 + 2 6/14 a0930307148  R: [閒聊] 烙印勇士384",
@@ -1607,19 +1741,19 @@ describe("無編號列的 clean-list 幀（只剩置底文的短頁）不得 see
 
   // 錄製檔那一幀的形狀：row0/row2/row23 是先前整頁重繪留下的（本次 partial
   // redraw 只改 row2 col10 之後，所以「編號」表頭還在），entry 區只剩兩列置底。
-  function frame(entryRows) {
-    const rowTexts = new Array(24).fill("");
+  function frame(entryRows, totalRows = 24) {
+    const rowTexts = new Array(totalRows).fill("");
     rowTexts[0] = listRows[0];
     rowTexts[1] = listRows[1];
     rowTexts[2] = listRows[2];
     for (const [r, text] of Object.entries(entryRows)) rowTexts[Number(r)] = text;
-    rowTexts[23] = listRows[23];
+    rowTexts[totalRows - 1] = listRows[23];
     return rowTexts;
   }
 
   // 進板落點 session：state=idle、pref 開，termBuf 的 notify 模擬 accumulate
   // 把當前幀收進 buffer（真實 _forceRedraw 的同步累積）。
-  function landingSession(rowTexts, curY) {
+  function landingSession(rowTexts, curY, totalRows = 24) {
     window.localStorage.setItem(
       "pttchrome.pref.v1",
       JSON.stringify({ values: { enableEasyReadingList: true } })
@@ -1638,11 +1772,11 @@ describe("無編號列的 clean-list 幀（只剩置底文的短頁）不得 see
     const mkRow = (text) =>
       [...text.padEnd(80)].map((ch) => ({ ch, isLeadByte: false }));
     const termBuf = {
-      rows: 24,
+      rows: totalRows,
       cols: 80,
       listLines: [],
       listLineNums: [],
-      lineChangeds: new Array(24).fill(false),
+      lineChangeds: new Array(totalRows).fill(false),
       changed: false,
       startedEasyReading: false,
       addEventListener() {},
@@ -1651,7 +1785,7 @@ describe("無編號列的 clean-list 幀（只剩置底文的短頁）不得 see
       settleSnapshot: { changedRows: new Set([3, 4]), cursorMoved: true, curX: 0, curY },
       notify() {
         if (this.listLineNums.length) return;
-        for (let r = 3; r <= 22; ++r) {
+        for (let r = 3; r <= totalRows - 2; ++r) {
           const text = rowTexts[r];
           if (!text || !text.trim()) continue;
           const n = /^[>\s]*(\d+)\s/.exec(text);
@@ -1700,6 +1834,24 @@ describe("無編號列的 clean-list 幀（只剩置底文的短頁）不得 see
     expect(s._renderMode).toBe("buffer");
     // 有錨點 ⇒ 背景 fill 真的送得出去（無錨點時這裡會是空陣列＝卡死）
     expect(enqueued.some((c) => c.kind === "prefetch-anchor-up")).toBe(true);
+  });
+
+  // REGRESSION：設定頁「BBS 終端機大小 → 固定字體大小」的列數由視窗高度反推
+  // （term_size.calcTermSize），可視高 > 480px 就 > 24 列 ⇒ 舊碼 `_engageEligible`
+  // 的 `rows === 24` 讓列表好讀整個靜默失效，連帶右鍵選單的「前已讀後未讀」
+  // 也一起消失（它要 listSession.markReadTargetAtRow，session 沒 active 就回 null）。
+  // 下界 24 照 server 端的 clamp（mbbsd/term.c:55）。
+  test("REGRESSION：非 24 列的終端機（固定字體大小模式）照常 engage", () => {
+    const rowTexts = frame({ 3: ">" + NUMBERED.slice(1), 4: PINNED, 5: PINNED }, 40);
+    const { s } = landingSession(rowTexts, 3, 40);
+    expect(s._engageEligible()).toBe(true);
+    s._onScreenSettled();
+    expect(s.state).toBe("active");
+    expect(s._renderMode).toBe("buffer");
+    // 接管了 ⇒ 右鍵選單的「前已讀後未讀」拿得到目標（消失的那個症狀）。
+    expect(s.markReadTargetAtRow(LIST_HEADER_ROWS)).toEqual({
+      num: parseInt(NUMBERED.trim().split(/\s+/)[0], 10),
+    });
   });
 });
 
@@ -1961,14 +2113,15 @@ describe("錨定還原（不變量 6 的原生捲動形式）", () => {
   });
 });
 
-// 退出文章回到列表（reducer: suspended --clean-list--> active，action resume-buffer）。
+// _resumeBuffer＝「從原生鏡像回來、畫面本來就是 server 那一頁」那條路（reducer 的
+// functionMode/rebuild 分支）。退文回列表**不走這裡**（見下一個 describe）。
 //
-// 症狀（錄製檔 ptt-debug-20260830-221107）：緩衝往上長過幾頁之後開文再退出，
-// 視野跳到緩衝最舊那一列，剛讀的那篇捲出視野。根因：_resumeBuffer 採用 server
-// 落地幀的視窗頂列當錨，但緊接著的 _forceRedraw 那一幀 captureScrollAnchor 會
-// 從 **detached 視口**（scrollTop 恆 0）把它覆寫掉 —— 與 _requestEnd/_requestHome
-// 同一個坑，那兩處都設了 _anchorOverride。
-describe("退文回列表：視野停在 server 落點那一頁", () => {
+// 症狀（錄製檔 ptt-debug-20260830-221107）：緩衝往上長過幾頁之後回到 buffer，
+// 視野跳到緩衝最舊那一列。根因：_resumeBuffer 採用 server 落地幀的視窗頂列當錨，
+// 但緊接著的 _forceRedraw 那一幀 captureScrollAnchor 會從 **detached 視口**
+//（scrollTop 恆 0）把它覆寫掉 —— 與 _requestEnd/_requestHome 同一個坑，那兩處
+// 都設了 _anchorOverride。
+describe("回 buffer（原生鏡像落點）：視野停在 server 落點那一頁", () => {
   const ROW = 20;
   const VP = 20 * ROW;
 
@@ -2394,5 +2547,138 @@ describe("_sequence 記憶化", () => {
     const after = s._sequence();
     expect(after).not.toBe(before);
     expect(after.length).toBe(before.length + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 退出文章回到列表（reducer: suspended --clean-list--> active，action
+// resume-in-place）。
+//
+// 使用者回報（錄製檔 ptt-debug-20260911-113150）：把某篇用滑鼠捲到視口最下面、
+// 進去再退出，那篇會跳回畫面中間。根因：舊的 resume-buffer 採用 server 落地幀
+// （READ_REDRAW，read.c 的 20 列分頁）的視窗頂列當錨 ⇒ 使用者自己捲出來的位置
+// 被丟掉，畫面被釘回 server 的分頁。
+//
+// 正確行為：文章期間視口不在 DOM 上，錨與緩衝原封不動（不變量 6c）⇒ 退文只採用
+// server 游標，捲動錨一律不動（不變量 N6，同 A 類凍結交易）。
+// ---------------------------------------------------------------------------
+describe("退文回列表：視野停在使用者自己捲到的位置", () => {
+  const ROW = 20;
+  const VP = 20 * ROW;
+
+  // 進文章前：緩衝 100..159，使用者把視口捲到頂＝110（序列位置 10）⇒ 可見
+  // [110, 129]，游標 129 恰好停在**視口最下面那一列**。
+  // 文章期間 .listBodyView 被移出容器 ⇒ live=false；detached 節點的 scrollTop 是
+  // 0（瀏覽器在移出時就把捲動位置丟了），所以替身的 top 也從 0 起算 —— session
+  // 手上的 _topNum 才是這段期間唯一的真相源。
+  const setup = () => {
+    const h = demandSession({ numStart: 100, count: 60 });
+    h.s._renderMode = "buffer";
+    h.s._edgeUp = true;
+    h.s._edgeDown = true;
+    h.s._topNum = 110;
+    h.s._selectedNum = 129;
+    h.s.state = "suspended";
+    h.screen = fakeScreen(0, VP, /* live */ false);
+    h.s._view.componentScreen = h.screen;
+    h.s._lastScrollTop = 0; // _beginOpen 的 _cancelScroll 歸零過
+    return h;
+  };
+
+  // server 退文重繪：read.c 的視窗把游標那篇擺在自己的分頁裡（120..139，游標
+  // 129 ⇒ 落在畫面正中間）。這正是使用者看到的「跑回中間」。
+  const settleBack = (s, facts) =>
+    s._dispatch(
+      {
+        type: "settle",
+        kind: "clean-list",
+        boardNameMatch: true,
+        inFlightKind: null,
+        consumed: false,
+        landedNumInBuffer: true,
+        holdReason: null,
+        withinResumeGrace: false,
+        hasNumberedRow: true,
+        engageEligible: true,
+      },
+      facts
+    );
+
+  // 一幀＝capture（視口還沒掛回來）→ render（視口回到 DOM）→ apply。
+  const frame = (s, screen) => {
+    s.captureScrollAnchor();
+    screen.live = true;
+    s.applyScrollAfterRender();
+  };
+
+  test("捲到視口最下面的那篇，退文後還在最下面", () => {
+    const { s, screen } = setup();
+    settleBack(s, pageFacts(120, 129));
+    expect(s.state).toBe("active");
+    frame(s, screen);
+
+    expect(s._topNum).toBe(110); // 沒被 server 落點（120）改掉
+    expect(s._scrollFrac).toBe(0);
+    expect(screen.top).toBe(10 * ROW); // 視口頂仍是序列位置 10
+    // 游標採用 server 落點，位置＝序列 29 ＝視口 [10, 30) 的最後一列
+    expect(s._selectedNum).toBe(129);
+    const seq = s._sequence();
+    expect(s._cursorPos(seq)).toBe(29);
+    expect(s._isPosVisible(seq, 29)).toBe(true);
+  });
+
+  test("錨不被 detached 視口的 scrollTop=0 覆寫（舊坑不得復發）", () => {
+    const { s, screen } = setup();
+    settleBack(s, pageFacts(120, 129));
+    frame(s, screen);
+    // 0 是「沒有資訊」不是「捲到最上面」：吃進去就會變成緩衝最舊那一列 100。
+    expect(s._topNum).not.toBe(100);
+    expect(s._topNum).toBe(110);
+  });
+
+  test("列內偏移（停在半列）一併保留", () => {
+    const { s, screen } = setup();
+    s._scrollFrac = 7;
+    settleBack(s, pageFacts(120, 129));
+    frame(s, screen);
+    expect(s._scrollFrac).toBeCloseTo(7);
+    expect(screen.top).toBe(10 * ROW + 7);
+  });
+
+  test("文章內換過文（落點捲出視野）→ 錨不動，只把游標 reveal 進視野", () => {
+    const { s, screen } = setup();
+    // 在文章裡按 ]/↓ 換到 150，退出時 server 游標停在那裡（序列位置 50，
+    // 不在視口 [10, 30) 內）。
+    settleBack(s, pageFacts(140, 150));
+    frame(s, screen);
+
+    expect(s._selectedNum).toBe(150);
+    const seq = s._sequence();
+    expect(s._isPosVisible(seq, 50)).toBe(true);
+    // nearest：只捲到剛好看得見，不重新置中（50 變成視口最後一列 ⇒ 頂＝31）
+    expect(screen.top).toBe(31 * ROW);
+  });
+
+  test("程式化定位不得被讀成「使用者捲動」而偷送 demand（不變量 4）", () => {
+    const { s, screen, enqueued } = setup();
+    s._edgeUp = false;
+    s._edgeDown = false;
+    settleBack(s, pageFacts(120, 129));
+    frame(s, screen);
+
+    expect(s._lastScrollTop).toBe(10 * ROW);
+    s._onScrollFrame();
+    expect(enqueued.filter((c) => c.kind.indexOf("prefetch") === 0)).toEqual([]);
+  });
+
+  test("落地幀上有置底文 ⇒ 板尾確認（錨不動，但事實要收下）", () => {
+    const { s, screen } = setup();
+    s._edgeDown = false;
+    const facts = pageFacts(140, 150);
+    facts.rowTexts[22] = "  ★ 27 6/09     arrenwu     □ [公告] 板規與置底";
+    facts.nums[22] = null;
+    settleBack(s, facts);
+    frame(s, screen);
+    expect(s._edgeDown).toBe(true);
   });
 });

@@ -19,11 +19,11 @@
 
 | 類 | 操作 | 處置 |
 |---|---|---|
-| T0 忽略鍵 | `keyEventToBytes(e) == null` 的鍵：CapsLock／F1–F12／NumLock／ScrollLock／不可映射的 Ctrl+Shift 組合 | `_classifyKey` 回 keyClass `ignore` → 吞掉、**不轉態、不 preventDefault**。判準即「這個鍵交給原生鍵盤路徑會不會送出 byte」，不硬列鍵清單 |
+| T0 忽略鍵 | `keyEventToBytes(e) == null` 的鍵：CapsLock／F1–F12／NumLock／ScrollLock／不可映射的 Ctrl+Shift 組合 | `_classifyKey` 回 keyClass `ignore` → 吞掉、**不轉態、不 preventDefault**。判準即「這個鍵交給原生鍵盤路徑會不會送出 byte」，不硬列鍵清單。**Alt remap（`Alt+A~Z` ＝ PTT 的 `Ctrl+A~Z`）不歸此類**：`keyEventToBytes` 對 `altKey` 一律回 null（**刻意的**，見不變量 12），但它們經 `altRemapCharCode` 送得出對應控制碼 ⇒ 由 `onKeyDown` 在 `_classifyKey` **之前**攔下改走 T3-B |
 | T1 本地 | ↑↓ jk／PgUp PgDn／Home End（buffer 內）／滾輪；read.c 同義鍵 `空白`＝`N`＝PgDn、`P`＝PgUp、`p`＝↑、`n`＝↓、`$`＝End | 零 server。視窗/游標語意＝web 慣例，不 read.c 逐格對齊（同義鍵集合本身照 read.c:858-902，**Ctrl-F/Ctrl-B 不納入**，維持 Ctrl 組合與瀏覽器快捷鍵的分界）。滑鼠 hover＝上游標底色（`term_view.onListMouseMove`，只對有文章的 body 列；**防誤觸模式開啟時只有標題欄 col≥30 給 pointer 並接受點擊，底色也只蓋那一段**，見 `docs/mouse.md`） |
 | T2 列表內交易 | 開文（Enter／**左鍵單擊該列**）、數字跳號、End/Home 邊界確認、`←`/q/e 離板 | 腳本交易（CommandQueue 序列化） |
 | **T3-A 原地重繪（凍結交易，全程不切原生）** | `INPLACE_KEYS`＝`=` `\` `]` `+` `[` `-` `<` `,` `.` `>` `{` `}` `t`（read.c#i_read_key 的 `thread()`／`search_read()`／`ToggleTagItem` 三組 case，**枚舉即合約**，不得改成「猜會不會開 prompt」的啟發式）| `_beginInplaceTransaction`：state→functionMode（吸收 settle／吞鍵）但 **render=frozen**，選取≠`_serverNum` 時先 `inplace-sync-jump` → `native-inplace` 命令（尾附 `\f`）→ expect＝**park 指紋**（`curX<=1 ∧ 3<=curY<=rows-2 ∧ (cursorRowNum≠null ∨ kind='clean-list')`；**不可寫成 `kind==='clean-list'`**：跳號腿之後底列本來就空，`redrawwin` 重繪的是現狀，協定 §4✚/§6）→ `_resumeInPlace`：採用落點當選取／`_serverNum`，**錨（`_topNum`/`_scrollFrac`）一律不動**、只 reveal（不變量 N6）。`_boardName` 全程保留 ⇒ 不丟 cache。落點不在緩衝→退回 `_resumeBuffer`+`rebuild`。失敗＝`_degradeToNative`（banner＋原生）。**Ctrl-C（ClearTagList）不在此組**：FULLUPDATE 只重畫當前頁，緩衝其他頁的 tag 標記會殘留 ⇒ 歸 B 類 |
-| T3-B 一鍵切原生 passthrough | `v`、`/`、`s`、`a`、`Z`、Ctrl-P、`z`……**其餘一切未列鍵** | 單按即生效：有序號選取且 `_serverNum` 未同步→先 `native-sync-jump`（frozen＋吞鍵）→ `enter-function-mode`（原生 excursion，不變量 15 拋 cache）→ 代送原鍵（`native-key` 佇列命令，**尾附 `\f`**：PTT 完全忽略某鍵時零 byte 零 settle，沒有它只能等滿 3s）＋提示「已切至原生（操作完成後自動恢復好讀）」。Ctrl 組合/不可映射鍵不代送（事件放行原生鍵盤路徑）。**hold＝`'passthrough'`**：clean-list settle **本身**一律 stay（settle 不解除 hold），由靜置探針決定何時回好讀；article／menu 情境切換照舊立即解除 |
+| T3-B 一鍵切原生 passthrough | `v`、`/`、`s`、`a`、`Z`、Ctrl-P、Ctrl-Q、Alt+任一字母、`z`……**其餘一切未列鍵** | 單按即生效：有序號選取且 `_serverNum` 未同步→先 `native-sync-jump`（frozen＋吞鍵）→ `enter-function-mode`（原生 excursion，不變量 15 拋 cache）→ 代送原鍵（`native-key` 佇列命令，**尾附 `\f`**：PTT 完全忽略某鍵時零 byte 零 settle，沒有它只能等滿 3s）＋提示「已切至原生（操作完成後自動恢復好讀）」。**Ctrl 組合與 Alt remap（`Alt+A~Z`，全 26 字母）一律代送**（2026-09-13 修，見不變量 12）；只有算不出 bytes 的鍵（Ctrl+Shift／`CtrlShiftMap` 無對應）才不代送、事件放行原生鍵盤路徑。**hold＝`'passthrough'`**：clean-list settle **本身**一律 stay（settle 不解除 hold），由靜置探針決定何時回好讀；article／menu 情境切換照舊立即解除 |
 | T3a 右鍵「前已讀後未讀」 | 右鍵選單項（只在列表好讀、游標下是**有序號**的文章列時出現） | 同 T3 的序列，但 payload 是**兩步**：`v`（expect＝畫面上出現 getdata prompt「…(W)前已讀後未讀…」，**掃整個畫面**，prompt 在 row 22 不是底列）→ 落地後才送 `w\r`。第二步只在第一步的 `onDone` 裡 enqueue —— `v` 沒進 prompt 時 `w` 會落回列表按鍵 `b_call_in`（對該列作者送呼叫器），協定見 `docs/pttbbs-screen-protocol.md` §11.5。`markReadTargetAtRow(renderRow)` 是零副作用的可行性查詢（React 端不重複判斷）；完成後照 T3-B 停在原生鏡像（已讀標記變了＝累積 buffer 過時，返回時走 rebuild），畫面靜下來由靜置探針自動回好讀 |
 | T3b 貼上 | Shift+Insert／右鍵選單「貼上」／中鍵貼上 | 同 T3，但 payload 是整串：`App.onPasteDone` → `ListSession.onPaste(text)`（回 true＝已接手）→ 需要時 `native-sync-jump` → `enter-function-mode` → `native-paste` 佇列命令送出 `ansiHalfColorConv(u2b(normalizePasteText(...)))`。**PTT 收到後完全原生**：不代按 Enter、不特判 AID（`#` 仍要 Enter 才跳且只移游標不開文，協定 §8.1）；貼上內容自帶換行則照送 Enter。交易在途（opening／frozen）吞掉＋提示 |
 | T3c 文字輸入（IME） | 中文輸入法組完字送出（compositionend） | 同 T3b，只是**不套 `normalizePasteText`**（那是貼上專屬的換行／折行正規化，IME 送的是剛組完的一段字）、佇列命令 kind 為 `native-input`。入口是 `term_view.onTextInput` 這條共用漏斗 → `ListSession.noteTextInput(text)`（回 true＝已接手）。**按鍵路徑抓不到它**：IME 的 keydown keyCode 是 229，被 `keyEventFilter` 擋在 `onKeyDown` 之外 ⇒ 走不到 `_classifyKey`。見不變量 12d |
@@ -170,14 +170,19 @@ pref `enableEasyReadingList`（預設 off）＋`easyReadingListPrefetchCount`（
   - **交換條件**：Home/End 從此每次一趟 round-trip（實測 ~100ms），沒有「邊已確認就
     本地瞬移」的快路徑。換掉的是「`_edgeUp`/`_edgeDown` 被誤設 ⇒ End 只跳到 buffer
     末列而不是板尾」這一類狀態相依的失效。
+  - **落點頁必須真的進緩衝**（2026-09-10）：onDone 的「本地套 End/Home」拿的是
+    `_sequence()` 的首/末位置，所以落點頁被 evict/prune 丟掉時它就落在**舊緩衝**的
+    邊上（使用者體感＝「只移到列表頂/底部」），接著 demand prefetch 還會用舊邊界
+    當 anchor 跳號把 server 游標一起拉回舊位置。三道守門見不變量 19。
   - 看板列表（`board_list_session.js`）一字不差地照做（board.c:1768/1830、psb.c:58-64
     CONFIRMED），前綴用 `BRD_CMD_PREFIX`。
 - **pinned 門控**：置底列只在 `_edgeDown`（已確認板尾）時進導航序列（native：置底只存在
   last page）→ 舊文區往下讀不會先看到置底文。seed/resume 時畫面含 ★ ⇒ `_edgeDown=true`。
-- **缺口 prune**：序號是連續整數，`pruneListToSegment` 在 accumulate（merge→evict 後）
+- **缺口 prune**：序號是連續整數，`pruneListToSegment` 在 accumulate（merge 後、**evict 前**）
   只留 pivot 所在連續段，視窗永不跨缺口。pivot＝`session.prunePivot()`：平常＝selection；
   End jump 在途＝null（留最大段）；Home jump＝1。**far-jump 必設 `_prunePivotOverride`**，
-  否則 prune 會把剛抓到的目標頁丟掉。
+  否則 prune 會把剛抓到的目標頁丟掉。而 `evictPivot()` **必須讀同一個覆寫**，
+  「prune 先、evict 後」的順序也是契約——兩者的理由見不變量 19。
 - demand：視口頂/底距 buffer 邊 **< 2×bodyRows（兩頁）** 即補（方向性，方向由 scrollTop
   的變化量推導；chain 不跨來源 fill/key）。到邊等待＝右下「讀取中…」指示
   （`view.setListLoading`；prefetch onDone/markEdge 清除）。
@@ -211,7 +216,7 @@ states：`idle → active ⇄ functionMode`；`active → opening → suspended 
 - key（active）：nav（↑↓jk/PgUp/PgDn/Home/End → read.c op）；Enter/→＝opening（selectedNum 有值→begin-open；null＝pinned→begin-open-pinned）；數字＝jump-digit（overlay 收參）；`←`/q/e＝leave 交易（**先 sync-jump 同步 server 游標再送離板鍵**——pttbbs getkeep 記 REAL cursor，不 sync 則再進板落點錯；`_serverNum` 快路徑同 passthrough，共用 `_enqueueCursorSyncJump`）；**A 類鍵（`INPLACE_KEYS`）＝keyClass `native-inplace` → `_beginInplaceTransaction`：凍結交易，全程不切原生**；**其餘鍵（`v` `/` `s` `Z`…）＝keyClass `passthrough` → `_beginNativePassthrough`：一鍵切原生＋代送**（`term_keyboard.keyEventToBytes` 轉 bytes，非 ASCII 單字元 `u2b`）。pref `enableListNativeAutoResume` 關掉時 A 類整組落回 `passthrough`。
 - opening：settle 等 article；timeout→functionMode 自癒；期間吞所有鍵。
 - functionMode：新事件 **`resume-probe`**（靜置探針合成，見下）→ `holdReason==='passthrough'` ∧ 無 in-flight ∧ clean-list ∧ hasNumberedRow ∧ engageEligible 時 →active（`landedNumInBuffer ∧ 板名同`→resume；否則＋rebuild），其餘一律 stay。clean-list **settle**→**`holdReason` 非 null（passthrough/external）時 stay 鏡像**（settle 本身永不解除 hold——一個回應可能 settle 兩次，第一個 settle 內容已新、游標還在舊位置，在它上面 resume 會採用到錯的落點）；無 hold（leave/jump 交易）→active（landedNum∈buffer ∧ 板名同→resume；否則＋rebuild）；article→suspended；menu→idle cleanup。**enter-function-mode（passthrough/自癒/降級——原生 excursion）在 action 層清 `_boardName`** → 回 clean-list 必走 rebuild 分支（不變量 15）；只有保留 `_boardName` 的 frozen 交易（leave/jump）可走純 resume 快路徑；passthrough 屬原生 excursion → 黏性停原生；經 article/menu 回好讀時因 `_boardName` 已清必 rebuild。
-- suspended：clean-list→re-seed（resume-buffer：採用落地幀的游標與**視窗頂列**當錨，並設 `_anchorOverride`（不變量 6c）；落點不在緩衝/板名異＋rebuild）；menu→idle。
+- suspended：clean-list ∧ 落點在緩衝 ∧ 板名同→**`resume-in-place`**（只採用落地幀的游標，**捲動錨一律不動**——文章期間視口不在 DOM 上，錨本來就是使用者離開前的那一個，不變量 N6）；否則 `resume-buffer`＋`rebuild`（畫面要換一份，重新錨定）；menu→idle。
 - 任意：pref-off/斷線→cleanup。
 
 ### 靜置探針（`resume-probe`，2026-09-03；pref `enableListNativeAutoResume`）
@@ -297,13 +302,20 @@ states：`idle → active ⇄ functionMode`；`active → opening → suspended 
 7e. **共用 queue 的 `flush()` 靜默會洩漏別人的旗標**：`CommandQueue` 由 ListSession 與 `AidNavigation` 共用，list 的 `_cleanup`/`_enterFunctionMode`/`_handoffArticle`/斷線都 `flush()`（不呼叫 onFail）⇒ in-flight 的 AID 命令被丟掉、`aidNavigation.active` 永遠 true ⇒ `term_view.onKeyDown` 吞掉**全部**鍵盤並一直閃「AID 跳文中」，無法自行復原。修法＝命令層 opt-in 的 `onFlushed`（flush 對其他命令仍靜默）。守護：`aid_navigation.test.js`。
 7f. **診斷**：`CommandQueue` 的 `opts.onEvent` 接到 `app.debugRecorder?.log('queue.'+name, info)`（`pttchrome.jsx`），info 帶 `{kind, sinceSentMs, pendingLen, probed}`。recorder 預設 null＝零成本；下次回報卡住時請對方按 Debug 錄製鈕重現，時間軸直接指出哪個 kind 卡住、多久、done/miss/timeout。
 7g. **跳號腿一律 `fullRepaint: true`，且 miss 只能由完整幀定讞**（2026-08-25「開文偶發凍四秒」）。兩半缺一不可：
-   - **零回應跳號**：跳到真游標**已經所在**的序號時畫面零差異 ⇒ server 送 0 bytes ⇒ `term_buf` 的 settle timer 只由 server 活動 re-arm（不變量 2b）⇒ 沒 settle ⇒ expect 永不被評估，只能苦等軟逾時。錄製檔 `ptt-debug-20260825-105701#t=12562`：prefetch 錨定腿剛把游標跳到 2381，open-jump 又跳 2381 ⇒ 凍 4094ms（其中 4002ms 純空等）。→ **keys 形如 `<數字>\r` 的每一腿都必須 `fullRepaint: true`**（目前八腿：`open-jump`、`open-pinned-jump`、`jump-number`、`jump-end`、`jump-home`、`prefetch-anchor-*`、`native-sync-jump`、`leave-sync-jump`），另加 `open-pinned-end`（游標已在底部時 End 同樣零回應）。**expect 不變**：協定 §6 M1——`redrawwin` 重繪的是 server 虛擬螢幕「現狀」，跳號後底列仍空 ⇒ 永遠不會變成 clean-list，park 指紋（不變量 3）仍是唯一判準。**翻頁腿（`prefetch-up/down`）刻意不掛**：有動的翻頁本來就確定性回應，附 \f 只是流量×2；`native-key`／`native-paste`／`native-input` 也不掛（bytes 是使用者任意輸入，且 §8.2 明訂 `view_postinfo` 這類交易不可帶 `fullRepaint`）。
+   - **零回應跳號**：跳到真游標**已經所在**的序號時畫面零差異 ⇒ server 不寫任何一格 ⇒ `term_buf` 的 settle timer 只由 server 活動 re-arm（不變量 2b）⇒ 沒 settle ⇒ expect 永不被評估，只能苦等軟逾時。（**2026-09 起「零回應」不再等於「零 byte」**：PTT 的 DEC 2026 同步輸出讓每個 `doupdate()` 都吐一對 `ESC[?2026h/l`，連 `!ft.dirty` 早退也吐 ⇒ 線上會看到 16 bytes。但那兩條序列不觸發 `_touchRows`／`posChanged` ⇒ **依然零 settle**，所以下面的結論與 `fullRepaint` 解法完全不變。細節見 `docs/pttbbs-screen-protocol.md` §1.1。）錄製檔 `ptt-debug-20260825-105701#t=12562`：prefetch 錨定腿剛把游標跳到 2381，open-jump 又跳 2381 ⇒ 凍 4094ms（其中 4002ms 純空等）。→ **keys 形如 `<數字>\r` 的每一腿都必須 `fullRepaint: true`**（目前八腿：`open-jump`、`open-pinned-jump`、`jump-number`、`jump-end`、`jump-home`、`prefetch-anchor-*`、`native-sync-jump`、`leave-sync-jump`），另加 `open-pinned-end`（游標已在底部時 End 同樣零回應）。**expect 不變**：協定 §6 M1——`redrawwin` 重繪的是 server 虛擬螢幕「現狀」，跳號後底列仍空 ⇒ 永遠不會變成 clean-list，park 指紋（不變量 3）仍是唯一判準。**翻頁腿（`prefetch-up/down`）刻意不掛**：有動的翻頁本來就確定性回應，附 \f 只是流量×2；`native-key`／`native-paste`／`native-input` 也不掛（bytes 是使用者任意輸入，且 §8.2 明訂 `view_postinfo` 這類交易不可帶 `fullRepaint`）。
    - **`isCompleteFrame` 守門**（`command_queue.js` 可注入，預設 `() => true`；`pttchrome.jsx` 注入 `changedRows.size >= rows`）：探針從 4000ms 提前到 250ms 之後，「探針送出後的下一個 settle 就是探針的答案」不再成立——慢速連線上指令自己的真回應常常晚於探針才到，而**部分幀不是「我在哪」的答案**。沒這道守門，那種幀會被判定讞 miss → 常態誤降級原生。判準來源：\f 的 `redrawwin` 回應固定以 `ESC[H ESC[2J` 開頭，而 `term_buf` 的 erase-display `case 2` 走 `_touchRows(0, rows-1)` ⇒ 全螢幕清除必然讓 `changedRows` 涵蓋所有列。非完整幀改用**探針窗**重新武裝並計數，上限 `MAX_PROBE_EXTENSIONS=1`（最壞 ≈ 250+600+600，仍在 2500ms 看門狗之內，沒有無限延長的路）。守門失效的退路是 hard timeout → `onFail('timeout')`，只可能把 miss 延後到硬上限，**不可能卡死**。
    守護：`list_command_budget.test.js`（跳號腿 \f 契約＋真 CommandQueue 的零回應重現）、`command_queue.test.js`「isCompleteFrame…」一組。
 8. CommandQueue timer 要包 wrapper（Illegal invocation）。
 9. `_renderScreenLines` list 分支傳 `{pageState:2}`；**dropHidden=false**（黑名單已在 `visibleListIndices` 前置過濾，視窗切片本來就不含隱藏列）。
 10. `visibleListIndices` 與 `screen_annotations#computeAnnotations` PAGE_LIST 分支同規則——**此同步只在好讀列表視窗（`enhance.listEasyReading` 為 true）成立**：好讀視窗刪除文＋黑名單無條件隱藏（`isDeletedListRow`＝作者欄 `-`；刪除文開文永無 article → 必 wedge，故比照黑名單隱藏）。**原生模式（無 listEasyReading）刻意分歧**：刪除文原生顯示（不隱藏不反黑）、黑名單改渲染成被刪除樣式通知列「（本文已被黑名單） <作者>」（`blacklistNoticeText`；作者＋標題黑名單皆適用；全形括號＋raw 前綴保留游標標記 → 不歪不位移）。`listEasyReading` **只在 term_view 的 buffer/frozen 視窗 render 呼叫傳入**（`:442`/`:446`）；native／functionMode 鏡像**不傳** → 走原生規則（通知列），故「好讀暫時切回原生」與純原生一致（不再變回反黑）。守護：`screen_dropHidden.test.js`（雙模）＋`row_render.test.js`（通知列渲染＋forceWidth）＋`comment_parse.test.js`（`blacklistNoticeText` raw 前綴/全形括號）。
-12. **非白名單鍵＝keyClass `passthrough` → `_beginNativePassthrough`**：reducer 先轉 functionMode（sync 腿在途吸收 settle＋frozen 吞鍵——非 native！閃現原生一幀＝黑名單/刪除文裸露），有序號選取且 ≠`_serverNum` 時先 `_enqueueCursorSyncJump('native-sync-jump')`（jump＋key **不可同 tick 直送**：pttbbs typeahead 跳繪，協定 §2），onDone/onFail 皆 `_enterFunctionMode`＋raw 代送原鍵（onFail 也送＝顯性降級，原生鏡像所見即所得）。**`_serverNum` 快路徑**沿用：選取＝`_serverNum`（seed/re-seed/resume facts、prefetch 落地都會教；native 出走/article/探針 fail＝null）→ 免 sync 腿零 round-trip 直切。pinned/無選取＝免 sync 直切＋代送。Ctrl 組合＝不代送、事件放行原生鍵盤（`bytes == null` 分支自 2026-08 起**只服務 Ctrl 組合**）。**勿再為個別鍵寫模擬交易**（relative 配對／mark／search 模擬都試過並移除）。守護：`list_keys.test.js`。
+12. **非白名單鍵＝keyClass `passthrough` → `_beginNativePassthrough`**：reducer 先轉 functionMode（sync 腿在途吸收 settle＋frozen 吞鍵——非 native！閃現原生一幀＝黑名單/刪除文裸露），有序號選取且 ≠`_serverNum` 時先 `_enqueueCursorSyncJump('native-sync-jump')`（jump＋key **不可同 tick 直送**：pttbbs typeahead 跳繪，協定 §2），onDone/onFail 皆 `_enterFunctionMode`＋raw 代送原鍵（onFail 也送＝顯性降級，原生鏡像所見即所得）。**`_serverNum` 快路徑**沿用：選取＝`_serverNum`（seed/re-seed/resume facts、prefetch 落地都會教；native 出走/article/探針 fail＝null）→ 免 sync 腿零 round-trip 直切。pinned/無選取＝免 sync 直切＋代送。**勿再為個別鍵寫模擬交易**（relative 配對／mark／search 模擬都試過並移除）。守護：`list_keys.test.js`。
+
+    - **Ctrl 組合與 Alt 重映射鍵一律代送**（2026-09-13 修「查詢作者會跑去其它文章」，錄製檔 `ptt-debug-20260913-184532`）。舊碼兩處把它們擋在 passthrough 序列之外，因而**跳過 sync 腿**：`_beginNativePassthrough` 開頭寫死 `e.ctrlKey ? null : keyEventToBytes(e)`；`onKeyDown` 開頭 `if (clipboard || e.altKey || e.metaKey) return;` 把 Alt remap 鍵整個早退（那條更隱蔽——連原生鏡像都不切，好讀畫面完全不動而 server 狀態已變）。但 read.c 有一整組**對真游標那一列**動作的 Ctrl 鍵，`:904 Ctrl-Q` `my_query(headers[crs_ln - top_ln].owner)`、`:911 Ctrl-S`、`:957 Ctrl-T` TagThread、`:970 Ctrl-D`（看板列表對應 board.c `:1890 Ctrl-S`、`:2044 Ctrl-T`、`:1731 Ctrl-W`）；T1 導覽零網路，真游標通常停在背景 prefetch 的落點 ⇒ 查到別人，按 ← 退出後 resume 又以那個錯游標 re-seed ⇒ 選取一起跑掉。證據 pointer：`#t=5926` 裸送 `^Q`（前面零 `queue.enqueue`）／`#t=5940` 是另一位作者的 my_query。**判準是「這個鍵會不會吃真游標」，不是「它是不是 Ctrl」** —— 新增 cursor-relative 鍵時先查 pttbbs source（表在 `docs/pttbbs-screen-protocol.md` §11.7）。
+    - `bytes == null` 分支現在**只服務算不出 bytes 的鍵**（Ctrl+Shift 組合、`CtrlShiftMap` 沒對應的 Ctrl+數字／Ctrl+F1）。
+    - **Ctrl 組合的 bytes 不可過 `u2b`**：`CtrlShiftMap` 的 `[`/`\`/`]` 是 219/220/221（upstream 拿 keyCode 當 char code 的老 bug，**不修**），都 > 127 ⇒ 沿用非 Ctrl 鍵那條 Big5 轉碼會送出跟原生鍵盤路徑不同的 byte。守門條件是 `!e.ctrlKey &&`。
+    - Alt remap 的判定**唯一來源是 `term_keyboard.isAltRemapEvent`**（2026-09-15 收斂；在那之前同一組條件在 `TermKeyboard._onKeyDown`／`list_session`／`board_list_session` 三處手抄，註解還要求「必須逐項對齊」——手抄必定漂移，症狀是**啞巴鍵**：這裡接手了、原生那邊卻不送）。攔截點在 `state !== 'active'` gate **之後**（交易在飛時與其他鍵一樣吞掉＋提示）、`_classifyKey` **之前**（兩個理由：`keyEventToBytes` 對 altKey 回 null ⇒ 會被誤判成 T0 `ignore`；而且 `j/k/n/p`（看板列表另有 `b`）同時是導覽白名單的同義鍵，順序一反 `Alt+J` 會變成本地移游標而不是送 `^J`）。
+    - **`keyEventToBytes` 對 `altKey` 回 null 是刻意的，不要「順手」讓它支援 Alt remap**：它緊接著就被 `_classifyKey` 按 `e.key` 分派白名單，一旦回傳 byte，`Alt+J/K/N/P` 落進 `nav`、`Alt+M` 落進開文、`Alt+0~9` 落進 jump-digit ⇒ 全部變成本地動作而非送鍵，整組 remap 靜默失效。守護 `tests/unit/alt_ctrl_remap.test.js`、`tests/unit/list_keys.test.js`（全 26 字母表驅動）。
+    - 已知限制（非本次引入）：置底公告列被選取時 `_selectedNum` 是 `null`，沒有編號可跳 ⇒ 仍無法 sync，`Ctrl-Q` 會查到真游標那列的作者。`_beginLeave`／`_beginInplaceTransaction` 共有。
 12b. **剪貼簿鍵不得進 passthrough，貼上不得裸送**（2026-08「AID 文章碼要貼兩次」）。兩半缺一即復發：
    - `onKeyDown` 的剪貼簿早退除了 Ctrl-C/A/V/X，**必須含 Shift+Insert**（app 自己的 i18n `alert_pasteShortcutText` 就是叫使用者用它）。它不是 ctrl 組合 ⇒ 舊碼落 `passthrough` → `_beginNativePassthrough` 的 **`e.preventDefault()` 會取消瀏覽器的貼上預設動作** ⇒ `#t` 收不到 `paste` 事件、`App.onDOMPaste` 永不觸發，PTT 只收到 `keyEventToBytes` 產出的 `\x1b[2~`。畫面切原生卻沒貼上任何東西，使用者得貼第二次（那次才成功——此時 `listRenderMode` 已是 native、hook 根本不被呼叫）。**純 `Insert`（無 shift）維持 passthrough**。
    - 貼上本身要走 `ListSession.onPaste`（T3b）而非 `view.onTextInput` 裸送：裸送會與 in-flight prefetch/jump 競態（typeahead，協定 §2），且 buffer 模式渲染的是累積清單 ⇒ **PTT 畫的 prompt 看不見**，要等某個 settle 觸發 catch-all 才現形。使用者讀成「沒反應」再貼一次 → AID 被 append 進同一個 prompt（`#1gIeu-3A1gIeu-3A` → 找不到文章）。
@@ -332,6 +344,11 @@ states：`idle → active ⇄ functionMode`；`active → opening → suspended 
    觸發窗口極寬：`_moveSelection` 尾端必定 `_maybeDemand` → `_enqueuePrefetch`，**剛按過任何一次 ↑↓/PgUp/PgDn，佇列通常就非 idle**；進板後 `_startFill` 最多鏈式 3 頁（錄製檔 t=4480~4962 就是連續 4 筆 prefetch，每筆 ~100ms），前 1–3 秒的 Home 幾乎必掉。直接違反本文開頭的「失敗顯性化，禁止靜默墜落」與「吞鍵不得無聲」。
    **通則**：使用者按的鍵是前景意圖，背景 prefetch 是投機工作 —— 衝突時讓背景讓路（`flushPendingKind` 丟未送出的、`expedite` 縮短在飛的），不是把前景意圖丟掉。新增任何走 queue 的按鍵路徑時，`!idle` 只能用來**排隊或去重**，不能用來**丟棄**。守護：`list_session.test.js`「Home/End 不得因佇列忙碌而靜默丟棄」六條、`board_list_session.test.js` 兩條、`command_queue.test.js` 的 `onSend`／`hasKind` 三條。
 
+19. **遠跳落點頁的保護必須同時覆蓋 prune 與 evict，而且 prune 在前**（2026-09-10 回報「好讀列表 Home/End 有時失效，體感變成單純移到列表頂/底部」，錄製檔 `ptt-debug-20260910-021827`）：錄製檔證實**鍵送得出去、server 也回對的畫面**（End → 真板尾 `351832..351846`），但約 300~600ms 後 `prefetch-anchor-down` 用**舊**緩衝邊界當 anchor 跳號（送 `340111` ＋ CR，回的是 8/18 的舊頁），把 server 游標一起拉回舊位置 ⇒ 整個跳躍被抹平。七次 Home/End 全是同一形狀，End 的 anchor 逐輪 `340111 → 340180 → 340229`（＝被 prefetch 撐大的舊緩衝）。
+   根因在 `term_view.accumulateListLines`：它原本**先 evict 再 prune**，而 `evictPivot()` 回的是 `_topNum`＝**跳之前的視口頂**，`evictListBuffer` 砍的是「離樞紐最遠的那一端」⇒ 遠跳時那一端恰好就是剛落地的那一頁。緩衝一旦吃滿 `MAX_LIST_ROWS=300`，落點頁就在遠跳專用的 `prunePivot()` 覆寫（End=`null` 留最大段／Home=`1` 留第 1 篇段）輪到之前被砍掉。連鎖：`noteEvicted` 把 `_edgeDown`／`_edgeUp` 清回 false（onDone 剛設的 true 被它自己的 `_forceRedraw` 廢掉）→ onDone 的 `_setCursorPos(seq, seq.length - 1)` 落在**舊緩衝**末列（＝使用者說的「只移到列表底部」）→ `_maybeDemand` 看到 edge 未確認就用 `bufferEdgeNum(舊緩衝)` 跳號。**「有時」的條件就是緩衝已達 300 列**；剛進板列少時 evict 不觸發，覆寫正常生效 ⇒ 能用。
+   三道一起修：(a) `accumulateListLines`／`accumulateBoardListLines` 改成 **prune 先、evict 後**（不相干的舊段先整段丟掉，evict 才量到對的列數，遠跳時通常直接變 no-op；無洞時 prune 是 early-return、evict 只剔兩端不可能製造洞 ⇒ 非遠跳路徑逐位元不變）；(b) `evictPivot()` 與 `prunePivot()` 共用同一個 `_prunePivotOverride`（落點頁與緩衝**連續**時沒有洞可 prune，(a) 救不了）；(c) onDone 最後一道 `_adoptJumpLandingIfDropped(landed, edge)`：落點編號真的不在 `listLineNums` 就照已驗證的 `_beginJumpNumber` 模式 `_rebuild(landed, edge)`（落點頁 wholesale），並留一則 `listSession.jumpLandingDropped` 診斷。`_rebuild` 的 `edge` 參數必須在 `_demandDownIfWindowShort` **之前**生效，否則板上沒有置底文時會在真板尾送一個零回應的 PgDn（見「已知限制」的滿版落點）。
+   守護：`list_accumulate.test.js`「遠跳落點頁不得被 evict 砍掉」三條（真的呼叫 `TermView.prototype.accumulateListLines`，stub 的 `evictPivot` 刻意回舊視口 ⇒ 驗的就是順序本身）、`list_session.test.js`「遠跳在飛時樞紐改成落點那一側」＋「遠跳落點頁被丟掉時改成重建」五條、`board_list_session.test.js` 的同構兩條。
+
 ### 不變量（2026-09-03 自動回好讀新增；違反即復發）
 
 - **N1 external hold 永不自動解除**：`_holdReason` 有兩種語意，`'external'`（`beginExternalNavigation()`，
@@ -344,8 +361,14 @@ states：`idle → active ⇄ functionMode`；`active → opening → suspended 
 - **N4 回復後有 grace window**：`active` 的 prompt/transient catch-all 在 `RESUME_GRACE_MS` 內不得 banner／不得切原生
   （事件欄位 `withinResumeGrace`，純函式全枚舉守護）。
 - **N5 A 類集合＝枚舉即合約**（`INPLACE_KEYS`，來源 read.c/board.c 的 case 表），**不得**改成啟發式；新增鍵要同步 unit。
-- **N6 A 類交易不得動捲動錨**：`_resumeInPlace` 只採用落點＋reveal，**不重設** `_topNum`/`_topPinnedKey`/`_scrollFrac`、
+- **N6 A 類交易與退文不得動捲動錨**：`_resumeInPlace` 只採用落點＋reveal，**不重設** `_topNum`/`_topPinnedKey`/`_scrollFrac`、
   不設 `_anchorOverride`（那是 `_resumeBuffer` 給「畫面本來就是 server 那一頁」用的；套在凍住的 buffer 上＝視野瞬間跳走）。
+  **退出文章回列表同組**（2026-09-12）：文章期間視口不在 DOM 上（不變量 6c）⇒ 錨與緩衝原封不動，
+  `suspended --clean-list--> active` 走 `resume-in-place`（落點在緩衝∧板名同）。舊行為採用 server
+  落地幀的視窗頂列，等於把畫面釘回 read.c 的 20 列分頁：把某篇捲到視口最下面、進去再退出，
+  那篇跳回畫面中間（使用者回報，錄製檔 `ptt-debug-20260911-113150`）。守護：`list_session.test.js`
+  「退文回列表：視野停在使用者自己捲到的位置」。**落點不在緩衝／板名異仍走 `resume-buffer`+`rebuild`**
+  （畫面本來就要換一份，重新錨定才是對的）。
 - **N7 吞鍵/換畫面永不靜默**：切原生、回好讀、逾時降級都要 `flashListHint`。
 - **N8 判定失誤不得造成「完全不可操作」**：凍結交易必須同時具備 `onFail → _degradeToNative`、`hardTimeoutMs=CMD_HARD_MS`、
   `_armFrozenWatchdog(FROZEN_WATCHDOG_MS=2500)` 三重保護 ⇒ 最壞情況是「2.5s 後掉回原生＋banner，再由靜置探針自己回好讀」，
@@ -359,7 +382,9 @@ states：`idle → active ⇄ functionMode`；`active → opening → suspended 
 
 ## 已知限制
 
-rows≠24 不 engage。MODE_SELECT（`/` 搜尋清單）＝`_selectMode` 子狀態：序號空間獨立（協定 §8），進出各強制 rebuild（`_boardName=null`）；**退出落點＝帳號已讀進度，非進 select 前位置**（協定 §8 live 事實）——fill 只向上，退回後 buffer 可能整段低於進板頁；**seed／rebuild 落點頁不滿版（下方空白列）時自動 demand-down 補頁**（共用 `_demandDownIfWindowShort`）——不補頁時，初次進版落在看板中段會導致向下 prefetch 的 markEdge 不觸發→`_edgeDown` 停 false→置底文整條被門控隱藏；**滿版落點不得探測**——板尾零回應 PgDn 的 timeout→`\f` 探針會與 hard timeout race 出無主 settle → 誤入 functionMode（live 實測）。（`/` 搜尋走 passthrough 原生打字，convSend 自帶 u2b；passthrough 代送的非 ASCII 單字元同樣先 `u2b`。）
+`buf.rows < 24` 不 engage（下界＝server clamp，`mbbsd/term.c:55`）——**≥24 的任意列數都可以**。
+2026-09-11 之前是 `=== 24`，於是設定頁「固定字體大小」（列數由視窗高度反推）會讓列表好讀
+與右鍵「前已讀後未讀」一起靜默消失；見 `docs/terminal-size.md`。MODE_SELECT（`/` 搜尋清單）＝`_selectMode` 子狀態：序號空間獨立（協定 §8），進出各強制 rebuild（`_boardName=null`）；**退出落點＝帳號已讀進度，非進 select 前位置**（協定 §8 live 事實）——fill 只向上，退回後 buffer 可能整段低於進板頁；**seed／rebuild 落點頁不滿版（下方空白列）時自動 demand-down 補頁**（共用 `_demandDownIfWindowShort`）——不補頁時，初次進版落在看板中段會導致向下 prefetch 的 markEdge 不觸發→`_edgeDown` 停 false→置底文整條被門控隱藏；**滿版落點不得探測**——板尾零回應 PgDn 的 timeout→`\f` 探針會與 hard timeout race 出無主 settle → 誤入 functionMode（live 實測）。（`/` 搜尋走 passthrough 原生打字，convSend 自帶 u2b；passthrough 代送的非 ASCII 單字元同樣先 `u2b`。）
 
 ## 素材再錄
 

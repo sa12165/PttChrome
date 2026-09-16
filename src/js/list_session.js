@@ -36,7 +36,7 @@ import {
   ansiHalfColorConv,
   normalizePasteText
 } from './string_util';
-import { keyEventToBytes } from './term_keyboard';
+import { keyEventToBytes, altRemapCharCode, isAltRemapEvent } from './term_keyboard';
 import {
   topPosFromScrollTop,
   anchorScrollTop,
@@ -495,18 +495,22 @@ export function transitionListSession(state, event) {
       if (event.type === 'settle') {
         switch (event.kind) {
           case 'clean-list':
-            // Back from the article (v5/M4 re-seed): the server repaints the
-            // full list on article exit (READ_REDRAW) with its own getkeep
-            // window and cursor — adopt that landing as the truth (push counts
-            // on the repainted page refresh via the redraw merge) instead of
-            // replaying saved anchors (the retired _restore parity family).
+            // Back from the article: the server repaints the full list on
+            // article exit (READ_REDRAW) with its own getkeep window. Adopt its
+            // CURSOR (push counts on the repainted page refresh via the redraw
+            // merge) but **not** its window top — 退文不得動捲動錨（不變量 N6）。
+            // 文章期間視口不在 DOM 上 ⇒ 錨與緩衝原封不動（不變量 6c），使用者
+            // 捲到哪裡、回來就該還在哪裡。舊行為（採用 server 落點的視窗頂列）
+            // 把畫面釘回 read.c 的分頁：把某篇捲到視口最下面、進去再退出，那篇
+            // 會跳回畫面中間（使用者回報，錄製檔 ptt-debug-20260911-113150）。
             // Same rule as functionMode: landed outside the buffer (pinned
-            // cursor parses null num) or board changed → rebuild.
+            // cursor parses null num) or board changed → rebuild（畫面本來就要
+            // 換一份，那時重新錨定才是對的）。
             // 退文落點只剩置底文時同樣不能 re-seed（不變量 17）：停在原生鏡像
             //（_handoffArticle 已把 renderMode 設 native），等下一幀。
             if (!event.hasNumberedRow) return stay;
             return event.landedNumInBuffer && event.boardNameMatch
-              ? { next: 'active', actions: ['resume-buffer'] }
+              ? { next: 'active', actions: ['resume-in-place'] }
               : { next: 'active', actions: ['resume-buffer', 'rebuild'] };
           case 'menu':
             // Same in-flight guard as functionMode's menu branch: an AID escape
@@ -1000,14 +1004,21 @@ ListSession.prototype = {
     return !!readValuesWithDefault().enableListNativeAutoResume;
   },
 
-  // pref on ∧ standard 24-row term (v1 bypass otherwise) ∧ the article easy
-  // reading is not mid-post (startedEasyReading tracks an actually-open post;
-  // view.useEasyReadingMode stays latched true between posts, so it is NOT the
-  // right guard here).
+  // pref on ∧ 終端機列數合法 ∧ the article easy reading is not mid-post
+  // (startedEasyReading tracks an actually-open post; view.useEasyReadingMode
+  // stays latched true between posts, so it is NOT the right guard here).
+  //
+  // 列數條件曾經是 `=== 24`（v1 的保守 bypass），但整條管線的幾何早就是
+  // `buf.rows` 推導的（`_bodyRows() = rows - 4`＝pttbbs 的 p_lines、
+  // list_render/clientToPos 同理），沒有任何對 24 的實質依賴 ⇒ 那一行只是讓
+  // 設定頁的「固定字體大小」模式靜默廢掉本功能（該模式的 rows 由視窗高度反推，
+  // 可視高 > 480px 就必定 > 24）。下界 24 照抄 server 端的 clamp
+  // （`mbbsd/term.c:55` MAX(24, MIN(100, h))）——比它小的列數 PTT 根本不會接受，
+  // 出現就代表 buf 處於不該有的狀態，寧可不接管。
   _engageEligible: function() {
     return (
       !!readValuesWithDefault().enableEasyReadingList &&
-      this._termBuf.rows === 24 &&
+      this._termBuf.rows >= 24 &&
       !this._termBuf.startedEasyReading
     );
   },
@@ -1097,6 +1108,8 @@ ListSession.prototype = {
         return this._enterFunctionMode(facts);
       case 'resume-buffer':
         return this._resumeBuffer(facts);
+      case 'resume-in-place':
+        return this._resumeInPlace(facts);
       case 'cleanup':
         return this._cleanup();
       // 'move-selection' / 'begin-open*' carry key context; executed in onKeyDown.
@@ -1196,13 +1209,24 @@ ListSession.prototype = {
     // Insert stays a passthrough key: only the shifted form is a clipboard
     // action. The paste itself is handled in onPaste (App.onPasteDone routes it
     // back here), not by letting bytes leak straight onto the wire.
+    // **`!e.altKey` 是合約的一部分，別拿掉**：Alt+C/A/V/X 要送 ^C/^A/^X/^V 給 PTT
+    // （Alt＝PTT 的 Ctrl，無例外），不是複製／全選／貼上／剪下 —— 那幾個維持
+    // Ctrl 版（mac 是 ⌘）。拿掉 `!e.altKey` 會讓它們被這道早退吃掉，靜默壞掉。
     const clipboard =
       (e.ctrlKey &&
         !e.altKey &&
         !e.metaKey &&
         ['c', 'a', 'v', 'x'].indexOf((e.key || '').toLowerCase()) !== -1) ||
       (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && e.key === 'Insert');
-    if (clipboard || e.altKey || e.metaKey) return;
+    // Alt remap（Alt＝PTT 的 Ctrl，全 26 字母）是**本 app 自己造的送鍵入口**，不是
+    // 瀏覽器快捷鍵 ⇒ 與 Ctrl 組合同級，必須走 passthrough 的 sync 腿。read.c:957 的
+    // Ctrl('T') TagThread 就是對真游標那一列動作的。非字母的 Alt 組合（Alt+←、
+    // Alt+數字）才是瀏覽器的，維持放行。
+    // 判定一律走 term_keyboard.isAltRemapEvent —— 這組條件以前在這裡、
+    // board_list_session、TermKeyboard._onKeyDown 三處手抄，註解還要求「必須對齊」，
+    // 而漂移的症狀是啞巴鍵（這裡接手了、原生那邊卻不送）。
+    const altRemap = isAltRemapEvent(e) ? altRemapCharCode(e) : null;
+    if (clipboard || (e.altKey && altRemap === null) || e.metaKey) return;
 
     if (this.state === 'opening') {
       // Serialized open in flight: swallow everything (sub-second; the open
@@ -1225,6 +1249,20 @@ ListSession.prototype = {
       return;
     }
     if (this.state !== 'active') return;
+
+    if (altRemap !== null) {
+      // _classifyKey 走不到：keyEventToBytes 對 altKey 一律回 null ⇒ 會被判成
+      // 'ignore'（吞掉、零 server），所以這裡自己攔。刻意排在 state gate **之後**：
+      // opening／frozen 期間與其他鍵一樣被吞掉並給提示，別跟序列化交易搶線路。
+      // **這道攔截排在 _classifyKey 之前是承重的**：j/k/n/p 同時也是導覽白名單的
+      // 同義鍵，順序一反，Alt+J 就會變成「本地把游標往下移一格」而不是送 ^J。
+      // 另注意 _beginPassthroughBytes 的 cursor-sync 腿是**無條件**的、與是哪個
+      // byte 無關 ⇒ 26 個字母全部自動享有（docs §11.7 那張表是說明，不是白名單，
+      // 新增鍵不需要動它）。
+      e.preventDefault();
+      this._beginPassthroughBytes(String.fromCharCode(altRemap));
+      return;
+    }
 
     const key = this._classifyKey(e);
     if (key.class === 'ignore') {
@@ -1278,19 +1316,32 @@ ListSession.prototype = {
   // key goes out raw only after the jump's park settle. While the leg is on
   // the wire the reducer already sits in functionMode (keyClass 'passthrough')
   // over the frozen snapshot — other keys are swallowed with a hint.
-  // Ctrl combos are NOT resent: no sync (can't serialize a key we don't own),
-  // immediate mirror switch, and the event is left un-defaulted so the native
-  // keyboard path sends this very press. Keys that map to NO bytes never get
-  // here at all — _classifyKey turns them into 'ignore' (they would take the
-  // same branch and hand over to a native path that also sends nothing).
+  //
+  // **Ctrl 組合一樣代送**（2026-09-13 修「查詢作者跑去別篇」）：舊碼寫死
+  // `e.ctrlKey ? null : ...`，把所有 Ctrl 組合推進下面的 bytes == null 分支，而那條
+  // 分支不經過 _beginPassthroughBytes ⇒ **跳過 sync 腿**。read.c:904 的 Ctrl('Q') 是
+  // `my_query(headers[crs_ln - top_ln].owner)`，對**真游標那一列**動作；好讀列表的
+  // T1 導覽零網路，真游標通常停在背景 prefetch 的落點 ⇒ 查到別人，退出後選取也被
+  // re-seed 帶走（錄製檔 ptt-debug-20260913-184532#t=5926 裸送 ^Q、#t=5940 是別人的
+  // my_query）。同類 cursor-relative 鍵：read.c Ctrl-S/T/D。keyEventToBytes 的
+  // ctrlKey 分支本來就算得出 bytes（CtrlShiftMap），舊註解「can't serialize a key we
+  // don't own」的前提早就不成立了。
+  //
+  // Keys that map to NO bytes never get here at all — _classifyKey turns them into
+  // 'ignore' (they would take the same branch and hand over to a native path that
+  // also sends nothing).
   _beginNativePassthrough: function(e) {
-    let bytes = e.ctrlKey ? null : keyEventToBytes(e);
+    let bytes = keyEventToBytes(e);
     // A printable non-ASCII char must go out as Big5 (raw UTF-16 = mojibake).
-    if (bytes && bytes.length === 1 && bytes.charCodeAt(0) > 127) bytes = u2b(bytes);
+    // **Ctrl 組合一律不過 u2b**：CtrlShiftMap 的 `[`/`\`/`]` 是 219/220/221（upstream
+    // 拿 keyCode 當 char code 的老 bug，本次不修），都 > 127 ⇒ 過 u2b 會被當成 Unicode
+    // 字元做 Big5 轉碼，送出跟原生鍵盤路徑不一樣的 byte。
+    if (!e.ctrlKey && bytes && bytes.length === 1 && bytes.charCodeAt(0) > 127)
+      bytes = u2b(bytes);
     if (bytes == null) {
-      // Ctrl combo (only case left — see header): not resendable, so switch the
-      // mirror now; the un-prevented event reaches the native keyboard handlers
-      // right after this hook returns and they send it.
+      // 現在只剩 Ctrl+Shift 組合、以及 Ctrl+數字／Ctrl+F1 這種 CtrlShiftMap 沒對應的
+      // 鍵：算不出 bytes 就沒得序列化代送，只能立刻切鏡像，事件不 preventDefault ⇒
+      // 原生鍵盤路徑緊接著處理這一次按鍵（對它們多半也是不送）。
       const r0 = transitionListSession(this.state, { type: 'key', keyClass: 'passthrough' });
       this.state = r0.next;
       this._enterFunctionMode();
@@ -1677,10 +1728,13 @@ ListSession.prototype = {
     });
   },
 
-  // 凍結交易落地後回到 buffer。**不可以直接用 _resumeBuffer**（陷阱 T2）：那一支
-  // 是給「從原生鏡像回來、畫面本來就是 server 那一頁」設計的，會把 _topNum 重設
-  // 成原生畫面第一列並設 _anchorOverride。A 類交易期間畫面是**凍住的 buffer**，
-  // 使用者的捲動位置在自己的視口裡 —— 套用會讓視野瞬間跳走。
+  // 回到 buffer 而**不動使用者的視野**。兩個呼叫端：
+  //   1. A 類凍結交易落地（`_enqueueInplaceKey`）——畫面是凍住的 buffer；
+  //   2. 退出文章回到列表（reducer `suspended --clean-list--> active`）——文章期間
+  //      視口不在 DOM 上，錨與緩衝原封不動（不變量 6c）。
+  // **不可以改用 _resumeBuffer**（陷阱 T2）：那一支是給「從原生鏡像回來、畫面本來
+  // 就是 server 那一頁」設計的，會把 _topNum 重設成原生畫面第一列並設
+  // _anchorOverride ⇒ 使用者自己捲出來的位置被 read.c 的分頁蓋掉，視野瞬間跳走。
   // 這裡只做兩件事：採用落點當選取／server 游標，然後把它帶進視野（不變量 N6）。
   _resumeInPlace: function(facts) {
     this._holdReason = null;
@@ -1694,6 +1748,17 @@ ListSession.prototype = {
       this._serverNum = facts.cursorRowNum;
       this._selectedNum = facts.cursorRowNum;
       this._selectedPinnedKey = null;
+    }
+    // 落地幀上有置底文＝板尾已確認（同 _seedAnchors／_resumeBuffer）。錨不動，但
+    // 這是 server 剛告訴我們的事實，丟掉就會讓 pinned 尾巴被門控關掉（_sequence）。
+    if (facts && !this._edgeDown) {
+      for (let r = 3; r <= facts.rows - 2; ++r) {
+        const t = (facts.rowTexts && facts.rowTexts[r]) || '';
+        if (t.indexOf('★') >= 0 && isPinnedListRow(t)) {
+          this._edgeDown = true;
+          break;
+        }
+      }
     }
     // 同步重繪：把落地那一頁併回緩衝（t 的 tag 標記之類的逐列變化靠這一趟生效）。
     // 錨（_topNum/_topPinnedKey/_scrollFrac）一律不碰。
@@ -2010,9 +2075,9 @@ ListSession.prototype = {
         this._view.flashListHint('好讀列表：處理中，請稍候…');
       return;
     }
-    // renderRow 是**渲染後**的列號：header 3 列之後就是整段序列（body 現在全部
-    // 畫出來、由瀏覽器捲），所以 body index 直接是序列位置。
-    const idx = renderRow - LIST_HEADER_ROWS;
+    // renderRow 是**渲染後**的列號：header 之後就是整段序列（body 現在全部畫
+    // 出來、由瀏覽器捲），所以 body index 直接是序列位置。
+    const idx = renderRow - this.headerRows();
     if (idx < 0) return; // header
     // 防誤觸模式開啟時只有標題欄可以開文，與原生一致（避免點到日期／作者欄誤開）。
     // 虛擬視窗的欄位與 server 的 readdoent 逐格對齊（buildListWindowLines 取的就是
@@ -2056,7 +2121,7 @@ ListSession.prototype = {
   // 那個選單項不出現（條件全收在這裡，React 端不重複判斷）。
   markReadTargetAtRow: function(renderRow) {
     if (this.state !== 'active' || this._renderMode !== 'buffer') return null;
-    const idx = renderRow - LIST_HEADER_ROWS;
+    const idx = renderRow - this.headerRows();
     if (idx < 0) return null; // header
     const view = this.getListView();
     // idx >= seq.length ＝ 短板補到 bodyRows 的空白列（或 footer）。
@@ -2206,7 +2271,11 @@ ListSession.prototype = {
       this._enqueuePrefetch(false, 'key');
   },
 
-  _rebuild: function(facts) {
+  // `edge`（選用）＝'up'／'down'，落點已經**確定**是那一端的邊界時帶。
+  // 必須在這裡套而不是讓呼叫端事後補：下面的 _demandDownIfWindowShort 就看
+  // `_edgeDown`，板上沒有置底文時 _seedAnchors 確認不了邊界 ⇒ 會在真板尾送一個
+  // 零回應的 PgDn（docs/easy-reading-list.md「滿版落點不得探測」那條已知限制）。
+  _rebuild: function(facts, edge) {
     this._breakChain();
     // _lastReadTitle kept: title keys are number-space independent (see _seed).
     this._view.resetListAccumulation();
@@ -2217,6 +2286,8 @@ ListSession.prototype = {
     this._edgeDown = false;
     this._fillPages = 0;
     this._seedAnchors(facts);
+    if (edge === 'up') this._edgeUp = true;
+    else if (edge === 'down') this._edgeDown = true;
     this._forceRedraw();
     if (this._selectedNum == null && this._selectedPinnedKey == null)
       this._selectLastNumbered();
@@ -2347,7 +2418,24 @@ ListSession.prototype = {
   // Home jump keeps article 1's segment.
   // evict／prune 的樞紐＝**視口頂那一列的序號**（使用者眼前的位置），退路才是選取。
   // 見 evictListBuffer 的註解：游標可以離視口很遠，用它當樞紐會丟掉眼前的內容。
+  //
+  // 但**遠跳期間例外**，而且這個例外是使用者回報的 bug：「跳之前的視口頂」距離
+  // 落點極遠 ⇒ evictListBuffer 的「砍離樞紐最遠的那一端」正好就是剛落地的那一頁。
+  // 實錄（2026-09-10 回報「Home/End 有時失效、體感只是移到列表頂/底部」，錄製檔
+  // ptt-debug-20260910-021827）：落點頁正確（End → 真板尾 351832..351846），但約
+  // 兩百毫秒後 prefetch 用**舊**緩衝邊界當 anchor 跳號（送 340111 + CR），把 server
+  // 游標一起拉回舊位置 ⇒ 整個跳躍被抹平。條件是緩衝已吃滿 MAX_LIST_ROWS=300，
+  // 所以症狀是「有時」——剛進板列少時 evict 不觸發，prune 的覆寫就能正常留住落點。
+  //
+  // 兩道一起修才完整：
+  //   1. accumulateListLines 改成 prune 先、evict 後 ⇒ 不相干的舊段先整段丟掉，
+  //      evict 量到的列數才是對的（遠跳時通常直接變 no-op）；
+  //   2. 這裡——落點頁**與緩衝連續**時沒有洞可 prune（例：緩衝底端剛好接著板尾），
+  //      那一道救不了，仍要靠樞紐本身指向落點那一側。
+  // null ⇒ sel=Infinity（只從小號端砍，留住 End 的板尾）；1 ⇒ 只從大號端砍
+  //（留住 Home 的第 1 篇）。
   evictPivot: function() {
+    if (this._prunePivotOverride !== undefined) return this._prunePivotOverride;
     if (this._topNum != null) return this._topNum;
     return this._selectedNum;
   },
@@ -2885,6 +2973,14 @@ ListSession.prototype = {
 
   // ---- window navigation ------------------------------------------------------
 
+  // 渲染後畫面裡 body 從第幾列開始。**滑鼠座標鏈一律問 session、不要自己挑常數**
+  // ——看板列表的 header 是另一個常數（BRD_HEADER_ROWS，語意不同、刻意各自宣告），
+  // 而 clientToPos／onListMouseMove 兩條路兩種列表共用。呼叫端挑常數就會在「其中
+  // 一邊改版」時靜默連坐（點進錯的看板、hover 落在錯的列）。
+  headerRows: function() {
+    return LIST_HEADER_ROWS;
+  },
+
   // The window's body row count: the native list body (rows 3..rows-2 on a
   // 24-row screen = 20 entries, pttbbs p_lines).
   _bodyRows: function() {
@@ -3376,6 +3472,9 @@ ListSession.prototype = {
     // anchor 必須在**送出當下**才取：這筆命令可能排在 prefetch 後面，enqueue 當時
     // 的 buffer 邊界到送出時已經長大了。
     let anchor = null;
+    // 落地那一幀的 facts（與 _beginJumpNumber 同寫法）：onDone 要用它檢查
+    // 落點頁有沒有真的進緩衝。
+    let landed = null;
     this._queue.enqueue({
       keys: '\x1b[4~',
       kind: 'jump-end',
@@ -3389,14 +3488,15 @@ ListSession.prototype = {
         // or past our previous bottom edge (a pinned row parses as null num).
         // anchor == null（buffer 裡一列編號都沒有）不再靜默 return —— 那是不變量
         // 17 的死局殘留；沒有錨點就純粹不拿它當條件，命令照樣送得出去。
-        return (
+        const ok =
           facts.curY >= 3 &&
           facts.curY <= facts.rows - 2 &&
           facts.curX <= 1 &&
           (anchor == null ||
             facts.cursorRowNum == null ||
-            facts.cursorRowNum >= anchor)
-        );
+            facts.cursorRowNum >= anchor);
+        if (ok) landed = facts;
+        return ok;
       },
       // 原生 End 在底端零回應 ⇒ 必須 fullRepaint（見上方說明）。
       fullRepaint: true,
@@ -3415,6 +3515,7 @@ ListSession.prototype = {
         // sets _edgeDown, so the next press no longer re-evaluates the
         // indicator and the pill stayed lit until an article/board change).
         self._setLoading(false);
+        self._adoptJumpLandingIfDropped(landed, 'down');
         self._edgeDown = true;
         const seq = self._sequence();
         if (!seq.length) return;
@@ -3448,6 +3549,7 @@ ListSession.prototype = {
     this._queue.flushPendingKind('prefetch');
     this._expediteBackground();
     this._setLoading(true);
+    let landed = null;
     this._queue.enqueue({
       keys: '\x1b[1~',
       kind: 'jump-home',
@@ -3457,12 +3559,13 @@ ListSession.prototype = {
         self._prunePivotOverride = 1; // keep article 1's (landing) segment
       },
       expect: function(snap, facts) {
-        return (
+        const ok =
           facts.cursorRowNum === 1 &&
           facts.curY >= 3 &&
           facts.curY <= facts.rows - 2 &&
-          facts.curX <= 1
-        );
+          facts.curX <= 1;
+        if (ok) landed = facts;
+        return ok;
       },
       // 跳號腿一律 fullRepaint（詳見 _enqueueCursorSyncJump）.
       fullRepaint: true,
@@ -3473,6 +3576,7 @@ ListSession.prototype = {
         self._serverNum = 1;
         self._prunePivotOverride = undefined;
         self._setLoading(false); // same edge-indicator ownership as _requestEnd
+        self._adoptJumpLandingIfDropped(landed, 'up');
         self._edgeUp = true;
         const seq = self._sequence();
         if (!seq.length) return;
@@ -3489,6 +3593,41 @@ ListSession.prototype = {
         self._setLoading(false);
       }
     });
+  },
+
+  // 遠跳（Home/End）落地後的保險：落點頁根本不在緩衝裡就整份重建。
+  //
+  // 為什麼需要這一道（2026-09-10 回報「Home/End 有時失效」，錯製檔
+  // ptt-debug-20260910-021827）：遠跳落地時緩衝裡會同時存在「舊段」與「落點段」，
+  // 而落點段的存活完全依賴 accumulateListLines 裡 prune/evict 兩道的樞紐都算對。
+  // 一旦算錯（當時是 evict 的樞紐用了**跳之前**的視口頂，緩衝吃滿 300 列時
+  // 把剛落地的那一頁砍掉），下面的 `_setCursorPos(seq, seq.length - 1)` 就落在**舊緩衝**
+  // 的末列＝使用者回報的「體感變成單純移到列表頂/底部」，接著 demand prefetch
+  // 還會用舊邊界當 anchor 跳號，連 server 游標一起拉回舊位置。樞紐已經修好，
+  // 這裡只是把「下次又有人把樞紐算錯」的結果從靈媒失效降級成「退回跳號語意」。
+  //
+  // 重建路徑與已驗証的 _beginJumpNumber 一樣（落點頁 wholesale）。`edge` 帶給 _rebuild
+  // 而不是事後設：理由見 _rebuild 的註解。
+  _adoptJumpLandingIfDropped: function(landed, edge) {
+    if (!landed) return false;
+    // 落點頁的代表編號：Home → 第 1 篇；End → 落點頁最大編號（游標可能停在
+    // 置底列 ⇒ cursorRowNum 為 null，不能只看它）。
+    let mark = null;
+    const nums = landed.nums || [];
+    for (let i = 0; i < nums.length; ++i) {
+      if (nums[i] == null) continue;
+      if (mark == null || (edge === 'up' ? nums[i] < mark : nums[i] > mark))
+        mark = nums[i];
+    }
+    if (mark == null) return false; // 整頁置底文：沒有編號可供比對
+    if ((this._termBuf.listLineNums || []).indexOf(mark) !== -1) return false;
+    this._core.debugRecorder?.log('listSession.jumpLandingDropped', {
+      edge: edge,
+      mark: mark,
+      bufferLen: (this._termBuf.listLineNums || []).length
+    });
+    this._rebuild(landed, edge);
+    return true;
   },
 
   // Absolute listLines index of the current selection. Numbered selections

@@ -30,7 +30,8 @@ import {
   boardListFetchTarget,
   boardListFetchVerdict,
   isBoardListSeparatorRow,
-  isBoardListBlockedRow
+  isBoardListBlockedRow,
+  parseBoardListName
 } from './board_list_parse';
 import { bufferEdgeNum } from './list_session';
 import { rowToText } from './comment_parse';
@@ -48,7 +49,7 @@ import {
   BRD_CMD_PREFIX,
   isBoardListCommandKind
 } from './list_render_owner';
-import { keyEventToBytes } from './term_keyboard';
+import { keyEventToBytes, altRemapCharCode, isAltRemapEvent } from './term_keyboard';
 import { u2b, ansiHalfColorConv, normalizePasteText } from './string_util';
 import { clickableColStart } from './mouse_regions';
 import { LEFT_ARROW } from './function_key_plan';
@@ -114,10 +115,12 @@ function prefersReducedMotion() {
 // active       畫累積緩衝，本地導覽
 // functionMode 原生 LIVE 鏡像，所有鍵放行（自癒與 passthrough 的落點，黏性）
 // opening      序列化交易在飛（開看板／離開／跳號），畫面凍住＋吞鍵
+// suspended    進了看板（文章列表在畫面上），**緩衝與捲動錨整份留著**，等退板
+//              回來原樣接上（同 list_session 的 suspended）。畫面所有權已交還。
 //
 // 事件（全部是先算好的布林，便於窮舉測試）：
-//   { type:'settle', ctx, inFlightKind, consumed, sameVariant, holdReason,
-//     withinResumeGrace, engageEligible }
+//   { type:'settle', ctx, inFlightKind, consumed, sameVariant, landedSameList,
+//     holdReason, withinResumeGrace, engageEligible }
 //   { type:'key', keyClass }
 //   { type:'resume-probe', ... }（同 settle 的欄位；靜置探針量當下畫面合成）
 //   { type:'pref-off' } | { type:'transaction-failed' }
@@ -149,8 +152,14 @@ export function transitionBoardListSession(state, event) {
               ? { next: 'active', actions: ['continue-fill'] }
               : { next: 'active', actions: ['rebuild'] };
           case 'article-list':
+            // 進板了（不是走我們自己的開板交易——那條在 _enqueueLandingKey 的
+            // onDone 就決定了）。畫面所有權交還給 ListSession／原生，但**緩衝與
+            // 捲動錨留著**：退板回來時原樣接上（不變量 N6）。編號空間有沒有換
+            // 由 resume 的指紋（landedSameList）判，換了就整份重建。
+            return { next: 'suspended', actions: ['suspend'] };
           case 'menu':
-            // 真的離開看板列表了（進板／回主功能表）⇒ 收攤，畫面交給另一邊。
+            // 真的離開看板列表了（回主功能表／分類看板根）⇒ 收攤，緩衝丟掉：
+            // 上一層是另一個編號空間，留著只會別名。
             return { next: 'idle', actions: ['cleanup'] };
           default:
             // brdlist-other（全部看板／newflag：本期不做，handoff I10）與各種
@@ -210,6 +219,26 @@ export function transitionBoardListSession(state, event) {
         return stay;
       }
       return stay; // 原生鏡像下鍵盤 hook 根本不會呼叫進來
+
+    case 'suspended':
+      if (event.type !== 'settle') return stay;
+      switch (event.ctx) {
+        case 'brdlist':
+          if (event.inFlightKind) return stay; // 交易在飛（AID 前導段等），別插隊
+          if (!event.engageEligible) return { next: 'idle', actions: ['cleanup'] };
+          // 退板回到**同一份**清單 ⇒ 採用 server 游標、捲動錨一律不動
+          //（不變量 N6）。否則是另一個編號空間（目錄看板遞迴／變體換了）⇒
+          // 整份重建，那時視野跳一下才是對的。
+          return event.sameVariant && event.landedSameList
+            ? { next: 'active', actions: ['resume-in-place'] }
+            : { next: 'active', actions: ['seed', 'start-fill'] };
+        case 'menu':
+          // 從板內一路回到主功能表／分類看板根：真的離開了，緩衝丟掉。
+          if (event.inFlightKind) return stay; // 同 functionMode 的 AID 守門
+          return { next: 'idle', actions: ['cleanup'] };
+        default:
+          return stay; // 板內的一切（文章列表翻頁、讀文、prompt…）
+      }
 
     case 'opening':
       if (event.type === 'transaction-failed')
@@ -322,10 +351,46 @@ BoardListSession.prototype = {
       inFlightKind: this._queue.inFlightKind,
       consumed: !!consumed,
       sameVariant: !!(facts.brd && facts.brd.variant === this._variant),
+      landedSameList: this._landedSameList(facts),
       holdReason: this._holdReason,
       withinResumeGrace: Date.now() - this._resumedAt < RESUME_GRACE_MS,
       engageEligible: this._engageEligible()
     };
+  },
+
+  // 退板落地的這一幀，還是我們進板前那一份清單嗎？（suspended → active 的守門）
+  //
+  // 編號＝絕對位置，但**同變體的不同清單共用同一個編號空間形狀**：分類看板的
+  // 目錄列（`NBRD_FOLDER`）按 Enter 會遞迴進另一份 choose_board，footer 變體
+  // 一模一樣（board.c:1279-1290 只看 IS_LISTING_FAV/IN_CLASS）⇒ 只比 variant ＋
+  // 「落點編號在緩衝裡」會把兩份清單混進同一個緩衝。
+  // 判準＝落點那一列的**板名**要跟緩衝裡同編號那一列相同。那是我們剛剛讀完的
+  // 看板（`num` 是 static，board.c:1646 ⇒ 退板一定停在原處），對不上就代表
+  // 畫面換了一份清單。板名不會因為讀過而變（變的是 cols 8-9 的未讀標記）。
+  //
+  // **整頁指紋**（2026-09-12）：只比游標那一列不夠。開板的落點守門放寬成排除法
+  //（見 `_enqueueLandingKey`）之後，群組看板遞迴進另一份 choose_board 也會經過
+  // suspended，而它的落點是第 1 列（board.c:1985 `num = 0`）——第 1 列剛好同名
+  // 就會把兩份清單 merge 進同一個緩衝（靜默錯誤）。所以整頁掃一遍：落地頁每一列
+  // 只要在緩衝裡有同編號的列，板名就必須一致；有任一列矛盾就不是同一份清單。
+  // 緩衝沒有的編號不算證據（落地頁本來就可能比緩衝多出邊界列）。
+  _landedSameList: function(facts) {
+    const brd = facts && facts.brd;
+    if (!brd || brd.cursorNum == null) return false;
+    const buffered = this._rowTextOf(brd.cursorNum);
+    if (!buffered) return false;
+    const name = parseBoardListName(facts.rowTexts[facts.curY] || '');
+    if (!name || name !== parseBoardListName(buffered)) return false;
+    const nums = brd.nums || [];
+    for (let r = 0; r < nums.length; ++r) {
+      if (nums[r] == null) continue;
+      const bufText = this._rowTextOf(nums[r]);
+      if (!bufText) continue;
+      const a = parseBoardListName(facts.rowTexts[r] || '');
+      const b = parseBoardListName(bufText);
+      if (a && b && a !== b) return false;
+    }
+    return true;
   },
 
   // pref 開著＝L1 凍結交易＋L2 自動回復生效；關掉＝逐位元回到 2026-09-03 之前。
@@ -333,12 +398,14 @@ BoardListSession.prototype = {
     return !!readValuesWithDefault().enableListNativeAutoResume;
   },
 
-  // pref 開著 ∧ 標準 24 列終端 ∧ 文章好讀沒有正在讀文（同 list_session 的守門，
+  // pref 開著 ∧ 終端機列數合法 ∧ 文章好讀沒有正在讀文（同 list_session 的守門，
   // 那條是為了不與文章模式的 render 分支搶畫面）。
+  // 列數下界 24 ＝ server 端的 clamp（`mbbsd/term.c:55`）；**不是** `=== 24`，
+  // 理由與 list_session._engageEligible 完全相同（見該處長註解）。
   _engageEligible: function() {
     return (
       !!readValuesWithDefault().enableBoardListSmoothScroll &&
-      this._termBuf.rows === 24 &&
+      this._termBuf.rows >= 24 &&
       !this._termBuf.startedEasyReading
     );
   },
@@ -416,6 +483,12 @@ BoardListSession.prototype = {
         return this._rebuild(facts);
       case 'enter-native':
         return this._enterNative(facts);
+      case 'suspend':
+        return this._suspend({ flush: true });
+      case 'resume-in-place':
+        this._resumeInPlace(facts);
+        // 進板時被 flush 掉的背景填充要接回去（緩衝可能還沒填到 _fillTarget）。
+        return this._maybeFill();
       case 'cleanup':
         return this._cleanup();
       default:
@@ -439,7 +512,10 @@ BoardListSession.prototype = {
   // 外部序列化導覽（aid_navigation / long_push）要接管這條線路：先停到原生鏡像，
   // 把中間的 settle 吸收掉，別讓我們自己的交易插隊。
   beginExternalNavigation: function() {
-    if (this.state === 'idle') return;
+    // suspended 與 idle 同樣「我們不在畫面上」⇒ 不要動（此前進板就是 idle，
+    // 這裡的早退路徑本來就涵蓋了板內的 AID 導覽）。切原生鏡像只會白丟緩衝，
+    // 而序列真的把我們帶回別份清單時，退板落地的 landedSameList 指紋會擋下來。
+    if (this.state === 'idle' || this.state === 'suspended') return;
     this.state = 'functionMode';
     // 'external'：**永不自動解除**（不變量 N1）——序列途中的 brdlist 幀很多，
     // 讓靜置探針看到就會把別人的序列從中間截斷。
@@ -450,19 +526,35 @@ BoardListSession.prototype = {
 
   onKeyDown: function(e) {
     // 瀏覽器／app 層的剪貼簿組合鍵留給 term_view 後面那幾個 handler。
+    // **`!e.altKey` 是合約的一部分，別拿掉**：Alt+C/A/V/X 要送 ^C/^A/^V/^X 給 PTT。
     const clipboard =
       (e.ctrlKey &&
         !e.altKey &&
         !e.metaKey &&
         ['c', 'a', 'v', 'x'].indexOf((e.key || '').toLowerCase()) !== -1) ||
       (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && e.key === 'Insert');
-    if (clipboard || e.altKey || e.metaKey) return;
+    // Alt remap（Alt＝PTT 的 Ctrl，全 26 字母）是**本 app 自己造的送鍵入口**，不是
+    // 瀏覽器快捷鍵 ⇒ 與 Ctrl 組合同級，必須走 passthrough 的 sync 腿（Alt+W ＝
+    // board.c:1731 Ctrl('W')）。非字母的 Alt 組合才是瀏覽器的，維持放行。
+    // 判定一律走 term_keyboard.isAltRemapEvent，理由同 list_session.onKeyDown。
+    const altRemap = isAltRemapEvent(e) ? altRemapCharCode(e) : null;
+    if (clipboard || (e.altKey && altRemap === null) || e.metaKey) return;
 
     if (this._busyHint()) {
       e.preventDefault();
       return;
     }
     if (this.state !== 'active') return;
+
+    if (altRemap !== null) {
+      // _classifyKey 走不到：keyEventToBytes 對 altKey 一律回 null ⇒ 判成 'ignore'。
+      // 排在 state gate 之後：交易在飛時與其他鍵一樣被吞掉並給提示。
+      // **排在 _classifyKey 之前是承重的**：看板列表的 b 是 PgUp 同義鍵
+      //（board.c:1763），j/k/n/p 是上下移動，順序一反 Alt+B 就變成本地翻頁而不是 ^B。
+      e.preventDefault();
+      this._beginPassthroughBytes(String.fromCharCode(altRemap));
+      return;
+    }
 
     const key = this._classifyKey(e);
     if (key.class === 'ignore') return; // 不 preventDefault：F12／CapsLock 歸瀏覽器
@@ -612,12 +704,20 @@ BoardListSession.prototype = {
 
   // ---- passthrough（非白名單鍵＝一鍵切原生＋代送）------------------------------
 
+  // **Ctrl 組合一樣代送**（2026-09-13）：舊碼寫死 `e.ctrlKey ? null : ...`，把 Ctrl
+  // 組合推進下面的 bytes == null 分支，而那條分支不經過 _beginPassthroughBytes ⇒
+  // **跳過 sync 腿**。board.c 有一整組對真游標那列動作的 Ctrl 鍵（:1890 Ctrl('S')、
+  // :2044 Ctrl('T')），本地導覽零網路 ⇒ server 對錯的那列動作。理由與實證同
+  // list_session._beginNativePassthrough 的標頭。
   _beginNativePassthrough: function(e) {
-    let bytes = e.ctrlKey ? null : keyEventToBytes(e);
-    if (bytes && bytes.length === 1 && bytes.charCodeAt(0) > 127) bytes = u2b(bytes);
+    let bytes = keyEventToBytes(e);
+    // **Ctrl 組合一律不過 u2b**：CtrlShiftMap 的 `[`/`\`/`]` 是 219/220/221，過 u2b
+    // 會被當成 Unicode 字元做 Big5 轉碼 ⇒ 與原生鍵盤路徑送出不同的 byte。
+    if (!e.ctrlKey && bytes && bytes.length === 1 && bytes.charCodeAt(0) > 127)
+      bytes = u2b(bytes);
     if (bytes == null) {
-      // Ctrl 組合：沒辦法序列化代送（我們不擁有這個鍵）。立刻切鏡像，事件不
-      // preventDefault ⇒ 原生鍵盤路徑緊接著會把它送出去。
+      // 只剩 Ctrl+Shift、以及 CtrlShiftMap 沒對應的 Ctrl 組合：算不出 bytes 就沒得
+      // 序列化代送。立刻切鏡像，事件不 preventDefault ⇒ 原生鍵盤路徑緊接著處理。
       const r = transitionBoardListSession(this.state, {
         type: 'key',
         keyClass: 'passthrough'
@@ -802,7 +902,7 @@ BoardListSession.prototype = {
       if (this._view.flashListHint) this._view.flashListHint('看板列表：處理中，請稍候…');
       return;
     }
-    const idx = renderRow - BRD_HEADER_ROWS;
+    const idx = renderRow - this.headerRows();
     if (idx < 0) return; // header
     const guard = !!(
       this._termBuf &&
@@ -1083,7 +1183,9 @@ BoardListSession.prototype = {
     this._freezeForTransaction();
     const self = this;
     const send = function() {
-      self._enqueueLandingKey('\r', 'open-board', '進入看板逾時，已切至原生模式');
+      self._enqueueLandingKey('\r', 'open-board', '進入看板逾時，已切至原生模式', {
+        enteringBoard: true
+      });
     };
     if (num === this._serverNum) send();
     else this._enqueueCursorSyncJump('open-sync-jump', send, function() {
@@ -1112,25 +1214,44 @@ BoardListSession.prototype = {
       });
   },
 
-  // 開看板／回上層／跳號**共用的落地腿**：送出鍵 → 任何一幀 settle 就收攤
-  //（`_reset()` 把 renderMode 交還、state 回 idle），接著同一個 settle 的 reducer
-  // 會依畫面內容自己決定要 engage 誰：
+  // 開看板／回上層**共用的落地腿**：送出鍵 → 任何一幀 settle 就交還畫面所有權
+  //（`_reset()`／開板是 `_suspend()`，兩者都把 renderMode 還原成 native），接著
+  // 同一個 settle 的 reducer 會依畫面內容自己決定要 engage 誰：
   //   文章列表 → ListSession（它的 handler 就在同一輪跑）
   //   新的看板列表 → 我們自己從 idle 重新 seed（新的編號空間，本來就該重建）
   //   主功能表／其他 → 原生
   // 「一律收攤再由內容決定」比在 expect 裡窮舉落點穩健得多：`←` 的上層可能是
   // 主功能表、分類看板根，也可能是另一份同變體的看板列表。
-  _enqueueLandingKey: function(keys, kind, failMsg) {
+  //
+  // opts.enteringBoard：開板專用 —— 進了看板就一定會從同一個 choose_board 呼叫點
+  // 退回來（`Read()` 回到它的呼叫者），使用者捲出來的視野該原樣還給他 ⇒ 改成
+  // `_suspend()`（緩衝留著）。
+  //
+  // 守門是**排除法**：只有落在「另一個編號空間」（另一份看板列表、上一層選單）
+  // 才收攤。**不可以寫成「落點是文章列表才 suspend」**——開板的落地幀通常根本
+  // 不是文章列表：`Read()` 在 `i_read()` 之前先跑 `more(<板>/notes)` ＋
+  // `pressanykey()`（bbs.c:4646-4655），也就是進板畫面（ctx 'other'）。它只在
+  // `currbid != bnote_lastbid` 時出現（同一連線第二次進同一板就沒有）⇒ 白名單版
+  // 的守門會時好時壞，實錄見錄製檔 ptt-debug-20260912-015707。
+  // 落點未知（facts 缺）同樣保留緩衝，交給退板落地幀的 `landedSameList` 指紋。
+  _enqueueLandingKey: function(keys, kind, failMsg, opts) {
     const self = this;
+    let landedCtx = null;
     this._queue.enqueue({
       keys: keys,
       kind: BRD_CMD_PREFIX + kind,
-      expect: function() {
+      expect: function(snap, facts) {
+        landedCtx = facts ? facts.ctx : null;
         return true;
       },
       timeoutMs: NATIVE_PASSTHROUGH_MS,
       onDone: function() {
-        self._reset();
+        const otherSpace =
+          landedCtx === 'brdlist' ||
+          landedCtx === 'brdlist-other' ||
+          landedCtx === 'menu';
+        if (opts && opts.enteringBoard && !otherSpace) self._suspend();
+        else self._reset();
       },
       onFail: function() {
         self._degradeToNative(failMsg);
@@ -1243,6 +1364,31 @@ BoardListSession.prototype = {
     this._forceRedraw();
   },
 
+  // 進板：把畫面所有權交還，但**緩衝／捲動錨／變體整份留著**（state → suspended）。
+  // 與 _reset 的唯一差別就是這個保留 —— 退板回到同一份清單時 _resumeInPlace 把
+  // 使用者自己捲出來的視野原樣接回去（不變量 N6），而不是被 server 那一頁
+  //（`head = (num/p_lines)*p_lines`，20 列分頁）重新釘住。
+  // opts.flush：reducer 那條路要清掉自己還在排的補頁命令（進板後那些鍵不能再送）；
+  // 交易 onDone 那條路**不可以** flush（in-flight 就是我們自己剛完成的那一條）。
+  _suspend: function(opts) {
+    this._breakScroll();
+    this._holdReason = null;
+    this._cancelResumeProbe();
+    if (this._frozenWatchdog) {
+      clearTimeout(this._frozenWatchdog);
+      this._frozenWatchdog = null;
+    }
+    if (opts && opts.flush) this._queue.flushKind(BRD_CMD_PREFIX);
+    this._setLoading(false);
+    this.state = 'suspended';
+    // 板內 server 游標會亂跑 ⇒ 不確定；退板落地幀會重教（同 _enterNative）。
+    this._serverNum = null;
+    this._prunePivotOverride = undefined;
+    this._renderMode = 'native';
+    this._view.showCursor();
+    this._forceRedraw();
+  },
+
   _cleanup: function() {
     // **只清自己的命令**：這條佇列是與 ListSession／AidNavigation／LongPush 共用的，
     // 整條 flush 會把別人剛排進去的命令靜默殺掉（進板那一幀 ListSession 正好在
@@ -1252,6 +1398,12 @@ BoardListSession.prototype = {
   },
 
   // ---- 序列／視窗 -------------------------------------------------------------
+
+  // 渲染後畫面裡 body 從第幾列開始。理由同 ListSession.headerRows（滑鼠座標鏈
+  // 一律問 session，不要由呼叫端挑常數）——這裡回的是**看板列表自己**的那個。
+  headerRows: function() {
+    return BRD_HEADER_ROWS;
+  },
 
   // body 的列數（原生 24 列畫面的 rows 3..22 ＝ p_lines ＝ 20）。
   _bodyRows: function() {
@@ -1335,7 +1487,10 @@ BoardListSession.prototype = {
 
   // evict／prune 的樞紐＝**視口頂那一列**（使用者眼前的位置），退路才是選取：
   // 游標與捲動位置解耦後，使用者可以把畫面捲到離游標很遠的地方。
+  // 遠跳（Home/End/跳號）期間樞紐必須是**落點那一側**，理由與修歷見
+  // list_session.js#evictPivot（同一個 bug 的同構面）。
   evictPivot: function() {
+    if (this._prunePivotOverride !== undefined) return this._prunePivotOverride;
     return this._topNum != null ? this._topNum : this._selectedNum;
   },
 

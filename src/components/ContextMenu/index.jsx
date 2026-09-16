@@ -7,6 +7,7 @@ import PrefModal from "./PrefModal";
 import TitleBlacklistModal from "./TitleBlacklistModal";
 import LongPushModal from "./LongPushModal";
 import LongPushProgressModal from "./LongPushProgressModal";
+import LongPushErrorModal from "./LongPushErrorModal";
 import DebugRecordButton from "../DebugRecordButton";
 import { onPrefSaveImpl } from "./pref_save";
 import { downloadAsFile } from "../../js/util";
@@ -29,11 +30,14 @@ import {
 } from "../../js/article_link_target";
 import {
   menuTargetFlags,
+  contextMenuDisposition,
   copyTextFor,
   copyPreviews,
 } from "../../js/context_menu_items";
-import { parsePagerFooterContext } from "../../js/string_util";
+import { isNativeMenuTarget } from "../../js/preview_targets";
 import { pushMaxBytes } from "../../js/long_push";
+import { longPushAvailable } from "../../js/long_push_gate";
+import { serializedOpHint } from "../../js/serialized_op_gate";
 
 function noop() {}
 
@@ -132,14 +136,22 @@ const initialState = {
   longPushEnabled: false,
   // 輸入框顯示「會分成幾則」用的**預估**上限；真正送出時由 LongPushSession 依
   // 推文輸入列的 prompt（自己的帳號）與畫面上的推文列（有沒有 IP 欄）校正。
+  // 這個保守初值只在「輸入框還沒開過」時成立——開的那一刻 openLongPush 會現算。
   longPushMaxBytes: pushMaxBytes({}),
   // --- Modal state ---
   showsInputHelper: false,
   showsTitleBlacklist: false,
   titleBlacklistDraft: "",
   showsLongPush: false,
-  // LongPushSession 的進度快照（null ＝ 沒在送，遮罩不出現）。
+  // 探路（startPreflight）從 PTT 畫面讀回來的事實，交給輸入框顯示：禁不禁噓、
+  // 這次會不會被降級成 →、目前在不在冷卻。null ＝ 沒探過路。
+  longPushPreflight: null,
+  // LongPushSession 的進度快照（null ＝ 沒在送，遮罩不出現）。探路期間也用它
+  // （phase: 'preflight'），使用者按下 X 之後才不會什麼都沒有。
   longPushProgress: null,
+  // 推不出去的終局（探路被擋／送出中止／取消）。內含 PTT 的原文訊息與還沒送出
+  // 的內容，null ＝ 沒有錯誤框。
+  longPushError: null,
   showsLiveArticleHelper: false,
   showsSettings: false,
   // --- LiveHelper state ---
@@ -180,7 +192,8 @@ export const ContextMenu = ({ pttchrome }) => {
     state.showsSettings ||
     state.showsTitleBlacklist ||
     state.showsLongPush ||
-    !!state.longPushProgress;
+    !!state.longPushProgress ||
+    !!state.longPushError;
   useEffect(() => {
     pttchrome.setModalOpen("contextMenu", modalOpen);
   }, [pttchrome, modalOpen]);
@@ -190,22 +203,57 @@ export const ContextMenu = ({ pttchrome }) => {
     const session = pttchrome.longPush;
     if (!session) return undefined;
     session.onChange = (progress) => update({ longPushProgress: progress });
+    // 探路的結果。遮罩收掉與「開輸入框／開錯誤框」**必須在同一次 update**：分兩次
+    // 的話 modalOpen 會 true→false→true，中間那一幀終端機會把焦點搶回隱藏 input #t
+    // （modal_shown_sources.test.js / connect_failure.offline.spec.js 守的那個坑）。
+    session.onPreflight = (result) =>
+      update(
+        result.blocked
+          ? {
+              longPushProgress: null,
+              showsLongPush: false,
+              longPushPreflight: null,
+              longPushError: result,
+            }
+          : {
+              longPushProgress: null,
+              showsLongPush: true,
+              longPushPreflight: result,
+              longPushMaxBytes:
+                result.maxBytes || stateRef.current.longPushMaxBytes,
+            },
+      );
+    // 送出階段的終局（失敗／取消）。成功不走這裡（session 自己閃一則 toast）。
+    session.onResult = (result) =>
+      update({ longPushProgress: null, longPushError: result });
     return () => {
       session.onChange = null;
+      session.onPreflight = null;
+      session.onResult = null;
     };
   }, [pttchrome, update]);
 
   const onContextMenu = useCallback(
     (event) => {
-      event.stopPropagation();
-      event.preventDefault();
+      // **preventDefault 不可以再無條件放在最前面**：壓在內嵌預覽圖上時要整個放行
+      // 瀏覽器原生選單（另存圖片／複製圖片／以智慧鏡頭搜尋）——那是唯一入口，沒有
+      // 任何網頁 API 叫得出來。三個分支的**順序**由 contextMenuDisposition 決定
+      // （純函式，守護 tests/unit/context_menu_disposition.test.js）。
       const { CmdHandler } = pttchrome;
-      const doDOMMouseScroll =
-        CmdHandler.getAttribute("doDOMMouseScroll") === "1";
-      if (doDOMMouseScroll) {
+      const disposition = contextMenuDisposition({
+        nativeTarget: isNativeMenuTarget(event.target),
+        doDOMMouseScroll: CmdHandler.getAttribute("doDOMMouseScroll") === "1",
+      });
+      if (disposition === "swallow") {
+        // 「按住右鍵滾輪翻頁」放開右鍵時補發的那一次，照舊吞掉。
+        event.stopPropagation();
+        event.preventDefault();
         CmdHandler.setAttribute("doDOMMouseScroll", "0");
         return;
       }
+      if (disposition === "native") return; // 一個 preventDefault 都不准叫
+      event.stopPropagation();
+      event.preventDefault();
       pttchrome.contextMenuShown = true;
       // just in case the selection get de-selected
       if (window.getSelection().isCollapsed) {
@@ -355,15 +403,14 @@ export const ContextMenu = ({ pttchrome }) => {
         imageUploadEnabled: !!prefs.enableImageUpload,
         inputHelperEnabled: !!prefs.enableInputHelper,
         liveArticleHelperEnabled: !!prefs.enableLiveArticleHelper,
-        // 長推文要真的按得到 X：站內信（currstat == RMAIL）的 pager 把 X 當成別的
-        // 快捷鍵（more.c 的 footer 是「(y)回信」那一組），送過去等於亂按。
-        // parsePagerFooterContext 只能單向推論，所以用「不是 mail」而非「是 reading」
-        // ——footer 會因為寬度不夠整段消失（string_util 的說明）。
-        longPushEnabled:
-          !!prefs.enableLongPush &&
-          pttchrome.buf.pageState === 3 &&
-          parsePagerFooterContext(lastRowText) !== "mail",
-        longPushMaxBytes: pushMaxBytes({ userId: prefs.autoLoginUser }),
+        // 長推文要真的按得到 X。判準與「攔截推文鍵」共用**同一個**函式，兩處不可能
+        // 分歧（見 long_push_gate.js；push_screen 的分歧是前車之鑑）。攔截那邊多一
+        // 道 atPagerStatusRow 是刻意的不對稱：吞掉按鍵比多畫一個選單項嚴重。
+        longPushEnabled: longPushAvailable({
+          prefs,
+          pageState: pttchrome.buf.pageState,
+          lastRowText,
+        }),
       });
     },
     [pttchrome, update],
@@ -443,27 +490,87 @@ export const ContextMenu = ({ pttchrome }) => {
     [pttchrome, onTitleBlacklistHide],
   );
 
-  // 長推文：開輸入框 → 按下送出後交給 LongPushSession，遮罩由它推上來的進度驅動。
-  // longPushMaxBytes 是開選單當下算好的預估上限，跨 initialState 重設要留著。
+  // 長推文：探路 → 開輸入框 → 按下送出後交給 LongPushSession，遮罩由它推上來的
+  // 進度驅動。
+  //
+  // 這個是**唯一**的入口函式，右鍵選單與「攔截推文鍵」共用。它先啟動探路
+  // （送一個 X 問 PTT 推不推得了），輸入框要等 onPreflight 回來才開——不能推的話
+  // 開的是錯誤框。**回 true 的意思是「我接手了這次按鍵」**（見 openLongPushModal
+  // 的合約註解），不是「輸入框已經開了」。
+  //
+  // maxBytes 在這一刻現算當**預估**：攔截那條沒有「開右鍵選單」那一刻，沿用開選單
+  // 時算好的值會拿到 initialState 的保守預設，「會分成幾則」就明顯高估。探路回來時
+  // 若讀到了自己的帳號／IP 欄，會再用準的值蓋過去。
+  const openLongPush = useCallback(() => {
+    const prefs = readValuesWithDefault();
+    const estimate = pushMaxBytes({ userId: prefs.autoLoginUser });
+    const session = pttchrome.longPush;
+    // 測試替身／還沒建好 session：退回探路上線前的行為，直接開輸入框。
+    if (!session || !session.startPreflight) {
+      update({
+        ...initialState,
+        showsLongPush: true,
+        longPushMaxBytes: estimate,
+      });
+      return true;
+    }
+    // **順序不可換**：startPreflight 內部的 _emit 會先經 onChange 寫一次
+    // longPushProgress，接著的 update({...initialState}) 會把它蓋掉，所以那個
+    // 值要在這裡補回去。
+    if (!session.startPreflight({ maxBytes: estimate })) return false;
+    update({
+      ...initialState,
+      longPushMaxBytes: estimate,
+      longPushProgress: {
+        index: 0,
+        total: 0,
+        phase: "preflight",
+        waitSec: 0,
+        message: "",
+      },
+    });
+    return true;
+  }, [pttchrome, update]);
   const onLongPushClick = useCallback(
     (event) => {
       event.stopPropagation();
       pttchrome.contextMenuShown = false;
-      update({
-        ...initialState,
-        showsLongPush: true,
-        longPushMaxBytes: stateRef.current.longPushMaxBytes,
-      });
+      // 接不下來（線路上已經有別的序列化操作）就要說一聲，不能默默沒反應。
+      if (!openLongPush())
+        pttchrome.view?.flashListHint?.(
+          serializedOpHint(pttchrome) || i18n("longPushError_busy"),
+          3000,
+        );
     },
-    [pttchrome, update],
+    [pttchrome, openLongPush],
   );
-  const onLongPushHide = useCallback(
-    () => update({ showsLongPush: false }),
+  // App → React 的注入，比照 onToggleLiveHelperModalState。**不掛 pref 當
+  // dependency**：能不能攔是每次按鍵現算的（pageState／底列，見 long_push_gate），
+  // 綁上去會做出「改完設定要重開選單才生效」的怪行為。
+  useEffect(() => {
+    pttchrome.openLongPushModal = openLongPush;
+    return () => {
+      pttchrome.openLongPushModal = noop;
+    };
+  }, [pttchrome, openLongPush]);
+  // 關掉輸入框＝這次不推了：探路成果（錨點／閱讀位置／AID）沒有用了，留著只會
+  // 讓下一次 start() 拿舊錨點去比對新畫面。
+  const onLongPushHide = useCallback(() => {
+    update({ showsLongPush: false, longPushPreflight: null });
+    pttchrome.longPush?.disarm();
+  }, [pttchrome, update]);
+  const onLongPushErrorHide = useCallback(
+    () => update({ longPushError: null }),
     [update],
+  );
+  // 剩餘內容由使用者自己按（舊版是偷偷蓋掉他的剪貼簿）。
+  const onLongPushCopyRest = useCallback(
+    (text) => pttchrome.doCopy(text),
+    [pttchrome],
   );
   const onLongPushConfirm = useCallback(
     ({ text, type }) => {
-      update({ showsLongPush: false });
+      update({ showsLongPush: false, longPushPreflight: null });
       if (pttchrome.longPush)
         pttchrome.longPush.start({
           text,
@@ -704,7 +811,9 @@ export const ContextMenu = ({ pttchrome }) => {
     longPushEnabled,
     longPushMaxBytes,
     showsLongPush,
+    longPushPreflight,
     longPushProgress,
+    longPushError,
     showsInputHelper,
     showsTitleBlacklist,
     titleBlacklistDraft,
@@ -767,6 +876,7 @@ export const ContextMenu = ({ pttchrome }) => {
       <LongPushModal
         show={showsLongPush}
         maxBytes={longPushMaxBytes}
+        preflight={longPushPreflight}
         imageUpload={pttchrome.imageUpload}
         onHide={onLongPushHide}
         onConfirm={onLongPushConfirm}
@@ -774,6 +884,11 @@ export const ContextMenu = ({ pttchrome }) => {
       <LongPushProgressModal
         progress={longPushProgress}
         onCancel={onLongPushCancel}
+      />
+      <LongPushErrorModal
+        error={longPushError}
+        onHide={onLongPushErrorHide}
+        onCopy={onLongPushCopyRest}
       />
       <PrefModal
         show={showsSettings}

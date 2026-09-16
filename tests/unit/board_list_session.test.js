@@ -21,12 +21,18 @@ const FOOT_FAV =
 const HEADER_NUM =
   "   編號   看  板       類別   中   文   敘   述               人氣 板   主";
 
-function brdScreenRows({ startNum = 1, count = 20, bodyRows = null } = {}) {
+// totalRows ＝終端機列數；body 佔 rows-4（＝pttbbs 的 p_lines）。預設 24 列。
+function brdScreenRows({
+  startNum = 1,
+  count = 20,
+  bodyRows = null,
+  totalRows = 24,
+} = {}) {
   const rowTexts = ["【看板列表】 批踢踢實業坊", "[←][q]回上層 [↑↓]選擇", HEADER_NUM];
   const body =
     bodyRows ||
     Array.from({ length: count }, (_, i) => brdRow(startNum + i, "B" + (startNum + i)));
-  for (let i = 0; i < 20; ++i) rowTexts.push(body[i] || "");
+  for (let i = 0; i < totalRows - 4; ++i) rowTexts.push(body[i] || "");
   rowTexts.push(FOOT_FAV);
   return rowTexts;
 }
@@ -36,7 +42,7 @@ const charOf = (ch) => ({ ch, isLeadByte: false, resetAttr() {} });
 const rowChars = (text) =>
   Array.from({ length: 80 }, (_, i) => charOf(text[i] || " "));
 
-function makeSession({ prefOn = true } = {}) {
+function makeSession({ prefOn = true, rows = 24 } = {}) {
   window.localStorage.setItem(
     "pttchrome.pref.v1",
     JSON.stringify({ values: { enableBoardListSmoothScroll: prefOn } })
@@ -55,18 +61,18 @@ function makeSession({ prefOn = true } = {}) {
   };
   let settleListener = null;
   const termBuf = {
-    rows: 24,
+    rows,
     cols: 80,
     lines: [],
     brdListLines: [],
     brdListLineNums: [],
     listRenderMode: "native",
     listRenderOwner: null,
-    lineChangeds: new Array(24).fill(false),
+    lineChangeds: new Array(rows).fill(false),
     changed: false,
     settleSnapshot: null,
     startedEasyReading: false,
-    _rowTexts: new Array(24).fill(""),
+    _rowTexts: new Array(rows).fill(""),
     getRowText(r) {
       return this._rowTexts[r] || "";
     },
@@ -174,13 +180,73 @@ describe("transitionBoardListSession（純 reducer）", () => {
     ).toEqual(["rebuild"]);
   });
 
-  test("active：落到文章列表／主功能表 → 收攤回 idle（畫面交給另一邊）", () => {
-    for (const ctx of ["article-list", "menu"]) {
-      expect(transitionBoardListSession("active", settle({ ctx }))).toEqual({
-        next: "idle",
-        actions: ["cleanup"],
-      });
-    }
+  test("active：進板 → suspended（緩衝留著）；回主功能表 → 收攤回 idle", () => {
+    // 進板＝還會從同一個 choose_board 退回來 ⇒ 緩衝與捲動錨留著，
+    // 退板時原樣接上（不變量 N6）。主功能表＝真的離開，上一層是另一個編號空間。
+    expect(
+      transitionBoardListSession("active", settle({ ctx: "article-list" }))
+    ).toEqual({ next: "suspended", actions: ["suspend"] });
+    expect(transitionBoardListSession("active", settle({ ctx: "menu" }))).toEqual({
+      next: "idle",
+      actions: ["cleanup"],
+    });
+  });
+
+  test("suspended：退回同一份清單 → resume-in-place（捲動錨不動）", () => {
+    expect(
+      transitionBoardListSession(
+        "suspended",
+        settle({ sameVariant: true, landedSameList: true, engageEligible: true })
+      )
+    ).toEqual({ next: "active", actions: ["resume-in-place"] });
+  });
+
+  test("suspended：落到別份清單（目錄看板遞迴／換變體）→ 整份重建", () => {
+    // 分類看板的目錄列 Enter 會遞迴進另一份 choose_board：footer 變體一模一樣、
+    // 編號同樣是絕對位置 ⇒ 只比 variant 會把兩份清單混進同一個緩衝。
+    for (const o of [
+      { sameVariant: true, landedSameList: false },
+      { sameVariant: false, landedSameList: true },
+    ])
+      expect(
+        transitionBoardListSession(
+          "suspended",
+          settle({ ...o, engageEligible: true })
+        )
+      ).toEqual({ next: "active", actions: ["seed", "start-fill"] });
+  });
+
+  test("suspended：板內的一切 settle 都只是 stay", () => {
+    for (const ctx of ["article-list", "brdlist-other", "other"])
+      expect(
+        transitionBoardListSession("suspended", settle({ ctx })).next
+      ).toBe("suspended");
+  });
+
+  test("suspended：回主功能表 → cleanup；交易在飛時不得插隊", () => {
+    expect(
+      transitionBoardListSession("suspended", settle({ ctx: "menu" }))
+    ).toEqual({ next: "idle", actions: ["cleanup"] });
+    // AID 退出前導段行經選單／看板列表時不得被 cleanup 的 flush 打斷（同 functionMode）。
+    for (const ctx of ["menu", "brdlist"])
+      expect(
+        transitionBoardListSession(
+          "suspended",
+          settle({ ctx, inFlightKind: "aid-escape", engageEligible: true })
+        )
+      ).toEqual({ next: "suspended", actions: [] });
+  });
+
+  test("suspended：pref 關掉／不可 engage → 收攤", () => {
+    expect(
+      transitionBoardListSession("suspended", { type: "pref-off" })
+    ).toEqual({ next: "idle", actions: ["cleanup"] });
+    expect(
+      transitionBoardListSession(
+        "suspended",
+        settle({ sameVariant: true, landedSameList: true, engageEligible: false })
+      )
+    ).toEqual({ next: "idle", actions: ["cleanup"] });
   });
 
   test("REGRESSION（I10）：active 收到不在本期範圍的看板列表 → 顯性切原生", () => {
@@ -266,6 +332,18 @@ describe("engage / 收攤", () => {
     expect(termBuf.listRenderMode).toBe("native");
   });
 
+  // REGRESSION：設定頁「BBS 終端機大小 → 固定字體大小」的列數是由視窗高度反推
+  // （term_size.calcTermSize），可視高 > 480px 就 > 24 列 ⇒ 舊碼的 `rows === 24`
+  // 讓整個功能靜默失效（勾了設定完全沒反應）。下界 24 照 mbbsd/term.c:55。
+  test("REGRESSION：非 24 列的終端機（固定字體大小模式）照樣接管", () => {
+    const { s, termBuf } = makeSession({ rows: 40 });
+    expect(s._engageEligible()).toBe(true);
+    termBuf.feed(brdScreenRows({ count: 36, totalRows: 40 }), { curY: 3 });
+    expect(s.state).toBe("active");
+    expect(termBuf.listRenderMode).toBe("buffer");
+    expect(termBuf.listRenderOwner).toBe("board-list");
+  });
+
   test("落到主功能表 → 收攤，所有權釋放回原生", () => {
     const { s, termBuf } = makeSession();
     termBuf.feed(brdScreenRows());
@@ -275,6 +353,36 @@ describe("engage / 收攤", () => {
     expect(s.state).toBe("idle");
     expect(termBuf.listRenderMode).toBe("native");
     expect(termBuf.listRenderOwner).toBeNull();
+  });
+
+  // 看板列表的 header 是**自己的**常數（BRD_HEADER_ROWS，與文章列表的
+  // LIST_HEADER_ROWS 同值但語意不同）。滑鼠座標鏈兩種列表共用，所以「render row
+  // ↔ body idx」的換算一律走 session 的 headerRows()，不得寫死任一常數。
+  test("列號換算走 session 的 headerRows()（不是寫死的常數）", () => {
+    const mk = () => {
+      const ctx = makeSession();
+      ctx.termBuf.feed(brdScreenRows());
+      seedBuffer(ctx.termBuf, 1, 20);
+      ctx.s._serverNum = ctx.s._selectedNum; // 真游標已同步 ⇒ 開板不必先跳號
+      return ctx;
+    };
+    // baseline：header = 3 ⇒ render row 3 是 body 第 0 項，點下去會開板。
+    // （少了這段，下面那條會在「其實根本沒走到換算」的情況下沉默通過。）
+    const base = mk();
+    expect(base.s.headerRows()).toBe(3);
+    base.s.onMouseClick(3, 10);
+    expect(base.s.state).toBe("opening");
+    expect(base.s._selectedNum).toBe(1);
+
+    // headerRows 換成 4 ⇒ 同一個 render row 落在 header 區，不得開板。
+    const moved = mk();
+    moved.s.headerRows = () => 4;
+    moved.s.onMouseClick(3, 10);
+    expect(moved.s.state).toBe("active");
+    // row 4 才是 body 第 0 項。
+    moved.s.onMouseClick(4, 10);
+    expect(moved.s.state).toBe("opening");
+    expect(moved.s._selectedNum).toBe(1);
   });
 
   test("disable()：pref 關掉一律回到原生", () => {
@@ -428,6 +536,34 @@ describe("本地導覽（游標夾住，不照抄 PTT 的 wrap）", () => {
 
 // ---------------------------------------------------------------------------
 
+// 遠跳（Home/End）期間 evict 的樞紐必須是落點那一側 —— 與 ListSession 同構的同一個
+// bug（2026-09-10 回報「好讀列表 Home/End 有時失效」，錄製檔 ptt-debug-20260910-021827）。
+// 樞紐若還是「跳之前的視口頂」，evictListBuffer 的「砍離樞紐最遠的那一端」正好把剛
+// 落地的那一頁砍掉（緩衝吃滿 MAX_LIST_ROWS 時）。
+describe("evictPivot（遠跳期間改用落點樞紐）", () => {
+  test("沒有遠跳在飛 → 視口優先，退路才是選取", () => {
+    const { s } = makeSession();
+    s._topNum = 115;
+    s._selectedNum = 100;
+    expect(s.evictPivot()).toBe(115);
+    s._topNum = null;
+    expect(s.evictPivot()).toBe(100);
+  });
+
+  test("遠跳在飛 → 與 prunePivot 同一個覆寫（null 留板尾、1 留第 1 項）", () => {
+    const { s } = makeSession();
+    s._topNum = 115;
+    s._selectedNum = 100;
+    s._prunePivotOverride = null; // brd-jump-end 在飛
+    expect(s.evictPivot()).toBe(null);
+    expect(s.prunePivot()).toBe(null);
+    s._prunePivotOverride = 1; // brd-jump-home 在飛
+    expect(s.evictPivot()).toBe(1);
+    s._prunePivotOverride = undefined;
+    expect(s.evictPivot()).toBe(115);
+  });
+});
+
 describe("抓頁（跳號一腿，不用會 wrap 的 PgUp/PgDn）", () => {
   test("往下抓：跳到緩衝底端的下一號，帶 \\f 保證有回應", () => {
     const { s, termBuf, enqueued } = makeSession();
@@ -525,18 +661,19 @@ describe("Enter 進看板", () => {
     return ctx;
   }
 
-  test("一般看板：送 Enter，落地後收攤讓另一邊接手", () => {
+  test("一般看板：送 Enter，落地後交還畫面讓另一邊接手", () => {
     const { s, termBuf, enqueued } = ready();
     s.onKeyDown(keyEvent("Enter"));
     expect(s.state).toBe("opening");
     expect(termBuf.listRenderMode).toBe("frozen");
     const cmd = enqueued[enqueued.length - 1];
     expect(cmd.keys).toBe("\r");
-    // 任何一幀 settle 都是回應：落點可能是文章列表、也可能是進了資料夾／群組看板
-    // 的另一份看板列表，一律收攤後由內容重新決定。
+    // 任何一幀 settle 都是回應：落點可能是進板畫面、文章列表，也可能是進了
+    // 資料夾／群組看板的另一份看板列表，一律交還畫面後由內容重新決定。
     expect(cmd.expect()).toBe(true);
     cmd.onDone();
-    expect(s.state).toBe("idle");
+    // 落點未知（facts 缺）⇒ 保留緩衝等退板指紋判（見 _enqueueLandingKey）。
+    expect(s.state).toBe("suspended");
     expect(termBuf.listRenderMode).toBe("native");
   });
 
@@ -837,5 +974,358 @@ describe("A 類鍵的凍結交易（看板列表：t / v / V）", () => {
     expect(h.s._renderMode).toBe("native");
     expect(h.s._holdReason).toBe("passthrough");
     expect(h.hints.some((m) => m.includes("逾時"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 進板 → 退板：視野不得被 server 那一頁重新釘住
+//
+// 使用者回報（與文章列表好讀同一個症狀，錄製檔 ptt-debug-20260911-113150）：
+// 用滑鼠把某個看板捲到視口最下面，進去再退出，它會跳回畫面中間。
+// 根因：舊行為在進板時 `_reset()` 把緩衝整份丟掉，退板再 `seed` —— 錨變成
+// server 落地頁的頂列，而 `head = (num / p_lines) * p_lines` 是 20 列分頁
+// （board.c:1710-1716）⇒ 位置一律被吸附回分頁邊界。
+// ---------------------------------------------------------------------------
+describe("進板 → 退板：緩衝與捲動錨跨畫面保留", () => {
+  // 文章列表那一幀（boardListContextKind 的指紋：row0 有《》、footer 有「文章選讀」）。
+  const articleListRows = () => {
+    const rows = new Array(24).fill("");
+    rows[0] = " 【板主:none】看板《C_Chat》";
+    rows[23] = "  文章選讀  (y)回應(X)推文";
+    return rows;
+  };
+
+  // 進板前：緩衝 1..60、使用者把視口捲到頂＝21（序列位置 20）、游標 40。
+  const engaged = () => {
+    const h = makeSession();
+    seedBuffer(h.termBuf, 1, 60);
+    h.s.state = "active";
+    h.s._variant = "fav";
+    h.s._renderMode = "buffer";
+    h.s._topNum = 21;
+    h.s._scrollFrac = 9;
+    h.s._selectedNum = 40;
+    h.s._serverNum = 40;
+    h.s._edgeUp = true;
+    h.s._edgeDown = true;
+    return h;
+  };
+
+  test("進板（非交易路徑）→ suspended，緩衝／錨／變體原封不動", () => {
+    const { s, termBuf } = engaged();
+    termBuf.feed(articleListRows(), { curY: 3 });
+
+    expect(s.state).toBe("suspended");
+    expect(s._renderMode).toBe("native"); // 畫面所有權已交還
+    expect(termBuf.brdListLineNums.length).toBe(60); // 緩衝沒被丟掉
+    expect(s._topNum).toBe(21);
+    expect(s._scrollFrac).toBe(9);
+    expect(s._variant).toBe("fav");
+    expect(s._serverNum).toBeNull(); // 板內游標會亂跑 ⇒ 不確定
+  });
+
+  test("退板回到同一份清單 → 錨不動，只採用 server 游標", () => {
+    const { s, termBuf } = engaged();
+    termBuf.feed(articleListRows(), { curY: 3 });
+    // server 退板重繪：`num` 是 static（board.c:1646）⇒ 停在剛讀的 40，
+    // head 對齊到 [21, 40] 那一頁 —— 舊行為就是被這一頁的頂列釘住。
+    termBuf.feed(brdScreenRows({ startNum: 21, count: 20 }), { curY: 3 + 19 });
+
+    expect(s.state).toBe("active");
+    expect(s._renderMode).toBe("buffer");
+    expect(termBuf.brdListLineNums.length).toBe(60); // 緩衝沒被丟掉重建
+    expect(s._topNum).toBe(21); // 沒被 server 落地頁改掉
+    expect(s._scrollFrac).toBe(9);
+    expect(s._selectedNum).toBe(40); // 游標採用落點
+    expect(s._serverNum).toBe(40);
+  });
+
+  test("落到別份清單（同變體、同編號、板名不同）→ 整份重建，不得混進舊緩衝", () => {
+    // 分類看板的目錄列 Enter 會遞迴進另一份 choose_board：footer 變體一樣、
+    // 編號一樣是 1-based 絕對位置 ⇒ 只比編號就會別名。
+    const { s, termBuf } = engaged();
+    termBuf.feed(articleListRows(), { curY: 3 });
+    const other = brdScreenRows({
+      bodyRows: Array.from({ length: 20 }, (_, i) => brdRow(21 + i, "OTHER" + i)),
+    });
+    termBuf.feed(other, { curY: 3 + 19 });
+
+    expect(s.state).toBe("active");
+    // 舊緩衝整份丟掉（_resetBuffer）——不得把別份清單 merge 進來。
+    expect(termBuf.brdListLineNums.length).toBe(0);
+    expect(s._topNum).toBe(21); // seed 採用落地頁頂列（本來就該重新錨定）
+    expect(s._selectedNum).toBe(40);
+  });
+
+  test("從板內一路回到主功能表 → 收攤，緩衝丟掉", () => {
+    const { s, termBuf } = engaged();
+    termBuf.feed(articleListRows(), { curY: 3 });
+    const menu = new Array(24).fill("");
+    menu[0] = "【主功能表】 批踢踢實業坊";
+    termBuf.feed(menu, { curY: 3 });
+
+    expect(s.state).toBe("idle");
+    expect(termBuf.brdListLineNums.length).toBe(0);
+    expect(s._topNum).toBeNull();
+  });
+
+  // 落點守門是**排除法**：只有「另一個編號空間」才收攤。進板畫面（notes 頁／
+  // 請按任意鍵繼續）是 ctx 'other'，它是進板的**必經中間幀**（bbs.c:4646-4655），
+  // 不是離開看板列表。
+  test("開板交易：落在另一份清單／選單才 reset，其餘（含進板畫面）一律 suspend", () => {
+    for (const [ctx, expected] of [
+      ["article-list", "suspended"],
+      ["other", "suspended"], // 進板畫面（請按任意鍵繼續）
+      [null, "suspended"], // facts 缺 ⇒ 未知，交給退板的 landedSameList 指紋
+      ["brdlist", "idle"], // 目錄／群組看板遞迴進另一份 choose_board
+      ["brdlist-other", "idle"],
+      ["menu", "idle"],
+    ]) {
+      const { s, enqueued } = engaged();
+      s._beginOpen();
+      const cmd = enqueued.find((c) => c.kind === BRD_CMD_PREFIX + "open-board");
+      expect(cmd).toBeTruthy();
+      cmd.expect(null, ctx == null ? null : { ctx });
+      cmd.onDone();
+      expect(s.state).toBe(expected);
+    }
+  });
+
+  // 錄製檔 ptt-debug-20260912-015707 的重現：91c6676 之後**還是**會跳位置，因為
+  // 開板落地幀不是文章列表而是進板畫面 —— `Read()` 在 `i_read()` 之前先跑
+  // `more(<板>/notes)` ＋ `pressanykey()`（bbs.c:4646-4655），只在
+  // `currbid != bnote_lastbid` 時出現（同一連線第二次進同一板就沒有 ⇒ 這個 bug
+  // 時有時無）。舊守門只認 'article-list' ⇒ `_reset()` 把緩衝丟光。
+  const noticeRows = () => {
+    const rows = new Array(24).fill("");
+    rows[0] = "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄";
+    rows[23] = " ▄▄▄▄▄▄▄ 請按任意鍵繼續 ▄▄▄▄▄▄▄";
+    return rows;
+  };
+
+  test("開板落在進板畫面 → 按任意鍵 → 文章列表 → 退板：視野全程不動", () => {
+    const { s, termBuf, enqueued } = engaged();
+    s._beginOpen();
+    const cmd = enqueued.find((c) => c.kind === BRD_CMD_PREFIX + "open-board");
+    cmd.expect(null, { ctx: "other" });
+    cmd.onDone();
+
+    expect(s.state).toBe("suspended");
+    expect(termBuf.brdListLineNums.length).toBe(60); // 緩衝沒被丟掉
+    expect(s._variant).toBe("fav");
+
+    termBuf.feed(noticeRows(), { curY: 23 }); // 進板畫面自己的那一幀
+    expect(s.state).toBe("suspended");
+    termBuf.feed(articleListRows(), { curY: 3 }); // 使用者按空白鍵之後
+    expect(s.state).toBe("suspended");
+    expect(termBuf.brdListLineNums.length).toBe(60);
+
+    // 退板：server 重繪落在含 40 的那一頁（head 對齊 20 列分頁）。
+    termBuf.feed(brdScreenRows({ startNum: 21, count: 20 }), { curY: 3 + 19 });
+
+    expect(s.state).toBe("active");
+    expect(s._renderMode).toBe("buffer");
+    expect(termBuf.brdListLineNums.length).toBe(60);
+    expect(s._topNum).toBe(21); // 使用者自己捲出來的錨
+    expect(s._scrollFrac).toBe(9);
+    expect(s._selectedNum).toBe(40); // 游標採用落點
+  });
+
+  // gate 2（landedSameList）是放寬 gate 1 之後唯一的內容守門 ⇒ 指紋不能只看游標
+  // 那一列：群組看板遞迴進另一份 choose_board 時，第 1 列剛好同名就會誤接。
+  test("退板落地頁：游標列同名但別列不同名 ⇒ 換了一份清單，整份重建", () => {
+    const { s, termBuf, enqueued } = engaged();
+    s._beginOpen();
+    const cmd = enqueued.find((c) => c.kind === BRD_CMD_PREFIX + "open-board");
+    cmd.expect(null, { ctx: "other" });
+    cmd.onDone();
+
+    // 落地頁 25..44：游標那一列（40）板名對得上，但第一列（25）對不上。
+    const body = Array.from({ length: 20 }, (_, i) =>
+      brdRow(25 + i, i === 0 ? "OTHER25" : "B" + (25 + i))
+    );
+    termBuf.feed(brdScreenRows({ bodyRows: body }), { curY: 3 + 15 });
+
+    expect(s.state).toBe("active");
+    expect(termBuf.brdListLineNums.length).toBe(0); // 舊緩衝不得混進別份清單
+    expect(s._topNum).toBe(25); // seed：重新錨到落地頁頂列
+  });
+
+  test("退板落地頁整頁都對得上 ⇒ resume-in-place（錨不動）", () => {
+    const { s, termBuf, enqueued } = engaged();
+    s._beginOpen();
+    const cmd = enqueued.find((c) => c.kind === BRD_CMD_PREFIX + "open-board");
+    cmd.expect(null, { ctx: "other" });
+    cmd.onDone();
+
+    termBuf.feed(brdScreenRows({ startNum: 25, count: 20 }), { curY: 3 + 15 });
+
+    expect(s.state).toBe("active");
+    expect(termBuf.brdListLineNums.length).toBe(60);
+    expect(s._topNum).toBe(21);
+    expect(s._selectedNum).toBe(40);
+  });
+});
+
+describe("suspended：外部序列化導覽不得動我們的緩衝", () => {
+  test("板內的 AID 導覽呼叫 beginExternalNavigation → 早退（同 idle）", () => {
+    const h = makeSession();
+    seedBuffer(h.termBuf, 1, 60);
+    h.s.state = "suspended";
+    h.s._variant = "fav";
+    h.s._topNum = 21;
+
+    h.s.beginExternalNavigation();
+
+    expect(h.s.state).toBe("suspended");
+    expect(h.termBuf.brdListLineNums.length).toBe(60);
+    expect(h.s._topNum).toBe(21);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+// 與 list_keys.test.js 檔末那組對稱（2026-09-13 回報「查詢作者會跑去其它文章」，
+// 錄製檔 ptt-debug-20260913-184532）。舊碼兩處把鍵擋在 passthrough 序列之外，因而
+// **跳過 native-sync-jump 腿**：
+//   1. _beginNativePassthrough 開頭寫死 `e.ctrlKey ? null : keyEventToBytes(e)`；
+//   2. onKeyDown 開頭 `if (clipboard || e.altKey || e.metaKey) return;` 把 Alt 重映射
+//      鍵（Alt+R/T/W/V ＝ ^R/^T/^W/^V）整個 early-return 掉 —— 連原生鏡像都不切。
+// 看板列表這邊的 cursor-relative Ctrl 鍵見 board.c:1890 Ctrl('S')、:2044 Ctrl('T')；
+// Alt+W ＝ board.c:1731 Ctrl('W') whereami。
+describe("cursor-relative Ctrl／Alt 組合鍵先同步真游標（2026-09-13）", () => {
+  function ready({ selected = 7, server = 1 } = {}) {
+    const ctx = makeSession();
+    ctx.termBuf.feed(brdScreenRows());
+    seedBuffer(ctx.termBuf, 1, 20);
+    ctx.s._selectedNum = selected;
+    ctx.s._serverNum = server;
+    return ctx;
+  }
+
+  test("Ctrl-S → 先 native-sync-jump，落地後才代送 \\x13", () => {
+    const { s, enqueued } = ready();
+    const e = keyEvent("s", { ctrlKey: true });
+    s.onKeyDown(e);
+
+    expect(e.defaultPrevented).toBe(true); // 代送模式：原事件不放行
+    expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+    expect(enqueued[0].keys).toBe("7\r");
+    enqueued[0].onDone();
+    expect(enqueued[1].kind).toBe(BRD_CMD_PREFIX + "native-key");
+    expect(enqueued[1].keys).toBe("\x13");
+    expect(enqueued[1].fullRepaint).toBe(true);
+  });
+
+  test("Ctrl 組合的 bytes 不得過 u2b：Ctrl-] 送 charCode 221", () => {
+    const { s, enqueued } = ready({ selected: 7, server: 7 });
+    s.onKeyDown(keyEvent("]", { ctrlKey: true }));
+    expect(enqueued.length).toBe(1);
+    expect(enqueued[0].keys).toBe(String.fromCharCode(221));
+  });
+
+  test("Alt 重映射鍵 Alt-W（＝^W whereami，board.c:1731）走 sync → 代送", () => {
+    const { s, enqueued } = ready();
+    const e = keyEvent("w", { altKey: true });
+    s.onKeyDown(e);
+
+    expect(e.defaultPrevented).toBe(true);
+    expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+    enqueued[0].onDone();
+    expect(enqueued[1].keys).toBe("\x17"); // ^W
+    expect(s._renderMode).toBe("native");
+  });
+
+  test("反向守護：非字母的 Alt 組合仍整個放行給瀏覽器", () => {
+    // Alt remap 只涵蓋 26 個字母；Alt+← 是瀏覽器的上一頁、Alt+數字不是 PTT 指令。
+    // 註：Alt-F 以前在這裡，26 字母 remap 之後它是 ^F（board.c:1775 下一頁）。
+    for (const [key, code] of [
+      ["5", "Digit5"],
+      ["ArrowLeft", "ArrowLeft"],
+    ]) {
+      const { s, enqueued } = ready();
+      const e = keyEvent(key, { altKey: true, code });
+      s.onKeyDown(e);
+      expect(e.defaultPrevented).toBe(false);
+      expect(s.state).toBe("active");
+      expect(enqueued).toEqual([]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Alt＝PTT 的 Ctrl，全 26 字母（2026-09）。看板列表版：board.c 的 cursor-relative
+// Ctrl 鍵（:1731 ^W whereami、:1890 ^S search_local_board、:2038 ^A 加入全部標記、
+// :2044 ^T 移除全部標記、:2050 ^P 貼上標記看板）全部必須先同步真游標。
+// ---------------------------------------------------------------------------
+describe("Alt remap 全 26 字母（看板列表）", () => {
+  function ready({ selected = 7, server = 1 } = {}) {
+    const ctx = makeSession();
+    ctx.termBuf.feed(brdScreenRows());
+    seedBuffer(ctx.termBuf, 1, 20);
+    ctx.s._selectedNum = selected;
+    ctx.s._serverNum = server;
+    return ctx;
+  }
+
+  test("board.c 的 cursor-relative 鍵：Alt+W/S/A/T/P 各自走 sync → 代送", () => {
+    for (const [L, out] of [
+      ["W", "\x17"], // whereami
+      ["S", "\x13"], // search_local_board
+      ["A", "\x01"], // fav_add_all_tagged
+      ["T", "\x14"], // fav_remove_all_tag
+      ["P", "\x10"], // paste_taged_brds
+    ]) {
+      const { s, enqueued } = ready();
+      const e = keyEvent(L.toLowerCase(), { altKey: true, code: "Key" + L });
+      s.onKeyDown(e);
+
+      expect(e.defaultPrevented).toBe(true);
+      expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+      enqueued[0].onDone();
+      expect(enqueued[1].kind).toBe(BRD_CMD_PREFIX + "native-key");
+      expect(enqueued[1].keys).toBe(out);
+    }
+  });
+
+  test("Alt+B 不得變成 PgUp —— 看板列表獨有的同義鍵陷阱", () => {
+    // board.c:1763 把 'b' 也當 PgUp（read.c 沒有這個同義鍵）。altRemap 的攔截若被
+    // 排到 _classifyKey 之後，Alt+B 就會變成本地翻頁而不是送 ^B 給 PTT。
+    const { s, enqueued } = ready();
+    const before = s._selectedNum;
+    const e = keyEvent("b", { altKey: true, code: "KeyB" });
+    s.onKeyDown(e);
+
+    expect(s._selectedNum).toBe(before); // 沒有本地翻頁
+    expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+    enqueued[0].onDone();
+    expect(enqueued[1].keys).toBe("\x02"); // ^B
+  });
+
+  test("Alt+C 不被剪貼簿白名單早退吃掉", () => {
+    const { s, enqueued } = ready();
+    const e = keyEvent("c", { altKey: true, code: "KeyC" });
+    s.onKeyDown(e);
+
+    expect(e.defaultPrevented).toBe(true);
+    expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+    enqueued[0].onDone();
+    expect(enqueued[1].keys).toBe("\x03");
+  });
+
+  test("macOS 形態（⌥W 的 e.key 是 ∑、⌥E 是 Dead）同樣接得住", () => {
+    for (const [key, code, out] of [
+      ["∑", "KeyW", "\x17"],
+      ["Dead", "KeyE", "\x05"],
+    ]) {
+      const { s, enqueued } = ready();
+      const e = keyEvent(key, { altKey: true, code });
+      s.onKeyDown(e);
+
+      expect(e.defaultPrevented).toBe(true);
+      expect(enqueued[0].kind).toBe(BRD_CMD_PREFIX + "native-sync-jump");
+      enqueued[0].onDone();
+      expect(enqueued[1].keys).toBe(out);
+    }
   });
 });

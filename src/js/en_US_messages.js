@@ -165,11 +165,59 @@ export const en_US = {
   "longPushProgress_note": {
     "message": "Cancelling only stops what has not been sent; comments already sent cannot be taken back."
   },
+  "longPushProgress_preflight": {
+    "message": "Checking with PTT whether you can comment..."
+  },
+  "longPushModal_preflightCooldown": {
+    "message": "PTT is in comment cooldown (about #s#s left). Go ahead and type; sending will wait automatically."
+  },
+  "longPushModal_preflightArrow": {
+    "message": "PTT has already decided this comment will be a -> note (you are the author, or you commented within 90s), so the type you pick makes no difference."
+  },
+  "longPushModal_preflightNoBoo": {
+    "message": "This board does not allow boo."
+  },
+  "longPushError_title": {
+    "message": "Cannot comment"
+  },
+  "longPushError_titleSending": {
+    "message": "Long comment aborted"
+  },
+  "longPushError_titleCancelled": {
+    "message": "Long comment cancelled"
+  },
+  "longPushError_sourcePtt": {
+    "message": "Message reported by PTT (verbatim)"
+  },
+  "longPushError_sourceClient": {
+    "message": "This is this app's own assessment, not PTT's wording"
+  },
+  "longPushError_reason": {
+    "message": "Technical reason: #r#"
+  },
+  "longPushError_sent": {
+    "message": "#n# comment(s) already sent."
+  },
+  "longPushError_sentNone": {
+    "message": "Nothing has been sent yet."
+  },
+  "longPushError_noRecall": {
+    "message": "Comments already sent cannot be taken back."
+  },
+  "longPushError_restLabel": {
+    "message": "Not sent yet"
+  },
+  "longPushError_copyRest": {
+    "message": "Copy remaining text"
+  },
+  "longPushError_close": {
+    "message": "Close"
+  },
+  "longPushError_busy": {
+    "message": "Another operation is in progress; please wait."
+  },
   "longPushProgress_cancel": {
     "message": "Cancel"
-  },
-  "longPush_notArticle": {
-    "message": "Open an article first to use long comment"
   },
 
   "options_contextMenu": {
@@ -184,6 +232,12 @@ export const en_US = {
   "options_enableLongPush": {
     "message": "Show \"Send long comment\" (auto-split into multiple comments)"
   },
+  "options_pushKeyOpensLongPush": {
+    "message": "Pressing X / % in an article opens \"Send long comment\""
+  },
+  "tooltip_pushKeyOpensLongPush": {
+    "message": "Turn off to get PTT's native single comment prompt back. X in the article list is always native."
+  },
 
   // options nav
   "options_general": {
@@ -197,6 +251,21 @@ export const en_US = {
   },
   "options_backup": {
     "message": "Backup"
+  },
+
+  // settings search (search box in the settings sidebar; unrelated to the
+  // quick search feature below -- do not mix the naming up)
+  "options_settingsSearchLabel": {
+    "message": "Search settings"
+  },
+  "options_settingsSearchPlaceholder": {
+    "message": "Search settings…"
+  },
+  "options_settingsSearchEmpty": {
+    "message": "No matching settings"
+  },
+  "options_settingsSearchHintKey": {
+    "message": "matched by internal name"
   },
 
   // quick search (context menu)
@@ -301,6 +370,12 @@ export const en_US = {
   },
   "mergeImageCaptionAi_pending": {
     "message": "AI matching… left"
+  },
+  "imageGray_on": {
+    "message": "Grayscale (for reverse image search)"
+  },
+  "imageGray_off": {
+    "message": "Restore colors"
   },
   "lightsOn_on": {
     "message": "Lights on (reveal hidden text)"
@@ -661,6 +736,9 @@ export const en_US = {
   "options_termSize": {
     "message": "BBS terminal size"
   },
+  "tooltip_termSize": {
+    "message": "Fixed term size: you pick the columns and rows; the font scales to fill the window. Fixed font size: the font stays put and the row count is derived from the window height (columns stay at 80 — PTT only ever draws 80). A taller window then shows more rows per page. Note: PTT does not repaint on resize, so the extra rows only fill in on the next page change (paging or re-entering a board)."
+  },
   "options_cols": {
     "message": "Columns"
   },
@@ -718,6 +796,15 @@ export const en_US = {
   "tooltip_mouseMisclickGuard": {
     "message": "On: in a list only the title column opens the post, and in a post only a comment's text toggles the same-commenter highlight — so the left edge stays free for the \"leave the post\" band. Off: the whole row responds. The highlight bar always covers exactly the clickable area."
   },
+  "options_mouseEdgePaging": {
+    "message": "Edge click paging"
+  },
+  "options_enableMouseEdgePaging": {
+    "message": "Click the screen edges to page / jump to first or last"
+  },
+  "tooltip_mouseEdgePaging": {
+    "message": "Lists and the board list: the top row is the first page, the bottom row the last page, and the right edge pages up (upper half) or down (lower half). In a post: upper half pages up, lower half pages down, and the bottom row jumps to the end (the left edge still leaves the post). Hovering outlines the region. Not applied to the main menu."
+  },
   "options_mouseFunctionKeys": {
     "message": "Clickable function keys"
   },
@@ -747,6 +834,12 @@ export const en_US = {
   },
   "tooltip_mouseBackNav": {
     "message": "Turns the browser's Back into PTT's LEFT key: leave the post / go up one level. Covers the two-finger trackpad swipe (which uses the browser's own native back gesture, so the arrow indicator, the follow-along motion and cancelling by letting go mid-swipe all behave exactly like on any other site), the mouse side button, Alt+Left or Cmd+[, and the toolbar Back button. Whether the trackpad gesture works at all depends on your system settings (macOS: Settings → Trackpad → More Gestures → Swipe between pages). To actually leave this site, close the tab, or use Back twice on a screen that has nothing left to exit."
+  },
+  "options_mouseServerReport": {
+    "message": "Hand the mouse to PTT"
+  },
+  "tooltip_mouseServerReport": {
+    "message": "Report mouse clicks and wheel events straight to the PTT server using the standard terminal XTerm SGR protocol, letting PTT itself decide what a click does. Turning this on makes this site's own mouse behaviour stand down (click a title to open, left-edge exit, wheel paging, on-screen function-key buttons); selecting text, clicking links and the right-click menu are unaffected. You must first enable MOUSE in PTT's own settings (個人設定區 → 設定使用者資料) before the server asks for reports. Off by default: nothing on PTT actually consumes mouse events yet, so turning it on today just gives up this site's mouse browsing for nothing."
   },
   "options_mouseBrowsing": {
     "message": "Mouse browsing"

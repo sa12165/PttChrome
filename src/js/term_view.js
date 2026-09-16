@@ -1,11 +1,12 @@
 // Terminal View
 
-import { TermKeyboard } from './term_keyboard';
+import { TermKeyboard, isAltRemapEvent } from './term_keyboard';
 import { cursorColorForBg } from './cursor_color';
 import { DEFAULT_HIGHLIGHT_BG, cursorHighlightClasses, highlightColStart, resolveHighlightRow } from './cursor_highlight';
-import { clickableColStart, cursorCss, CUR_BACK, CUR_POINTER, CUR_AUTO, EXIT_COL_END, resolveMouseGates } from './mouse_regions';
+import { clickableColStart, cursorCss, CUR_BACK, CUR_POINTER, CUR_AUTO, EXIT_COL_END, resolveMouseGates, resolveMouseRegion } from './mouse_regions';
 import { functionKeyRows, parseFunctionKeys } from './footer_keys';
-import { exitBandRect } from './mouse_geometry';
+import { edgeBandRect, exitBandRect } from './mouse_geometry';
+import { calcTermSize, termLayoutOffsets } from './term_size';
 import { renderOverlayRow, renderScreen } from './term_ui';
 import { i18n } from './i18n';
 import { setTimer, TRACE } from './util';
@@ -20,10 +21,67 @@ import { cursorOffsets, paintedRowsAreBufRows } from './cursor_anchor';
 import { cursorGeomSample } from './debug_recorder';
 import { isDocumentForeground } from './notification_gate';
 import { serializedOpHint } from './serialized_op_gate';
+import { isPushKey, pushGateFacts, shouldInterceptPushKey } from './long_push_gate';
 import icon128 from '../icon/icon_128.png';
-import cursorBack from '../cursor/back.png';
+import { MOUSE_CURSOR_URLS } from './mouse_cursors';
 
 const DEFINE_INPUT_BUFFER_SIZE = 12;
+
+// Alt remap 送鍵之後，多久之內把組字事件當成 dead key 的副產物吞掉。
+// macOS 的 ⌥E/⌥I/⌥N/⌥U 是組合重音的 dead key：即使 keydown 被 preventDefault，
+// 仍可能開一次組字並 commit 出 é/î/ñ/ü。詳見 onCompositionStart / onInput 的防線。
+export const ALT_COMPOSITION_SUPPRESS_MS = 150;
+
+// 純函式而非 prototype method：onInput／onCompositionStart 在單元測試裡是用
+// `TermView.prototype.onInput.call(假物件, e)` 呼叫的，那個假物件身上沒有別的方法。
+// 順帶 at 為 undefined 時 NaN < n 是 false，未初始化的路徑自動走「沒有剛 remap」。
+export function altRemapRecently(at, now) {
+  return (now === undefined ? Date.now() : now) - at < ALT_COMPOSITION_SUPPRESS_MS;
+}
+
+// 終端機鍵盤路徑的入口守門：這個 keydown/keypress 該不該進到分派鏈？
+// 抽成模組層純函式才測得到（原本是 constructor 裡的 closure）。
+// 守護：tests/unit/term_view_alt_composition.test.js。
+export function acceptsKeyEvent(e, isComposition) {
+  // IME 組字中的 keydown（Chrome 回報 keyCode 229、iOS 的起始鍵是 0）由 input
+  // 事件那條路處理，這裡一律丟掉。
+  //
+  // **例外：Alt 當 Ctrl 的送鍵**（2026-09，Alt 全面 remap 成 PTT 的 Ctrl）。
+  // 舊註解寫「On both Mac and Windows, control/alt+key will be sent as original
+  // key code even under IME」——這個前提對 macOS 的 Option 不成立：Option 是組字
+  // 修飾鍵，⌥E/⌥I/⌥N/⌥U 是組合重音的 **dead key**，Chrome 對它們的 keydown 就是
+  // 回報 keyCode 229（Firefox 有時是 0）。少了這個例外會同時壞兩件事：
+  //   1. Alt+E/I/N/U 在 mac 上變啞巴鍵（送不出 ^E/^I/^N/^U）；
+  //   2. 沒有人跑到 preventDefault ⇒ **組字照開**，é/î/ñ/ü 會從 compositionend
+  //      那條路（onInput → onTextInput → _convSend）漏進 PTT。
+  // e.code 不受 Option 影響（仍是 'KeyE'），altRemapCharCode 認得出來。
+  // 真 IME 的 229 不受影響：那時 altKey 是 false。
+  //
+  // keyCode 0 那半是 iOS 來的，但**刻意保留**：專案目標是主流桌機瀏覽器
+  //（CLAUDE.md），不為手機做相容，而它在桌機 IME 也在作用，移除有風險、零收益。
+  // 不要再把它當待辦。
+  if ((e.keyCode == 229 || e.keyCode == 0) && !isAltRemapEvent(e))
+    return false;
+
+  // iOS sends backspace when composing. Disallow any non-control keys during it.
+  if (isComposition && !e.ctrlKey && !e.altKey)
+    return false;
+
+  // Don't process meta keys, like Mac's command key.
+  if (e.metaKey)
+    return false;
+
+  return true;
+}
+
+// 這個 keydown 該不該取消「推文即時更新」？
+// Alt remap 是真的在下指令，必須跟 Ctrl 一樣關掉；其餘 Alt 組合仍是瀏覽器／OS 的。
+// **不可簡化成「一律 true」**：呼叫點在 keydown listener 裡，排在
+// `keyCode 16..19`（Shift/Ctrl/Alt 裸鍵）的早退**之前**，一律 true 會讓「單獨輕點
+// Alt 去開瀏覽器選單」也把實況更新關掉。
+export function cancelsLiveHelper(e) {
+  return !e.altKey || isAltRemapEvent(e);
+}
 
 // enhance 旗標，只給「好讀累積長頁」（buf.pageLines）那兩個 render 分支用。
 // 意思是：這批列是 cloneRow 出來的**快照**，append 之後永遠不會再被寫入，所以
@@ -156,9 +214,15 @@ export function TermView() {
   // mouseBackNav：攔截瀏覽器的「返回」→ 左方向鍵（0 關 1 開）。來源含觸控板
   // 左滑手勢、滑鼠側鍵、Alt+←／⌘[、工具列上一頁，全走同一條 history sentinel。
   this.mouseBackNav = 1;
+  // mouseServerReport：把滑鼠事件回報給 PTT server（XTerm SGR）。預設關，理由見
+  // pref_storage.js。真的要送還得主機自己開了 tracking（buf.mouseReport.isActive()）。
+  this.mouseServerReport = false;
   // 防誤觸模式（pref mouseMisclickGuard，預設開）：可點區＝底色區的起始欄，
   // 決策在 mouse_regions.clickableColStart。
   this.mouseMisclickGuard = true;
+  // 邊緣翻頁區（pref mouseEdgePaging，預設開）：頂列 Home／底列 End／右緣上下半
+  // 翻頁（文章內是整片上下半）。與總開關 and 過之後餵進 resolveMouseRegion。
+  this.mouseEdgePaging = true;
   // 功能鍵可點（pref mouseFunctionKeys）。與總開關 and 過之後才決定要不要算
   // functionKeyRows（見 _renderScreenLines）。
   this.mouseFunctionKeys = true;
@@ -414,6 +478,14 @@ export function TermView() {
   this.exitHintBand = exitHintBand;
   this.BBSWin.appendChild(exitHintBand);
 
+  // 邊緣翻頁區（pref mouseEdgePaging）的提示帶。與上面那條同樣的三個理由掛在
+  // BBSWindow 底下，差別只在它的四邊都由 JS 寫（矩形由 resolveMouseRegion 決定，
+  // 經 mouse_geometry.edgeBandRect 換算），而退出帶是固定的左 7 欄整片高。
+  var edgeHintBand = document.createElement('div');
+  edgeHintBand.setAttribute('id', 'edgeHintBand');
+  this.edgeHintBand = edgeHintBand;
+  this.BBSWin.appendChild(edgeHintBand);
+
   this.mainDisplay.style.border = '0px';
   this.setFontFace('MingLiu,monospace');
 
@@ -421,6 +493,9 @@ export function TermView() {
     this.checkLeftDB.bind(this),
     this.checkCurDB.bind(this),
     this._send.bind(this));
+
+  // 最後一次 Alt remap 送鍵的時戳（見 keydown listener 與 altRemapRecently）。
+  this._altRemapAt = 0;
 
   this.input.addEventListener('compositionstart', (e) => {
     this.onCompositionStart(e);
@@ -447,32 +522,7 @@ export function TermView() {
     !this.bbscore.modalShown &&
     !this.bbscore.contextMenuShown &&
     !this._listInputWrap;
-  let keyEventFilter = (e) => {
-    // On both Mac and Windows, control/alt+key will be sent as original key
-    // code even under IME.
-    // Char inputs will be handler on input event.
-    // We can safely ignore those IME keys here.
-    if (e.keyCode == 229)
-      return false;
-
-    // 下面兩條是 iOS 來的，但**刻意保留**：專案目標是主流桌機瀏覽器（CLAUDE.md），
-    // 不為手機做相容，而這兩條在桌機 IME 也在作用（isComposition 期間吞掉非控制鍵），
-    // 移除有風險、零收益。不要再把它當待辦。
-
-    // iOS sends the keydown that starts composition as key code 0. Ignore it.
-    if (e.keyCode == 0)
-      return false;
-
-    // iOS sends backspace when composing. Disallow any non-control keys during it.
-    if (this.isComposition && !e.ctrlKey && !e.altKey)
-      return false;
-
-    // Don't process meta keys, like Mac's command key.
-    if (e.metaKey)
-      return false;
-
-    return true;
-  };
+  let keyEventFilter = (e) => acceptsKeyEvent(e, this.isComposition);
 
   addEventListener('keypress', (e) => {
     if (!shouldAcceptInput() || !keyEventFilter(e))
@@ -485,7 +535,14 @@ export function TermView() {
       return;
 
     // disable auto update pushthread if any command is issued;
-    if (!e.altKey) this.bbscore.onDisableLiveHelperModalState();
+    if (cancelsLiveHelper(e)) this.bbscore.onDisableLiveHelperModalState();
+
+    // macOS 的 dead key（⌥E/⌥I/⌥N/⌥U）即使被 preventDefault 仍可能開一次組字，
+    // 而且 compositionstart 不保證會來（Windows 上根本不來）。記一個時間窗，讓
+    // onCompositionStart / onInput 兩道防線自己判斷要不要吞掉，過期即失效 —— 用
+    // 一次性旗標的話「何時清掉」沒有正確答案，會洩漏成永久狀態。
+    // 代價：按下 Alt+字母後 150ms 內剛好 IME 上字會被丟掉一次，可接受。
+    if (isAltRemapEvent(e)) this._altRemapAt = Date.now();
 
     if(e.keyCode > 15 && e.keyCode < 19)
       return; // Shift Ctrl Alt (19)
@@ -1021,6 +1078,13 @@ TermView.prototype = {
   onInput: function(e) {
     if (this.bbscore.modalShown || this.bbscore.contextMenuShown)
       return;
+    // 第三道防線：組字若被某些瀏覽器搶在 keydown 之前開起來，它 commit 出來的重音
+    // 字元（é/î/ñ/ü）絕不可以當成使用者打的字送進 PTT —— 那是 ⌥E/⌥I/⌥N/⌥U 這幾顆
+    // dead key 的副產物，使用者的本意是送 ^E/^I/^N/^U。
+    if (altRemapRecently(this._altRemapAt)) {
+      e.target.value = '';
+      return;
+    }
     if (this.isComposition) {
       // beginning chrome 55, we no longer can update input buffer width on compositionupdate
       // so we update it on input event
@@ -1051,6 +1115,20 @@ TermView.prototype = {
     if (busyHint) {
       this.flashListHint(busyHint);
       return;
+    }
+    // 推文鍵的第三條入口：IME。中文輸入法開著時 keydown 的 keyCode 是 229，被
+    // keyEventFilter 擋在 onKeyDown 之外，字改從 input 事件進到這裡 ⇒ 少了這道，
+    // 「IME 開著按 X」會得到原生推文、關掉才是長推文，行為不一致（easy_reading.js
+    // noteTextInput 的註解已把這個情境列為 case (a) 並宣示三條入口一致）。
+    // **isPasting 排除**：貼上一個 'X' 不是按鍵。只匹配單一字元，IME 一次上字
+    // "XD" 自然落回原路。同樣排在 noteTextInput 之前（那兩個會 _enterFunctionMode）。
+    if (!isPasting && isPushKey(text)) {
+      var pushFacts = pushGateFacts(this.bbscore);
+      if (pushFacts && shouldInterceptPushKey({
+            key: text, prefs: readValuesWithDefault(),
+            pageState: pushFacts.pageState, lastRowText: pushFacts.lastRowText
+          }) && this.bbscore.openLongPushModal && this.bbscore.openLongPushModal())
+        return;
     }
     // 送字給 PTT ≠ 按鍵。兩種好讀模式都是在 keydown 決定要不要切成原生鏡像
     // （functionMode），而 IME（keydown 的 e.key 是 'Process'、keyCode 229，被
@@ -1092,7 +1170,9 @@ TermView.prototype = {
   //     從未 dispatch 的合成事件呼叫 preventDefault，Chromium／Firefox／jsdom 三
   //     者的 defaultPrevented 都會變 true，這是 DOM 標準行為。）
   //  2. 合成事件的 e.code 是空字串、isTrusted 為 false、target 為 null。目前鏈上
-  //     只有 term_keyboard.altRemapCharCode 讀 e.code，它已寫成 `e.code || ''`。
+  //     只有 term_keyboard 的 altRemapCharCode 與 isAltRemapEvent 讀 e.code，兩者
+  //     都經過 `e.code || ''`（isAltRemapEvent 也用不到：合成事件 altKey 為 false，
+  //     進不了 alt 分支）。
   //     **日後在鏈上新增讀 e.code／e.target／e.isTrusted 的邏輯就會靜默壞掉。**
   //  3. 用 this.onKeyDown(ev) **直接呼叫**，不要 dispatchEvent：#t 上已掛了 keydown
   //     listener，dispatch 會讓同一個事件跑兩次分派。
@@ -1142,6 +1222,29 @@ TermView.prototype = {
         this.bbscore.easyReading.tryReenterFromNative(e)) {
       e.preventDefault();
       return;
+    }
+    // 推文鍵（X / %）改開「長推文一鍵發送」。pref pushKeyOpensLongPush，預設開。
+    //
+    // **排在所有 dispatch 之前**：下面 easyReading._onKeyDown 的 default 分支會
+    // _enterFunctionMode()，那個函式結尾的同步 redraw 把 mainDisplay.scrollTop 歸
+    // 零，而 LongPushSession.start() 的 ORDER INVARIANT 要在那之前用 scrollTop 算
+    // 閱讀位置、並讀文章標頭錨點 ⇒ 提前進 functionMode 會讓送完回不到原位置。
+    // 同理排在 _keyboard.onKeyDown 之前（原生模式下 X 就是走那條送出去的）。
+    // 但**排在三道自訂 hotkey 之後**：使用者明確綁的鍵應該贏過這個預設接管。
+    //
+    // 順序只能是「先開成功、再吞」：openLongPushModal 在 ContextMenu 尚未 mount 時
+    // 是 noop（回 undefined）⇒ 不 preventDefault，X 照原生路徑送出去。吞掉按鍵又
+    // 不開輸入框＝使用者按 X 沒反應，是這個功能最嚴重的失敗模式。
+    if (isPushKey(e.key)) {
+      var pushFacts = pushGateFacts(this.bbscore);
+      if (pushFacts && shouldInterceptPushKey({
+            key: e.key, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey,
+            prefs: readValuesWithDefault(),
+            pageState: pushFacts.pageState, lastRowText: pushFacts.lastRowText
+          }) && this.bbscore.openLongPushModal && this.bbscore.openLongPushModal()) {
+        e.preventDefault();
+        return;
+      }
     }
     if (this.useEasyReadingMode && this.buf.startedEasyReading &&
         !this.buf.easyReadingFunctionMode) {
@@ -1245,10 +1348,6 @@ TermView.prototype = {
     this.lastRowDiv.style.fontSize = fontSize;
     this.lastRowDiv.style.width = mainWidth;
 
-    if (this.chh*this.buf.rows < innerBounds.height)
-      this.mainDisplay.style.marginTop = ((innerBounds.height-this.chh*this.buf.rows)/2) + this.bbsViewMargin + 'px';
-    else
-      this.mainDisplay.style.marginTop =  this.bbsViewMargin + 'px';
     if (this.fontFitWindowWidth) {
       this.scaleX = Math.floor(innerBounds.width / (this.chw*this.buf.cols+10) * 100)/100;
       this.scaleY = Math.floor(innerBounds.height / (this.chh*this.buf.rows) * 100)/100;
@@ -1274,6 +1373,18 @@ TermView.prototype = {
     this.mainDisplay.style.webkitTransform = scaleCss;
     this.lastRowDiv.style.webkitTransform = scaleCss;
 
+    // 垂直位移（數學在 term_size.js）。**水平不在這裡做** —— 見該檔
+    // termLayoutOffsets 的 LOCKED 註記（置中由 #BBSWindow 的 align="center"
+    // 提供，這裡再加一次就是雙重置中）。
+    // 順序上必須在 getFirstGridOffsets() 之前：那一行量的就是這裡寫的位移。
+    this.mainDisplay.style.marginTop =
+      termLayoutOffsets({
+        innerHeight: innerBounds.height,
+        chh: this.chh,
+        rows: this.buf.rows,
+        margin: this.bbsViewMargin
+      }).marginTop + 'px';
+
     this.firstGridOffset = this.bbscore.getFirstGridOffsets();
 
     this.updateExitHintBandGeometry();
@@ -1289,16 +1400,48 @@ TermView.prototype = {
   // 帶子不參與 .main 的 transform，所以寬度自己乘 scaleX —— 這也是 cellWidth 做的事。
   updateExitHintBandGeometry: function() {
     if (!this.exitHintBand) return;
-    var rect = exitBandRect({
-      innerWidth: this.innerBounds.width,
-      chw: this.chw,
-      cols: this.buf.cols,
-      scaleX: this.scaleX,
-      scaleY: this.scaleY,
-      firstGridLeft: this.firstGridOffset && this.firstGridOffset.left
-    });
+    var rect = exitBandRect(this.bandGeometry());
     this.exitHintBand.style.left = rect.left + 'px';
     this.exitHintBand.style.width = rect.width + 'px';
+    // 幾何變了（字級／視窗大小）⇒ 已經亮著的邊緣帶要跟著重算，否則會停在舊位置。
+    if (this._edgeHintBand) this.setEdgeHintBand(this._edgeHintBand);
+  },
+
+  // 兩條提示帶共用的一組幾何。**必須與 App.clientToPos 同源** —— 它也是餵同一組
+  // 欄位給 mouse_geometry（App.gridGeometry），兩邊算出來的格線才會逐格對齊。
+  bandGeometry: function() {
+    return {
+      innerWidth: this.innerBounds.width,
+      innerHeight: this.innerBounds.height,
+      chw: this.chw,
+      chh: this.chh,
+      cols: this.buf.cols,
+      rows: this.buf.rows,
+      scaleX: this.scaleX,
+      scaleY: this.scaleY,
+      firstGridLeft: this.firstGridOffset && this.firstGridOffset.left,
+      firstGridTop: this.firstGridOffset && this.firstGridOffset.top
+    };
+  },
+
+  // 邊緣翻頁區的視覺提示。吃 resolveMouseRegion 的 `hintBand`（格子空間的半開
+  // 矩形）或 null。開關時機與 setExitAffordance 完全一致（term_buf.onMouse_move /
+  // clearHighlight、onListMouseMove、App.onPrefChange、App.setModalOpen、
+  // window blur）—— 漏一個就留殘影。
+  setEdgeHintBand: function(band) {
+    if (!this.edgeHintBand) return;
+    this._edgeHintBand = band || null;
+    var rect = band ? edgeBandRect(band, this.bandGeometry()) : null;
+    if (!rect) {
+      this.edgeHintBand.classList.remove('active');
+      return;
+    }
+    var style = this.edgeHintBand.style;
+    style.left = rect.left + 'px';
+    style.top = rect.top + 'px';
+    style.width = rect.width + 'px';
+    style.height = rect.height + 'px';
+    this.edgeHintBand.classList.add('active');
   },
 
   // 文章左側可退出的視覺提示。開關時機見 term_buf.onMouse_move / clearHighlight、
@@ -1412,12 +1555,39 @@ TermView.prototype = {
     });
   },
 
-  onListMouseMove: function(row, col) {
+  // 列表好讀視窗裡的邊緣翻頁區。回 null ＝這一格不是邊緣區（交回 hover／開文那條
+  // 路）。**hover 與 click 兩條路共用這一支**：左側退出帶當年兩邊各寫一份判斷，
+  // docs/mouse.md 至今還掛著「改一邊要看另一邊」的警告，新區域不要再多一組。
+  //
+  // 借用原生文章列表（pageState 2）那張表是刻意的，不是取巧：列表好讀的視窗版面
+  // 與原生 24 列逐列對齊（header 3 列／body／footer），連 lineEmpty 都不必問
+  // （視窗裡的空白列不影響邊緣區）。
+  listEdgeRegion: function(screenRow, col) {
+    if (screenRow == null || screenRow < 0 || !this.buf) return null;
+    var region = resolveMouseRegion({
+      pageState: 2,
+      row: screenRow,
+      col: col,
+      rows: this.buf.rows,
+      cols: this.buf.cols,
+      lineEmpty: false,
+      edgePaging: !!(this.buf.useMouseBrowsing && this.mouseEdgePaging)
+    });
+    // hintBand 非 null ⟺ 這一格是邊緣區（其餘動作一律 null），用它當判別式就不必
+    // 在這裡逐一列舉 action。
+    return region.hintBand ? region : null;
+  },
+
+  // screenRow ＝ 指標的**螢幕**列號（App.onMouse_move 用 mouse_geometry
+  // .rowFromClientY 算），與 row（序列 index）是兩套座標，邊緣翻頁區只能用前者。
+  onListMouseMove: function(row, col, screenRow, overAnchor) {
     var hover = -1;
     if (this.buf.useMouseBrowsing && this.buf.listRenderMode === 'buffer') {
       var ls = listOwnerOf(this.bbscore);
       // body ＝ header 之後的整段序列，所以 body index 直接是序列位置。
-      var idx = row - LIST_HEADER_ROWS;
+      // header 列數**問 session**：這條路兩種列表共用，而它們的 header 是兩個
+      // 不同的常數（理由見 ListSession.headerRows）。
+      var idx = ls ? row - ls.headerRows() : -1;
       if (ls && idx >= 0) {
         var view = ls.getListView();
         // idx >= seq.length ＝ 短板補到 bodyRows 的空白列（或 footer），
@@ -1431,15 +1601,32 @@ TermView.prototype = {
     // 不該同時是退出區，這樣「提示帶亮＝點得下去」的合約才成立。
     var iconsEnabled = !!(this.buf.useMouseBrowsing && this.mouseLeftClick);
     var onExitBand = hover >= 0 && col >= 0 && col < EXIT_COL_END;
-    if (onExitBand) {
+    // 邊緣翻頁區。**吃螢幕列號而不是序列列號**（見 listEdgeRegion 的說明）：
+    // 列表好讀的視窗與原生 24 列同版面（header 3 列／body／footer），所以逐格套用
+    // 原生列表那張表就對了，不必另寫一份判斷。
+    // overAnchor：指標壓在 <a> 上（連結／功能鍵按鈕）⇒ 元素層贏，邊緣區讓位
+    // （同 term_buf.onMouse_move 的處理，理由見 App.onMouse_move）。
+    var edge = overAnchor ? null : this.listEdgeRegion(screenRow, col);
+    if (edge) {
+      // 邊緣區上沒有「hover 到哪一列」的概念（同退出帶），底色收掉。
+      hover = -1;
+      if (this.buf.BBSWin)
+        this.buf.BBSWin.style.cursor = cursorCss(edge.cursor, {
+          urls: MOUSE_CURSOR_URLS,
+          iconsEnabled: true
+        });
+      this.setEdgeHintBand(edge.hintBand);
+      this.setExitAffordance(false);
+    } else if (onExitBand) {
       // 退出帶上沒有「hover 到哪一列」的概念（與文章一致），底色收掉。
       hover = -1;
       if (this.buf.BBSWin)
         this.buf.BBSWin.style.cursor = cursorCss(CUR_BACK, {
-          backUrl: cursorBack,
+          urls: MOUSE_CURSOR_URLS,
           iconsEnabled: iconsEnabled
         });
       this.setExitAffordance(iconsEnabled);
+      this.setEdgeHintBand(null);
     } else {
       var clickable =
         hover >= 0 &&
@@ -1449,10 +1636,11 @@ TermView.prototype = {
       if (this.buf.BBSWin)
         this.buf.BBSWin.style.cursor = cursorCss(
           clickable ? CUR_POINTER : CUR_AUTO,
-          { backUrl: cursorBack, iconsEnabled: iconsEnabled }
+          { urls: MOUSE_CURSOR_URLS, iconsEnabled: iconsEnabled }
         );
       // 離開退出帶就要關掉；不關的話從文章切回列表也會留下殘影。
       this.setExitAffordance(false);
+      this.setEdgeHintBand(null);
     }
     // 滑鼠動了 ⇒ 由滑鼠持有底色。早退（同一列內移動）只在**滑鼠本來就持有**時成立：
     // 鍵盤剛把底色搶走的話，即使 hover 列沒變也要重新套用，否則在同一列內晃動滑鼠
@@ -1844,6 +2032,14 @@ TermView.prototype = {
   },
 
   onCompositionStart: function(e) {
+    // 第二道防線（第一道是 keydown 的 preventDefault）：macOS 的 dead key
+    //（⌥E/⌥I/⌥N/⌥U）仍可能開一次組字。這裡**不設 isComposition、不亮 #t 浮層** ——
+    // 否則 isComposition 會卡在 true，keyEventFilter 那條
+    // `isComposition && !ctrlKey && !altKey` 之後會把一般打字全吞掉，只能重整頁面。
+    if (altRemapRecently(this._altRemapAt)) {
+      this.input.value = '';
+      return;
+    }
     //this.input.disabled="";
     this.input.setAttribute('bshow', '1');
     this.updateInputBufferPos();
@@ -1908,14 +2104,13 @@ TermView.prototype = {
     }
   },
 
+  // 「固定字體大小」模式的尺寸來源。數學在 term_size.js（欄數恆 80 的理由、
+  // 列數上下界的出處都在那裡）。
   calcTermSizeFromFont: function(fontSizePx) {
-    fontSizePx = Math.floor((fontSizePx + 1) / 2) * 2;
-    let width = this.bbsWidth ? this.bbsWidth : this.innerBounds.width;
-    let height = this.bbsHeight ? this.bbsHeight : this.innerBounds.height;
-    return {
-      cols: Math.max(80, Math.min(200, Math.floor(2 * (width - 10) / fontSizePx))),
-      rows: Math.max(24, Math.min(100, Math.floor(height / fontSizePx)))
-    };
+    return calcTermSize({
+      height: this.bbsHeight ? this.bbsHeight : this.innerBounds.height,
+      fontSizePx: fontSizePx
+    });
   },
 
   getRowLineElement: function(node) {
@@ -2360,6 +2555,22 @@ TermView.prototype = {
       }
     }
     mergeListPage(this._listNumMap, this._listPinnedMap, entries);
+    // Contiguity guard: the window must never span pages we skipped over (far
+    // jumps: End / Home / open-pinned). Keep only the pivot's segment; the
+    // dropped side's edge flag is cleared so demand can re-fetch it.
+    //
+    // **順序是契約：prune 先、evict 後**（勿再換回來）。遠跳落地時緩衝裡有兩段：
+    // 舊的那段已經不相干、落點那段才是使用者要的。舊順序（evict 在前）下，evict 的
+    // 樞紐是**跳之前**的視口頂，而它砍的是「離樞紐最遠的那一端」⇒ 緩衝吃滿
+    // MAX_LIST_ROWS 時正好把剛落地的那一頁砍掉，而且是在遠跳專用的 prunePivot
+    // 覆寫輪到之前（使用者回報的「Home/End 有時失效」，錯製檔
+    // ptt-debug-20260910-021827，守護 tests/unit/list_accumulate.test.js）。
+    // prune 先把舊段整段丟掉，evict 才量到對的列數（遠跳時通常直接變 no-op）。
+    // 換序安全：無洞時 prune 是 early-return，evict 只剔兩端（不可能製造洞）
+    // ⇒ 非遠跳路徑逆位元不變。
+    var pr = pruneListToSegment(this._listNumMap, ls ? ls.prunePivot() : null);
+    if (ls && pr.prunedUp) ls.noteEvicted(-1);
+    if (ls && pr.prunedDown) ls.noteEvicted(1);
     // Row cap: evict the end farthest from the **viewport** so redraw cost stays
     // bounded (a few hundred rows ≈ the native feel). 樞紐是視口不是選取——
     // 游標可以被捲出視野很遠，用它當樞紐會把使用者眼前那一段丟掉（見
@@ -2372,12 +2583,6 @@ TermView.prototype = {
     );
     if (ls && ev.evictedUp) ls.noteEvicted(-1);
     if (ls && ev.evictedDown) ls.noteEvicted(1);
-    // Contiguity guard: the window must never span pages we skipped over (far
-    // jumps: End / Home / open-pinned). Keep only the pivot's segment; the
-    // dropped side's edge flag is cleared so demand can re-fetch it.
-    var pr = pruneListToSegment(this._listNumMap, ls ? ls.prunePivot() : null);
-    if (ls && pr.prunedUp) ls.noteEvicted(-1);
-    if (ls && pr.prunedDown) ls.noteEvicted(1);
     var flat = flattenListBuffer(this._listNumMap, this._listPinnedMap);
     buf.listLines = flat.lines;
     buf.listLineNums = flat.nums;
@@ -2527,12 +2732,13 @@ TermView.prototype = {
     }
     // 列數上限 + 連續段守門，與文章列表同一組純函式（key 換成看板編號）。
     // 樞紐是**視口**不是選取（游標可以被捲出視野很遠，見 evictListBuffer 的註解）。
-    var ev = evictListBuffer(this._brdNumMap, bs ? bs.evictPivot() : null, MAX_LIST_ROWS);
-    if (bs && ev.evictedUp) bs.noteEvicted(-1);
-    if (bs && ev.evictedDown) bs.noteEvicted(1);
+    // 順序與文章列表一致：**prune 先、evict 後**（理由見 accumulateListLines）。
     var pr = pruneListToSegment(this._brdNumMap, bs ? bs.prunePivot() : null);
     if (bs && pr.prunedUp) bs.noteEvicted(-1);
     if (bs && pr.prunedDown) bs.noteEvicted(1);
+    var ev = evictListBuffer(this._brdNumMap, bs ? bs.evictPivot() : null, MAX_LIST_ROWS);
+    if (bs && ev.evictedUp) bs.noteEvicted(-1);
+    if (bs && ev.evictedDown) bs.noteEvicted(1);
     var flat = flattenListBuffer(this._brdNumMap, EMPTY_PINNED_MAP);
     buf.brdListLines = flat.lines;
     buf.brdListLineNums = flat.nums;

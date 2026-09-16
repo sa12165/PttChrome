@@ -124,6 +124,27 @@
   opacity: 1;
 }
 
+/* 邊緣翻頁區（pref mouseEdgePaging）的提示帶：頂列 Home／底列 End／右緣上下半
+   翻頁（文章內是整片上下半）。四邊都由 term_view.setEdgeHintBand 寫成 inline
+   style（矩形來自 mouse_regions 的 hintBand，經 mouse_geometry.edgeBandRect
+   換算），這裡只給樣式。
+
+   pointer-events:none 與上面那條同樣是**硬需求**：這片帶子會蓋住半個畫面，少了它
+   連結、內嵌預覽圖、功能鍵按鈕全部點不到。同理不宣告任何 user-select。 */
+#edgeHintBand {
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease-out;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  box-sizing: border-box;
+  z-index: 2;
+}
+#edgeHintBand.active {
+  opacity: 1;
+}
+
 /* 打字游標＝一條細長直線（像 <input> 的 caret），不是字元。
    前身是 index.html 裡一個 `_` 字元疊 text-shadow 加粗成底線，但底線的垂直位置取決於
    字型的 underscore glyph metrics（元素本身 height:0），在反白輸入列這類畫面會畫到格子
@@ -364,6 +385,23 @@ a:link,a:visited,a:active,a:hover {
 }
 .mergedCommentBlock span[type="bbsrow"] > div > [data-type="bbsline"]:first-child {
   margin-left: calc(-1 * var(--merged-comment-indent, 0));
+}
+/* 懸掛縮排只管**文字**：自動開圖的佔位盒要豁免（使用者 2026-09 回報「合併推文裡的
+   圖沒滿版」）。上面那個 padding-left 下在 bbsrow 上，而 .inlinePreviewSlot 就住在
+   同一個 bbsrow 裡（見 LinkSegmentBuilder：每行 bbsline 後面緊跟該行的預覽 div）且是
+   **區塊盒** ⇒ containing block 先被縮排扣掉一截：一般態的 `margin: 0.5em auto` 在變窄
+   的盒子裡置中（整體右移、左緣貼齊作者 id 欄），放大態的 width:100% 也剛好少一個縮排寬。
+   等量負 margin-left 一次解決兩者 —— 區塊盒在正常流中 `margin-left + width(auto) = 容器寬`，
+   所以左緣拉回塊左緣的同時，寬度自己補回那一截，與非合併推文的圖逐像素相同。
+   **不可改成寫死 width/padding**：字級（forceWidth）與視窗寬一變就失準。
+   **只能寫在 stylesheet**：runtime 改寫 slot 的樣式會命中 CSS Scroll Anchoring 的
+   suppression trigger（見 render/inline_preview_slot.js 檔頭硬不變量）；靜態規則、值對
+   單一節點恆定 ⇒ 不觸發，與 .inlinePreviewSlot 的 display:grid 同類。
+   與上面的 padding-left **成對**：只留其中一條，圖會凸出容器左緣。
+   守護：tests/unit/merged_comment_image_css.test.js（CSS 契約）、
+   tests/e2e/offline/comment_merge.offline.spec.js（真幾何，jsdom 量不到）。 */
+.mergedCommentBlock .inlinePreviewSlot {
+  margin-left: calc(-1 * var(--merged-comment-indent, 0px));
 }
 /* 樓號徽章不覆寫：沿用一般 .floorBadge 的「零寬盒＋右對齊 id 起始欄向左長」疊字，
    前綴「marker＋空格＋id」照 col 對齊 → 合併塊作者 id 與相鄰單則推文（renderRow）
@@ -817,6 +855,31 @@ span {
   display: grid;
   grid-template-areas: "stack";
   align-items: start;
+  /* slot 是**整列寬**的區塊（沒有 width 宣告，逐層繼承 .main 的 chw*80+10px），
+     而圖片只有 max-width:39em + margin:auto 置中 ⇒ 直式圖／小圖左右各留下數十欄
+     空白。那片空白不該算「點在預覽上」：
+       1. 灰階鈕的 hover 觸發會擴散到整列寬（捲到圖就常駐）；
+       2. 更嚴重的是 App.mouse_click 第 5 條 isPreviewTarget 會 return ⇒ 文章模式
+          左 0-6 欄的退出手勢在圖片那幾列整段失效，而 hover 路徑純看格子座標、
+          不看 DOM ⇒ 提示帶照亮、指標照樣是 back，點下去 0 byte（affordance 說謊）。
+     修法是讓 hit-test 跟著「真的有像素的地方」走：slot 讓開，可互動的子孫各自
+     取回 auto（見下一條）。pointer-events 不影響 layout ⇒ 版面、佔位高度、
+     scroll anchoring、golden 快照全不動。
+     寬圖（達 39em ≈ 78 欄）左 7 欄仍被圖片本身覆蓋 —— 那裡確實有圖片像素，
+     維持「圖片優先」是刻意的，不是漏網。 */
+  pointer-events: none;
+}
+/* pointer-events **是繼承屬性**，所以子孫要逐一取回。清單與 js/preview_targets.js
+   的 PREVIEW_CLICK_SELECTOR 對齊 —— 少了任何一項，那種媒體連自己都點不到
+   （圖片放大、載入失敗重試都會靜默失效）。
+   .inlinePreviewSpacer 刻意不在列上：替身盒本來就不該吃點擊（它另有 none）。 */
+.inlinePreviewSlot img.easyReadingImg,
+.inlinePreviewSlot video.easyReadingVideo,
+.inlinePreviewSlot iframe,
+.inlinePreviewSlot .previewLoading,
+.inlinePreviewSlot .previewError,
+.inlinePreviewSlot > .previewGrayBtn {
+  pointer-events: auto;
 }
 .inlinePreviewSlot > .inlinePreviewContent,
 .inlinePreviewSlot > .inlinePreviewSpacer {
@@ -826,10 +889,74 @@ span {
   pointer-events: none;
 }
 
+/* 單張圖的暫時性灰階切換鈕（src/render/inline_preview_slot.js#ensureGrayButton）。
+   動線是「轉灰階 → 用瀏覽器內建的以圖找圖查」，所以效果只要是 render-time 的
+   filter 就夠（本地產不出真正灰階的位元組，理由見該檔的 grayHrefs 註解）。
+
+   ---- 為什麼是 grid item + 百分比 margin，不是 JS 算座標 ----
+   圖片身上有一條**動態反向 scale**（term_view.js 抵消 .main 的 transform:scale），
+   而 .main 本身也是 transform 過的 ⇒ getBoundingClientRect() + position:fixed 量到的
+   是另一個座標系，還得自己跟捲動與 resize。改成待在**同一個 layout 空間**裡：按鈕
+   是 slot 的第三個 grid item、與內容疊在同一格（不增加 slot 高度），水平位置靠一條
+   負責抵消「圖片 margin:0.5em auto 置中留白」的百分比 margin。百分比 margin 以
+   grid area（＝slot）寬為基準，所以扣掉左右各半的留白就正好貼在圖片右上角。
+   --img-w 由既有的 ResizeObserver 回呼量 img.offsetWidth 寫在**按鈕自己**身上
+   （.inlinePreviewSlot / .inlinePreviewContent 一律不得有 runtime inline style，
+   見上面的硬不變量）。放大／縮小／字級／視窗改變都自動跟上，零捲動監聽。
+   外觀比照 render/merge_buttons.js 的浮動按鈕。 */
+.inlinePreviewSlot > .previewGrayBtn {
+  grid-area: stack;
+  justify-self: end;
+  align-self: start;
+  margin-right: calc((100% - var(--img-w, 100%)) / 2);
+  /* 圖片上緣相對於內容層上緣，同樣由 JS 量（**不可**在這裡寫 0.5em 照抄圖片的
+     margin：em 在按鈕身上以按鈕自己的 12px 解析，圖片那個 0.5em 用的是終端機字級
+     ⇒ 按鈕會浮到圖片上緣之外、壓到上一列文字，實測差 9px）。 */
+  margin-top: var(--img-top, 0px);
+  /* 「DOM 排在後面」不足以疊在圖片上方：<img> 是**行內置換元素**（CSS 2.1 繪製
+     順序的第 7 步），而按鈕是 block-level grid item（背景／邊框在第 4 步）⇒ 圖片
+     反而蓋住按鈕。實測症狀：按鈕看得見卻點不到，elementFromPoint 回的是 <img>
+     （Playwright 會說「img … intercepts pointer events」，看起來像座標算錯）。
+     給它自己的堆疊脈絡就排到第 9 步。位移量是 0，版面不動。 */
+  position: relative;
+  z-index: 1;
+  visibility: hidden;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  border-radius: 4px;
+  color: #fff;
+  background: rgba(33, 37, 41, 0.75);
+  border: 1px solid #ced4da;
+}
+/* 平時隱藏，不干擾閱讀；:focus-visible 那條讓鍵盤使用者也叫得出來。
+
+   **這裡的 :hover 之所以夠精確，完全靠上面那條 slot 的 pointer-events:none**：
+   slot 是整列寬，它自己若還是 hit-test 目標，「捲到這張圖」就等於「滑鼠一定在觸發
+   範圍內」⇒ 按鈕幾乎永遠掛著（使用者實際回報過）。收斂之後 hit target 只會是圖片／
+   指示器／按鈕自己，:hover 再沿祖先鏈傳上來 ⇒ 觸發範圍剛好是媒體盒。**兩條是綁死
+   的一組，別只拿掉其中一條。**
+
+   不用 :has(img:hover) 寫成明示條件是刻意的：build.target 含 firefox110，而 :has()
+   要到 Firefox 121 才有 —— 選擇器清單裡只要有一個無效，**整條規則會被丟棄** ⇒ 按鈕
+   在那些瀏覽器上永遠叫不出來，比它要修的問題更糟。 */
+.inlinePreviewSlot:hover > .previewGrayBtn,
+.inlinePreviewSlot > .previewGrayBtn:focus-visible {
+  visibility: visible;
+}
+/* 只打真圖：替身盒 .inlinePreviewGhost 雖然也掛 .easyReadingImg，但它是 <div>。 */
+.inlinePreviewSlot[data-gray="1"] img.easyReadingImg {
+  filter: grayscale(1);
+}
+
 /* 自動開圖「讀取中」指示器：解析中 + 媒體下載中共用。
    <img>/<video> 無法回報真實進度，故用不定式（indeterminate）滑動色塊。 */
+/* display 是 flex 而非 inline-flex、外加 width:fit-content：inline-level 元素的
+   `margin: auto` 解析成 0 ⇒ 指示器其實整片貼在第 0 欄，把左側退出帶壓掉。 */
 .previewLoading {
-  display: inline-flex;
+  display: flex;
+  width: fit-content;
   align-items: center;
   gap: 0.5em;
   margin: 0.5em auto;
@@ -870,8 +997,11 @@ span {
 }
 
 /* 自動開圖載入失敗（重試耗盡）：可見、可點重試的提示，取代靜默空白 */
+/* 同 .previewLoading：inline-flex 的 margin:auto 是 no-op ⇒ 靠左壓掉退出帶。
+   收斂後可點重試的命中區也剛好縮到文字本身。 */
 .previewError {
-  display: inline-flex;
+  display: flex;
+  width: fit-content;
   align-items: center;
   margin: 0.5em auto;
   padding: 0.15em 0.5em;

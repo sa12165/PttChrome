@@ -12,7 +12,7 @@ function rowOf(text) {
   return text.split("").map((c) => ({ ch: c, isLeadByte: false }));
 }
 
-function makeSession({ count = 8, pinned = 0 } = {}) {
+function makeSession({ count = 8, pinned = 0, rows = 24 } = {}) {
   const sent = [];
   const enqueued = [];
   const hints = [];
@@ -38,12 +38,12 @@ function makeSession({ count = 8, pinned = 0 } = {}) {
     listLineNums.push(null);
   }
   const termBuf = {
-    rows: 24,
+    rows,
     cols: 80,
     useMouseBrowsing: true,
     listLines,
     listLineNums,
-    lineChangeds: new Array(24).fill(false),
+    lineChangeds: new Array(rows).fill(false),
     changed: false,
     // 靜置探針（非導覽操作完成後自動回好讀）會在 hold 期間量一次當下畫面，
     // 所以 stub 也要有 TermBuf 的畫面讀取介面（真的 TermBuf 一定有）。
@@ -123,6 +123,27 @@ describe("markReadTargetAtRow（純查詢，決定選單項出不出現）", () 
     expect(s.markReadTargetAtRow(bodyRow(2))).toEqual({ num: 103 });
     expect(s.markReadTargetAtRow(bodyRow(3))).toBe(null);
     expect(s.markReadTargetAtRow(bodyRow(4))).toBe(null);
+  });
+
+  // 列號換算只依 LIST_HEADER_ROWS 與序列長度，與終端機列數無關 —— 鎖住它，
+  // 免得日後有人在這裡補回 rows 判斷（列表好讀曾因 `rows === 24` 的門檻整個
+  // 失效，連帶讓這個選單項在「固定字體大小」模式下消失）。
+  test("非 24 列的終端機（固定字體大小模式）→ 照常取得序號", () => {
+    const { s } = makeSession({ rows: 40 });
+    expect(s.markReadTargetAtRow(bodyRow(2))).toEqual({ num: 103 });
+  });
+
+  // 「render row ↔ body idx」的換算必須走 session 自己的 headerRows()，不是寫死
+  // 的 LIST_HEADER_ROWS —— 滑鼠座標鏈（clientToPos / onListMouseMove）兩種列表
+  // 共用，而看板列表的 header 是另一個常數。改了 headerRows 卻沒跟著走的話，
+  // 其中一邊改版時就是靜默連坐（點進錯的看板）。
+  test("列號換算走 session 的 headerRows()（不是寫死的常數）", () => {
+    const { s } = makeSession();
+    expect(s.headerRows()).toBe(LIST_HEADER_ROWS);
+    s.headerRows = () => 4;
+    expect(s.markReadTargetAtRow(4)).toEqual({ num: 101 });
+    expect(s.markReadTargetAtRow(3)).toBe(null); // 在新的 header 區內
+    expect(s.markReadTargetAtRow(6)).toEqual({ num: 103 });
   });
 
   test("非 active／非 buffer（原生鏡像、交易中）→ null", () => {

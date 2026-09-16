@@ -27,6 +27,13 @@ pref `enableBoardListSmoothScroll`（預設 `false`）。實作 `src/js/board_li
 不必攔 `c` 鍵）→ footer 變體（**`(y)只列最愛` 要先於 `(m)加入/移出最愛` 判**，兩者
 都以 `(m)` 開頭）→ 游標停在 body 且該列有編號。
 
+**終端機列數不限 24**：engage 條件（`board_list_session._engageEligible`）只要求
+`buf.rows >= 24`（下界＝server 端 clamp，`mbbsd/term.c:55`）。2026-09-11 之前寫死
+`=== 24`，於是設定頁「BBS 終端機大小 → 固定字體大小」（列數由視窗高度反推，可視高
+> 480px 就 > 24）會讓整個功能**靜默失效**——勾了設定完全沒反應、也沒有任何提示。
+整條管線的幾何本來就是 `buf.rows` 推導的（`_bodyRows() = rows - 4` ＝ pttbbs 的
+`p_lines`），沒有對 24 的實質依賴。見 `docs/terminal-size.md`。
+
 ⚠ **guest 沒有我的最愛**：`choose_board` 開頭 `if (!cuser.userlevel) LIST_BRD();`
 （`board.c:1665`）⇒ guest 按 `F` 落到「全部看板」。offline cassette 只能錄分類子分類。
 
@@ -131,20 +138,58 @@ pin 1 只跑 `applyFunctionKeys`，而 `functionKeyRows(1,n) === functionKeyRows
 
 ### 4.3 狀態機（`transitionBoardListSession`，純 reducer）
 
-`idle` → `active` ⇄ `functionMode`；`active` → `opening`。（**沒有 `suspended`**：
-離開看板列表就收攤，不跨畫面保留緩衝。）
+`idle` → `active` ⇄ `functionMode`；`active` → `opening`；`active` → `suspended` → `active`。
+
+**`suspended`（進板）是 2026-09-12 加的**（此前是「離開看板列表就收攤」）：進板時把畫面所有權
+交還，但**緩衝／捲動錨／變體整份留著**，退板回來原樣接上（同 `list_session` 的 suspended，
+文章列表好讀的不變量 N6）。舊行為是退板後重新 `seed`，錨變成 server 落地頁的頂列，而
+`head = (num / p_lines) * p_lines` 是 20 列分頁（board.c:1710-1716）⇒ 使用者把某個看板捲到
+視口最下面、進去再退出，它會被吸附回畫面中間（使用者回報，與文章列表好讀同一個症狀，
+錄製檔 `ptt-debug-20260911-113150`）。
+
+**別名守門（承重）**：同變體的**不同清單**共用同一個編號空間形狀——分類看板的目錄列
+（`NBRD_FOLDER`）Enter 會遞迴進另一份 `choose_board`，footer 變體一模一樣（board.c:1279-1290
+只看 `IS_LISTING_FAV`/`IN_CLASS`）。所以 resume 要過**兩道**守門：
+
+1. 開板交易的落點是**另一個編號空間**（`brdlist`／`brdlist-other`／`menu`）才 `_reset()`；
+   其餘（進板畫面、文章列表、prompt、落點未知）一律 `_suspend()`。
+   **這道是排除法，不可以寫回「落點是 `article-list` 才 suspend」**（2026-09-12 的修正）：
+   開板的落地幀通常**不是**文章列表，而是進板畫面 —— `Read()` 在 `i_read()` 之前先跑
+   `more(<板>/notes)` ＋ `pressanykey()`（bbs.c:4646-4655，ctx 判成 `'other'`），而且它只在
+   `currbid != bnote_lastbid` 時出現（同一連線第二次進同一板就沒有）⇒ 白名單版的守門會
+   **時好時壞**：手測若進的是剛才進過的板就看不出來。實錄：錄製檔
+   `ptt-debug-20260912-015707`（build 91c6676，`boardList.transition` 的 `from` 是 `idle`
+   而不是 `suspended`）。
+2. 退板落地幀再過一次內容指紋 `landedSameList`：落點那一列的**板名**（`parseBoardListName`）
+   要跟緩衝裡同編號那一列相同，**而且整頁掃一遍**——落地頁每一列只要在緩衝裡有同編號的
+   列，板名就必須一致（緩衝沒有的編號不算證據）。有任一列矛盾就 `seed`（整份重建）。
+   整頁那半是 gate 1 放寬後補上的承重：群組看板（`BRD_GROUPBOARD`）遞迴也先過進板畫面
+   （board.c:1992-1998 同樣是 `more(notes)`＋`pressanykey()`）⇒ 它也會經過 `suspended`，
+   而它的落點是第 1 列（board.c:1985 `num = 0`），只比游標那一列的話「第 1 列剛好同名」
+   就會把兩份清單 merge 進同一個緩衝（靜默錯誤）。
+
+`parseBoardListName` **不用固定欄位**：未讀標記 `unread[1]` 是全形「ˇ」（board.c:1343），
+`rowToText` 會把它收成**一個**字元 ⇒ 板名的字串索引隨已讀/未讀位移一格；改抓「編號之後的
+第一個 ASCII 識別字」。守護：`board_list_parse.test.js` 的 `parseBoardListName` 那組、
+`board_list_session.test.js`「進板 → 退板：緩衝與捲動錨跨畫面保留」。
 
 | 狀態 | 事件 | 結果 |
 |---|---|---|
 | idle | settle `brdlist` ＋ engageEligible | active：`seed` + `start-fill` |
 | active | settle `brdlist` 同變體 | `continue-fill` |
 | active | settle `brdlist` 換變體 | `rebuild`（編號空間換了） |
-| active | settle `article-list` / `menu` | idle：`cleanup` |
+| active | settle `article-list` | **suspended：`suspend`**（緩衝／錨留著，等退板） |
+| active | settle `menu` | idle：`cleanup`（上一層是另一個編號空間） |
 | active | settle 其他（含 `brdlist-other`） | 交易在飛／剛被消費 → stay；否則 functionMode：`enter-native`＋banner |
 | active | key nav / open / leave / passthrough / native-inplace | move-selection / opening+begin-open / opening+begin-leave / functionMode（passthrough＝原生鏡像；native-inplace＝**凍結交易，全程不切原生**）|
 | functionMode | settle `article-list` / `menu` | idle：`cleanup` |
 | functionMode | **`resume-probe`**（靜置探針）| `holdReason==='passthrough'` ∧ 無 in-flight ∧ `ctx==='brdlist'` ∧ engageEligible → active：`seed`＋`start-fill`。**不可以走「回 idle 等下一個 settle」**——畫面靜止時不會再有 settle，那會卡死 |
 | functionMode | 其他 settle | stay（繼續鏡像；settle 本身永不解除 hold）|
+| suspended | settle `brdlist` ∧ 同變體 ∧ `landedSameList` ∧ engageEligible | active：`resume-in-place`（採用落點游標，**捲動錨不動**） |
+| suspended | settle `brdlist`，但換了一份清單 | active：`seed`＋`start-fill`（整份重建） |
+| suspended | settle `brdlist`，但 !engageEligible | idle：`cleanup` |
+| suspended | settle `menu` | idle：`cleanup`（交易在飛時 stay，同 functionMode 的 AID 守門）|
+| suspended | 其他 settle（板內翻頁、讀文、prompt…）| stay |
 | opening | 任何 settle | stay（落地由 queue 的 expect 判） |
 | 任何 | `pref-off` | idle：`cleanup` |
 
@@ -162,11 +207,11 @@ pin 1 只跑 `applyFunctionKeys`，而 `functionKeyRows(1,n) === functionKeyRows
 | 交易 | 序列 | expect |
 |---|---|---|
 | 抓頁 `brd-fetch-up/down` | `<base±1>\r` ＋ `\f` | 停在 body 且有編號 → `boardListFetchVerdict` 判 edge |
-| End `brd-jump-end` | `99999999\r` ＋ `\f` | 同上（search_num 夾到 brdnum ⇒ 順便確認板尾） |
-| Home `brd-jump-home` | `1\r` ＋ `\f` | cursorNum === 1 |
+| End `brd-jump-end` | 原生 `ESC[4~` ＋ `^L` | 停在 body 且 curX≤1（board.c:1830 `KEY_END`／`$` → `num = brdnum-1` CONFIRMED） |
+| Home `brd-jump-home` | 原生 `ESC[1~` ＋ `^L` | cursorNum === 1（board.c:1768 `KEY_HOME`／`0` → `num = 0`） |
 | 跳號 `brd-jump-number` | `<n>\r` ＋ `\f` | 停在 body → `rebuild`（落點可能離緩衝很遠） |
 | 游標同步 `brd-*-sync-jump` | `<sel>\r` ＋ `\f` | cursorNum === sel |
-| 進看板 `brd-open-board` | `\r` | **任何 settle**；onDone → `_reset()` |
+| 進看板 `brd-open-board` | `\r` | **任何 settle**；onDone → 落點是另一份清單／選單（`brdlist`／`brdlist-other`／`menu`）才 `_reset()`，其餘（進板畫面／文章列表／未知）`_suspend()`（緩衝留著）|
 | 回上層 `brd-leave` | `\x1b[D` | 同上 |
 | passthrough `brd-native-key/paste/input` | 原鍵／Big5 bytes ＋ `\f` | 同上（畫面已是原生鏡像）|
 | A 類鍵 `brd-native-inplace` | `t`／`v`／`V` ＋ `\f`（必要時先 `brd-inplace-sync-jump`）| `brd.parked ∧ cursorNum≠null ∧ 同變體` → `_resumeInPlace`（採用落點、**錨不動**）；落點不在緩衝 → `rebuild` |
@@ -175,7 +220,13 @@ pin 1 只跑 `applyFunctionKeys`，而 `functionKeyRows(1,n) === functionKeyRows
 （文章列表／另一份看板列表／主功能表·分類根），在 expect 裡窮舉遠比「收攤後讓
 **同一個 settle** 的 reducer 依內容重新決定」脆弱。收攤後 state 回 `idle`，
 `_settleEvent` 讀到的 `inFlightKind` 已是 null ⇒ 是看板列表就當場重新 seed，
-是文章列表就由 ListSession 接手（它的 handler 在同一輪已經跑過）。
+是文章列表就由 ListSession 接手（它的 handler 在同一輪已經跑過）。開板那條的
+「收攤」是 `_suspend()`（緩衝留著）而不是 `_reset()`，其餘不變。
+
+**已知缺口（未做）**：`suspended` 只涵蓋「進板 → 退板」。**進資料夾／群組看板再退回
+上一層清單**仍會重新 `seed` ⇒ 上一層的視野被 server 那一頁重新釘住。要修得存一疊
+上層清單的緩衝與錨（父子同變體、編號空間形狀相同，所有權與別名守門都要重寫），
+本期刻意不做。
 
 ### 4.5 鍵盤白名單（枚舉即合約）
 
@@ -186,7 +237,10 @@ pin 1 只跑 `applyFunctionKeys`，而 `functionKeyRows(1,n) === functionKeyRows
 （board.c:1802/1871）。三者都不開 prompt、不換編號空間 ⇒ 走**凍結交易**（`native-inplace`），
 全程看不到原生。**`*`（tag all）刻意不在此組**：它一次翻掉整份清單的 tag 標記，緩衝裡其他頁會殘留
 舊標記 ⇒ 歸 passthrough（切原生，回來整份重建）。
-Ctrl 組合與其餘一切 → passthrough（切原生鏡像＋代送），操作完成、畫面靜下來 250ms 後由**靜置探針**
+Ctrl 組合、Alt 重映射鍵（Alt+R/T/W/V ＝ `^R/^T/^W/^V`）與其餘一切 → passthrough（**有序號選取且真游標
+落後時先 `native-sync-jump`**，再切原生鏡像＋代送）。Ctrl/Alt 這兩類 2026-09-13 前被擋在序列之外因而跳過
+同步腿，而 board.c 有一整組吃真游標的鍵（`:1890 Ctrl-S`、`:2044 Ctrl-T`、`:1731 Ctrl-W`）——根因與守則見
+`docs/easy-reading-list.md` 不變量 12。操作完成、畫面靜下來 250ms 後由**靜置探針**
 自動重新 engage（pref `enableListNativeAutoResume`，預設開；關掉＝停在原生，進板／回上層才恢復）。
 探針的三個條件與時鐘來源與文章列表完全相同，見 `docs/easy-reading-list.md`「靜置探針」節。
 送不出 byte 的鍵（F1/CapsLock…）→ `ignore`，判準是 `keyEventToBytes(e) == null` 本身。
@@ -229,9 +283,12 @@ Ctrl 組合與其餘一切 → passthrough（切原生鏡像＋代送），操�
 
 live spec 的兩條硬規則（踩過才寫的）：
 1. 主功能表的字母鍵只是**移動游標**，要 `F` 之後再 `Enter` 才進得去（menu.c 的 hotkey 語意）。
-2. 導覽類斷言前一定要等 `commandQueue.idle`：抓頁在飛時 `_requestEnd`/`_requestHome`
-   會靜默 early-return，否則測試會在「什麼都沒發生」上綠掉（2026-09-03 實測：
-   End 按下去選取沒動，斷言卻過了）。
+2. 導覽類斷言前一定要等 `commandQueue.idle`，但理由已經不是「靜默 early-return」——
+   2026-09-05 起抓頁在飛時 `_requestEnd`/`_requestHome` 改成**前景優先**（丟未送出的
+   prefetch、`expedite` 縮短在飛的那筆，見 easy-reading-list.md 不變量 18）；只有
+   `hasKind('brd-jump-')`（連按去重）還會真的不排。所以要等的是「上一個跳號落地」，
+   不等就可能在「什麼都沒發生」上綠掉（2026-09-03 實測：End 按下去選取沒動，
+   斷言卻過了）。
 
 **offline e2e 尚未錄製**：`RECORD_MODE=brdlist` 只能錄「分類看板子分類」（guest 沒有
 我的最愛，§1；而我的最愛是個人偏好清單，不可入 repo）。分類子分類是站台公開內容、
