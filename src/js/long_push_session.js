@@ -109,6 +109,10 @@ export function LongPushSession(core, view, termBuf, queue) {
   this.onPreflight = null;
   // 送出階段的終局（失敗／取消）→ 錯誤框。成功仍走 _hint 的 toast。
   this.onResult = null;
+  // **整段成功送完**才會呼叫（失敗／取消一律不叫）。目前唯一的消費者是草稿清除：
+  // 送到一半失敗時草稿要留著，使用者才有機會把沒送出去的那段救回來
+  // （long_push_draft.js 檔頭）。
+  this.onSent = null;
   this._timer = null;
   this._reset();
 }
@@ -163,6 +167,30 @@ LongPushSession.prototype = {
   disarm: function() {
     this._armed = null;
     if (this._phase === 'armed') this._phase = 'idle';
+    this._releaseWire();
+  },
+
+  // 放手：這個功能不再握著畫面。**busy 的每一條 true→false 都必須經過這裡**
+  // （disarm 是唯一的共同出口：_finish 與 _preflightFail 都呼叫它，start() 那次
+  // 則因為 active 已經是 true 而被下面的守門擋掉）。
+  //
+  // 為什麼非通知不可：好讀的自動翻頁被 easy_reading._wireBusy() 擋下時是**延後**
+  // 不是丟棄，喚醒點只有 EasyReading.onWireIdle()，而那是接在 CommandQueue.onIdle
+  // 上的。_wireBusy 的三個來源裡，longPush.busy 是唯一一個 queue 管不到的 ——
+  // armed（使用者在輸入框打字）與冷卻倒數（最長 240 秒）期間 queue 空著、onIdle
+  // 早就發過了，busy 卻要等到這裡才翻 false。少了這一行的症狀：按 X 叫出長推文再
+  // 取消，文章就永遠停在當前頁、怎麼捲都不會讀到結尾（沒送鍵就沒有新幀，不會再
+  // 評估第二次 ⇒ 死結，只能離開文章再進）。實錄：ptt-debug-20260917-221112 的最後
+  // 三筆 easyReading.pageDown 全是 {action:"blocked", inFlightKind:null}。
+  //
+  // force：待補送的鍵未必還在 —— 取消路徑會退出文章再 ⏎ 重開，那個文章邊界的
+  // _resetPagingState 就把 _deferredPageDownKeys 清成 null 了。要不要真的送鍵仍由
+  // 好讀自己的 nextPageDownDecision 決定，這裡只負責「叫醒」。
+  // 守護：tests/unit/long_push_wire_release.test.js。
+  _releaseWire: function() {
+    if (this.busy) return;
+    const er = this._core && this._core.easyReading;
+    if (er && er.onWireIdle) er.onWireIdle({ force: true });
   },
 
   _clearTimer: function() {
@@ -225,6 +253,8 @@ LongPushSession.prototype = {
     this._reset();
     if (o.kind === 'done') {
       if (o.message) this._hint(o.message);
+      // 唯一的「整段都送出去了」出口 ⇒ 草稿到這裡才可以清（見建構式的 onSent）。
+      if (this.onSent) this.onSent();
       return;
     }
     if (this.onResult)

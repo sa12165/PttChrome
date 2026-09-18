@@ -5,7 +5,7 @@
 
 ## 機制（CONFIRMED）
 
-- 啟用條件：pref `enableEasyReading`(預設 **false**，`PrefModal.jsx` `DEFAULT_PREFS`) && `connectedUrl.easyReadingSupported`(`pttchrome.jsx` true)。使用者自己開，存 localStorage `pttchrome.pref.v1`。
+- 啟用條件：pref `enableEasyReading`(**2026-09-16 起預設 true**，`pref_storage.js` `DEFAULT_PREFS`) && `connectedUrl.easyReadingSupported`(`pttchrome.jsx` true)。使用者自己開，存 localStorage `pttchrome.pref.v1`。
 - 啟用旗標：`view.useEasyReadingMode`，由 `bindProperty` 綁成 `EasyReading._enabled`。
 - 進文章(pageState 3)後由 `_onChanged` 判斷、`_onViewUpdated` 送 PageDown(`\x1b[6~`)把整篇累積成可捲動長頁（決策落純函式 `nextEasyReadingRowState`；`_onChanged` 已抽 `_computeRowState`+`_applyRowState` 兩 helper 供快路徑與兜底共用）。長文章(精華區索引)因此自動翻頁久、攔截 `/` 等鍵 → 原生搜尋不可用。
 - **翻頁＝單一 in-flight 交易（2026-08 重構，治「※ 發信站/※ 文章網址 那段消失」，依據 `docs/pttbbs-screen-protocol.md` §13 P1/P3/P4/P6）**：
@@ -264,13 +264,15 @@ scaleX / scaleY / dpr / fontsReady`，另有 `cursor.geom` 取樣（游標真的
 
 ## 送鍵閘門：延後，不是丟棄（CONFIRMED unit＋live 量測）
 
-好讀狀態機自己送的鍵**繞過 CommandQueue**，所以線上有序列化交易時一個 byte 都不准送（`_wireBusy()` = `aidNavigation.active || commandQueue.inFlightKind`；理由與兩個實測症狀見 `easy_reading._send` 註解與 `docs/deep-link.md`）。**但「不准送」必須是延後，不能是丟棄**——
+好讀狀態機自己送的鍵**繞過 CommandQueue**，所以線上有序列化交易時一個 byte 都不准送（`_wireBusy()` = `aidNavigation.active || commandQueue.inFlightKind || longPush.busy`；理由與兩個實測症狀見 `easy_reading._send` 註解與 `docs/deep-link.md`）。**但「不准送」必須是延後，不能是丟棄**——
 
 - **為何丟棄一定出事**：文章落地的那一個 settle 上，執行順序是 `pageStateSettled`→好讀開機並送第一個 PageDown →`screenSettled`→好讀（同頁 sig ⇒ wait）→**最後**才是 `list_session`→`queue.onSettle`→`open-enter` 完成。這個順序是 `pttchrome.jsx` 的「ORDER MATTERS」刻意保證的（`ensureEnabledOnArticle` 要 `_enabled` 已定案），所以**好讀的第一個 PageDown 必然撞上仍在飛的 `open-enter`／`aid-open`**。舊碼在 `_send` 前就寫好 `_inFlightSig`/`_inFlightSentAt` 並 `_armWatchdog` ⇒ 留下一筆假 in-flight ⇒ 只剩 620ms（`PAGE_DOWN_GRACE_MS+20`）的 watchdog 能救。**live 量測 2026-08-17：修前 638ms，修後 20ms**（`blocked` 計數 2、`onWireIdle` 1 次）。且 `PAGE_DOWN_MAX_RETRIES=1`，那次 retry 若又撞上別的交易就直接 `giveup` ⇒ 整篇停在第一頁。
 - **機制**：`_maybeSendPageDown` **開頭**就 `_wireBusy()` 早退（決策連跑都不跑），把 bytes 存進 `_deferredPageDownKeys` 並回傳 `'blocked'`；交易狀態三件套與 watchdog **完全不動**。線路真的空了由 `CommandQueue.onIdle`（opt-in，`pttchrome.jsx` 接到 `easyReading.onWireIdle`）叫醒補送。
 - **`onIdle` 必須在 `_maybeSendNext()` 之後判定**：`open-jump` 的 `onDone` 會接著 enqueue `open-enter`，那時線路根本沒空過；早一步通知等於補送到下一個指令頭上。`flush()` 只在原本非 idle 時才通知。
 - **補送是自我保持、不是重試迴圈**：`onWireIdle` 時若仍 busy，`_maybeSendPageDown` 會把 bytes 原封存回 deferred，等下一次通知。沒有 timer。
 - **per-article**：`_deferredPageDownKeys` 由 `_resetPagingState` 清（與 `_pendingScrollRestore`／`_pendingEnableOnArticle` 同規）——跨文章帶過去就是憑空多送一次 PageDown（P4）。
+- **閘門的每一個來源都必須有配對的喚醒事件**。`_wireBusy()` 現在是 `aidNavigation.active || commandQueue.inFlightKind || longPush.busy`，而 **`longPush.busy` 是唯一一個 queue 管不到的**：`armed`（探完路、使用者在輸入框打字）與冷卻倒數（最長 240 秒）期間 queue 空著、`onIdle` 早就發過了，`busy` 要等到關框（`disarm`）才翻 false。所以它得自己通知——`long_push_session._releaseWire()` → `onWireIdle({ force: true })`。**症狀（2026-09-17 錄製檔 `ptt-debug-20260917-221112`）：按 X 叫出長推文再取消，文章永遠停在當前頁、怎麼捲都不會讀到結尾**；指紋是最後三筆 `easyReading.pageDown` 全為 `{action:"blocked", inFlightKind:null}`（inFlightKind 已經是 null 卻還是被擋 ⇒ 擋人的是 `longPush.busy`）。死結成立的原因是沒送鍵就沒有新幀，不會再評估第二次。
+- **`force` 的語意**：連 `_deferredPageDownKeys` 都不需要（取消長推文會退出文章再 ⏎ 重開，那個文章邊界的 `_resetPagingState` 已經把它清掉了），直接拿 `\x1b[6~` 重新跑一次決策。安全性完全靠 `nextPageDownDecision`：`functionMode`／非完整幀／非狀態列 → `none`，`pagePercent>=100` → `done`，同頁簽章未過 grace → `wait`，所以多叫幾次不可能違反 P4。**未來若再加一個 `_wireBusy` 來源，一併問自己「它放手時誰來通知」**。
 - **gap 自癒同理但更嚴**：`_healGap` 開頭 `_wireBusy()` 直接 return 且**刻意不清 `easyReadingGapDetected`**（下次 settle 重試）。`_healFromTop` 會先清 `pageLines` 才送 Home，被 `_send` 吞掉就只剩空白畫面，而它沒有 watchdog 兜底。
 - 守護：`tests/unit/easy_reading_send_gate.test.js`（fake timers 斷言「零時間前進即送出」＋不留假 in-flight）、`tests/unit/command_queue.test.js`（`onIdle` 的真空判定）。
 
@@ -335,7 +337,7 @@ best-effort：逾時／miss／框裡沒 AID 一律降級續跳（錨點退回原
 
 ## e2e 測試要點（tests/e2e/easy-reading.spec.js）
 
-- **好讀預設 false**：測試須在 `page.addInitScript` 寫 localStorage `pttchrome.pref.v1`→`{values:{enableEasyReading:true}}` 才會啟動，否則 End 只是原生（測不到）。
+- **好讀預設 true（2026-09-16 翻預設）**：要測「原生」的 spec 反過來得自己關（live 走 `helpers/ptt.js#applyPrefs`，offline 走全新 context 的 localStorage），否則吃到的是好讀。舊約定（測試自己寫 `{values:{enableEasyReading:true}}` 才會啟動）已失效。
 - app 未掛全域：`main.jsx` 僅 `DEVELOPER_MODE`(dev build 有)下 `window.__app=app` 供測試讀 `view.useEasyReadingMode`/`buf.pageState`。
 - 判好讀 vs 原生：好讀 `mainContainer` 累積 >24 列且 `#easyReadingLastRow` display:block；原生 24 列、lastRow display:none、畫面含原生狀態列「瀏覽 第 N 頁…」。原生狀態列**不論 100% 或非 100% 都含「(h)說明」**（差別只在頁數指示器顏色，到底時反白）。**勿**用「mainContainer 是否含瀏覽第」分原生/好讀 footer：footer overlay 現已**即時鏡像真實狀態列**（含「瀏覽 第…(h)說明」，見 render 段「footer 鏡像」），但它是 `BBSWin` 下獨立 div、非 `#mainContainer`，故 `mc.innerText` 不含它——仍以 `useEasyReadingMode`/`mcChildren`/`lastRowDisplay` 區分。
 - 取消 PTT 搜尋提示用**空 Enter**，勿用 Escape（pmore 把 `\x1b` 當逃逸序列開頭，導覽錯亂）。

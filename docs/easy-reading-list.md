@@ -29,7 +29,7 @@
 | T3c 文字輸入（IME） | 中文輸入法組完字送出（compositionend） | 同 T3b，只是**不套 `normalizePasteText`**（那是貼上專屬的換行／折行正規化，IME 送的是剛組完的一段字）、佇列命令 kind 為 `native-input`。入口是 `term_view.onTextInput` 這條共用漏斗 → `ListSession.noteTextInput(text)`（回 true＝已接手）。**按鍵路徑抓不到它**：IME 的 keydown keyCode 是 229，被 `keyEventFilter` 擋在 `onKeyDown` 之外 ⇒ 走不到 `_classifyKey`。見不變量 12d |
 | T4 非請自來 | 水球/廣播（server 主動寫入） | 唯一自動切原生路徑：banner 明示（水球專屬措辭）＋停在原生（`'passthrough'` hold ⇒ 畫面靜下來後靜置探針自動回好讀；pref 關掉時才是 article/menu 才恢復）|
 
-pref `enableEasyReadingList`（預設 off）＋`easyReadingListPrefetchCount`（預設 200，0=停背景 fill）
+pref `enableEasyReadingList`（**2026-09-16 起預設 on**）＋`easyReadingListPrefetchCount`（預設 200，0=停背景 fill）
 ＋`enableListNativeAutoResume`（**預設 on**，一顆同時管 A 類凍結交易與 B 類自動回復；
 關掉＝逐位元回到黏性原生。三階梯：全開／中（關這顆）／全關（關母開關＝純原生 24 列）——
 每一階都必須是完整可用的狀態）
@@ -46,6 +46,7 @@ pref `enableEasyReadingList`（預設 off）＋`easyReadingListPrefetchCount`（
 | 純函式層：`classifyListScreen`/`classifyListBurst`/`transitionListSession`/`mergeListPage`/`flattenListBuffer`/`moveListSelection`/`visibleListIndices`/`parseBoardName`/`evictListBuffer`/`bufferEdgeNum` | `src/js/list_session.js` 上半（unit：`list_session.test.js`） |
 | class `ListSession(core,view,termBuf,queue)`：狀態機＋捲動錨（`_topNum`/`_topPinnedKey`/`_scrollFrac`）＋游標（`_selectedNum`）＋demand＋`getListView`／`captureScrollAnchor`／`applyScrollAfterRender`／`onDomScroll` | 同檔下半；`pttchrome.jsx` App constructor 接線 |
 | `CommandQueue`（注入 send/timer/onEvent、soft/hard/probe timeout、`expedite`、flush 靜默） | `src/js/command_queue.js` |
+| 送出契約（2026-09-17 變更）：queue 的 send 綁 `conn.send`＝**機器模式**，server 停在 `VKSTATE_ESC` 時一律先補一個 ESC 化解。**`_beginPassthroughBytes`／`_enqueueInplaceKey` 送的使用者 byte 也一樣**——那些是單一按鍵、不可能是 ESC 組合鍵的第二個位元組（組合鍵的 Esc 走 `term_view._send`、不排進 queue），而化解反而修好「使用者漏一個 Esc 之後按 `[`／數字 → 命令零回應到 timeout → 誤降級原生」。推導見 `src/js/vtkbd_send_state.js` 檔頭與 `docs/pttbbs-screen-protocol.md` §1.2 | `src/js/vtkbd_send_state.js` |
 | 序號解析：`parseListArticleNum`/`isPinnedListRow`/`recoverCursorArticleNum`/`pageArticleNums` | `src/js/comment_parse.js` |
 | settle snapshot | `src/js/term_buf.js` `_armSettleTimer` |
 | render：redraw buffer/frozen 分支（`buildListWindowLines`＝header/footer 快取＋`getListView()` 的整段序列＋`>` 游標裝飾）、`accumulateListLines`（merge→evict→prune→flatten→chrome 快取）、`relabelListCursorRow` | `src/js/term_view.js` |

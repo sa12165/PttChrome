@@ -100,7 +100,12 @@ async function drawBoardList(page, rows, cursorRow) {
       const REV = '\x1b[7m';
       const OFF = '\x1b[0m';
       let d = '\x1b[2J';
-      d += '\x1b[1;1H' + REV + u2b('【板主：test】看板《Test》'.padEnd(40)) + OFF;
+      // row0 反白鋪滿整列、row1 不可留空：term_buf.setPageState 判 pageState 2
+      // 要的就是這兩件事（isUnicolor(0,0,29) + isUnicolor(0,cols-20,cols-10) +
+      // !isLineEmpty(1) + isUnicolor(2,0,cols-10)）。少了它們畫面會落在 pageState 0，
+      // 「列表(2) → 文章(3)」的 settle 邊緣就不成立 ⇒ 好讀不會自動開。
+      d += '\x1b[1;1H' + REV + u2b('【板主：test】看板《Test》'.padEnd(80)) + OFF;
+      d += '\x1b[2;1H' + u2b('[←]離開 [→]閱讀 [^P]發表文章 [b]備忘錄');
       d +=
         '\x1b[3;1H' +
         REV +
@@ -218,6 +223,10 @@ async function submitLongPush(page, text) {
 
 async function boot(page) {
   await bootOffline(page, ptt);
+  // 這支 spec 自己畫畫面（drawArticle／drawBoardList）驗的都是**原生**行為，而列表
+  // 好讀自 2026-09-16 起預設開 —— 它一 engage 就會自己往線路送機器鍵，讓「按 X 只送
+  // 出一個 byte」這類斷言收到多餘的 bytes。明確關掉，別靠預設值。
+  await ptt.applyPrefs(page, { enableEasyReadingList: false });
   await drawArticle(page);
   expect(await page.evaluate(() => window.__app.buf.pageState)).toBe(3);
   // 免費路徑拿得到 AID ⇒ 開場不會按 Q（長推文的錨點來源，見 long_push_anchor.js）。
@@ -285,6 +294,50 @@ test.describe('長推文一鍵發送（離線）', () => {
     await expect
       .poll(() => page.evaluate(() => window.__app.modalShown))
       .toBe(false);
+    await expect
+      .poll(() => page.evaluate(() => window.__app.longPush.active))
+      .toBe(false);
+  });
+
+  // 鍵盤送出。unit（long_push_modal.test.jsx）已經守了「Ctrl+Enter 會呼叫
+  // onConfirm」，這裡守只有真瀏覽器看得到的兩件事：
+  //   1. preventDefault 真的擋掉了 textarea 自己的換行（jsdom 不會插那個字元，
+  //      fireEvent 的回傳值只證明「有呼叫 preventDefault」）——送不出去的空白狀態
+  //      下按一次最看得出來：框還開著，內容必須仍是空的。
+  //   2. 這一下沒漏給 PTT：modalShown 擋著 term_view 的 global keydown，線路上
+  //      第一個 byte 必須就是長推文自己送的 X。
+  test('Ctrl+Enter 送出：不多插換行，也不漏 byte 給 PTT', async ({ page }) => {
+    await boot(page);
+    await openContextMenu(page);
+    await collectSent(page);
+    await itemByText(page, await label(page, 'cmenu_longPush')).click();
+    await runPreflight(page);
+
+    const box = page.locator('[name="longPushText"]');
+    await expect(box).toBeVisible();
+    await collectSent(page);
+    await box.press('Control+Enter');
+    // 空的時候按＝什麼都不會發生，但那一下也不能變成一個換行。
+    await expect(box).toBeVisible();
+    await expect(box).toHaveValue('');
+    expect(await sentText(page)).toBe('');
+
+    await box.fill('安安');
+    await collectSent(page);
+    await box.press('Control+Enter');
+
+    await expect(page.getByTestId('longPushProgressStatus')).toBeVisible();
+    await expect.poll(() => sentText(page)).toBe('X');
+
+    // 內容就是打的那兩個字，沒有被多出來的換行切成兩則。
+    await drawLastRow(page, TYPE_MENU);
+    await drawLastRow(page, PROMPT);
+    const seg = await toBig5(page, '安安');
+    await expect.poll(() => sentText(page)).toBe('X1' + seg + '\r');
+
+    await drawLastRow(page, CONFIRM);
+    await drawLastRow(page, ARTICLE_FOOTER);
+    await expect(page.getByTestId('longPushProgressStatus')).toHaveCount(0);
     await expect
       .poll(() => page.evaluate(() => window.__app.longPush.active))
       .toBe(false);
@@ -489,9 +542,16 @@ test.describe('長推文一鍵發送（離線）', () => {
       // 使用者那顆按鈕的 byte 沒有被原樣轉送：線路上只有探路那一個 X（後面那些
       // 是收尾的 Ctrl-C 與回文章的 ⏎）。% 那顆尤其要驗——漏攔的話會變成「點這顆
       // 是長推文、點旁邊那顆是原生」。
+      //
+      // 第二輪的 X 前面會多一個 ESC，那是**對的**：上一輪用 Escape 關輸入框，那一下
+      // 會漏到終端機（Mantine 的 Escape handler 先跑，modalShown 那時已經翻成 false）
+      // ⇒ server 的 vtkbd 停在 VKSTATE_ESC。機器鍵一律先補一個 ESC 化解才到得了
+      // pmore；沒有它，這個 X 會被吃成 esc_arg、PTT 零反應 ——「讀不到文章代碼（miss）」
+      // 就是這樣來的（回歸守在本檔最後一支與 tests/unit/vtkbd_send_state.test.js）。
       const sent = await page.evaluate(() => window.__sent);
-      expect(sent[0]).toBe('X');
-      expect(sent.filter((b) => b === 'X')).toHaveLength(1);
+      expect(sent[0]).toMatch(/^?X$/);
+      expect(sent.filter((b) => b.indexOf('X') >= 0)).toHaveLength(1);
+      expect(sent.join('')).not.toContain('%');
       // 收掉輸入框，下一輪重來。關框＝這次不推了 ⇒ 探路成果要丟掉，不然下一次
       // start() 會拿舊錨點去比對新畫面。
       await page.keyboard.press('Escape');
@@ -540,6 +600,45 @@ test.describe('長推文一鍵發送（離線）', () => {
     expect(await page.evaluate(() => window.__app.longPush.busy)).toBe(false);
   });
 
+  // 「讀不到文章代碼（miss）」的根因回歸（錄製檔 ptt-debug-20260917-012944.json）。
+  //
+  // 使用者關掉長推文輸入框後順手多按一下 Esc：那時畫面上已經沒有任何彈窗，
+  // modalShown 是 false ⇒ 那一下是**合法的終端機輸入**，源頭擋不住（想靠「有彈窗
+  // 就不送鍵」修的話會發現關框那一下本來就擋得住，多按的那一下沒得擋）。
+  // 於是 server 的 vtkbd 停在 VKSTATE_ESC，下一次按 X 時 CommandQueue 送出去的第一個
+  // byte 會被吃成 esc_arg ⇒ 畫面零反應 ⇒ 700ms 後送  探針 ⇒ 判成 miss。
+  //
+  // 修法是把守門的預設反轉（機器送出一律化解，ESC 組合鍵的保護只留給真鍵盤）。
+  // 純函式兩層都有 unit（vtkbd_send_state / telnet_esc_guard / user_key_send_wiring），
+  // 這裡守的是 unit 碰不到的那條：**真 DOM keydown → term_view → telnet._vkState →
+  // CommandQueue → WS**。
+  test('關輸入框後漏出去的 Esc 不會吃掉下一次按 X', async ({ page }) => {
+    await boot(page);
+    await collectSent(page);
+
+    // 第一輪：按 X 探路 → 輸入框開 → 取消關掉。
+    await ptt.sendKey(page, 'X');
+    await runPreflight(page);
+    await page
+      .locator('form')
+      .getByRole('button', { name: await label(page, 'longPushModal_cancel') })
+      .click();
+    await expect(page.locator('[name="longPushText"]')).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => window.__app.modalShown)).toBe(false);
+
+    await collectSent(page);
+    // 順手多按的那一下 Esc。框已經關了 ⇒ 它本來就該送到 PTT。
+    await ptt.sendKey(page, 'Escape');
+    await expect.poll(() => sentText(page)).toBe('');
+
+    // 再按一次 X：探路的第一個機器 byte 前面要補一個 ESC 化解，X 才到得了 pmore。
+    await ptt.sendKey(page, 'X');
+    await expect.poll(() => sentText(page)).toBe('' + 'X');
+    // 而且探路真的走完：miss 的那條路會開錯誤框，這裡要開的是輸入框。
+    await runPreflight(page);
+    await expect(page.getByTestId('longPushErrorMessage')).toHaveCount(0);
+  });
+
   test('游標還在原篇時不多送任何定位鍵', async ({ page }) => {
     await boot(page);
     await submitLongPush(page, '第一段\n第二段');
@@ -558,5 +657,98 @@ test.describe('長推文一鍵發送（離線）', () => {
       1
     );
     await expect.poll(() => sentText(page)).toBe('X');
+  });
+
+  // REGRESSION（使用者回報 + 錄製檔 ptt-debug-20260917-221112）：按 X 叫出長推文
+  // 輸入框、然後**取消**，文章就再也不會往下讀到結尾。
+  //
+  // 根因是通知只有單向：好讀的自動翻頁被 easy_reading._wireBusy() 擋下時是延後
+  // 不是丟棄，喚醒點只有 EasyReading.onWireIdle()，而那是接在 CommandQueue.onIdle
+  // 上的。longPush.busy 卻是唯一一個 queue 管不到的來源 —— 探路成功後 _armed 一直
+  // 活著（使用者在打字，線路真的空著），queue 早就空了、onIdle 也發過了，busy 要
+  // 等到關框（disarm）才翻 false ⇒ 那一刻沒有人再通知好讀。沒送鍵就沒有新幀，
+  // 不會再評估第二次 ⇒ 死結。
+  //
+  // 兩層 unit 各守一半（easy_reading_send_gate 的 force 補送、long_push_wire_release
+  // 的 _releaseWire），這裡守的是 unit 碰不到的那條：**真的好讀狀態機 + 真的
+  // CommandQueue + 真的 React 關框**串起來之後，那個 PageDown 真的上得了線路。
+  test('取消長推文之後，好讀的自動翻頁要接得回去', async ({ page }) => {
+    await boot(page);
+
+    // 這支 spec 其他 case 的 drawArticle 刻意**不**把游標停在右下角（P6 的 complete
+    // gate 不成立）⇒ 好讀不會送 PageDown，鍵序斷言才乾淨。這一條要的正好相反：
+    // 一幀「完整的」文章畫面，好讀看到就會想翻頁。
+    const drawArticleComplete = async (footer) => {
+      await page.evaluate(
+        ({ rows, footer }) => {
+          const u2b = (str) => {
+            let out = '';
+            for (const ch of str) {
+              const c = ch.charCodeAt(0);
+              if (c < 0x80) {
+                out += ch;
+                continue;
+              }
+              out +=
+                String.fromCharCode(window.lib.u2bArray[2 * c]) +
+                String.fromCharCode(window.lib.u2bArray[2 * c + 1]);
+            }
+            return out;
+          };
+          let d = '\x1b[2J';
+          for (const k of Object.keys(rows))
+            d += '\x1b[' + (Number(k) + 1) + ';1H' + u2b(rows[k]);
+          d += '\x1b[24;1H' + u2b(footer);
+          // P6：只有游標停在右下角的那一幀才是「完整的 server 回應」。
+          d += '\x1b[24;80H';
+          window.__app.onData(d);
+        },
+        { rows: { 0: ARTICLE_HEADER, 1: ARTICLE_TITLE, 20: ARTICLE_URL }, footer }
+      );
+      await page.waitForTimeout(300);
+    };
+    const footerAt = (page1, page2, pct, start, end) =>
+      `  瀏覽 第 ${page1}/${page2} 頁 (${String(pct).padStart(3)}%)  ` +
+      `目前顯示: 第 ${start}~${end} 行  (y)回應(X%)推文(h)說明(←)離開 `;
+
+    // 好讀是在「列表(2) → 文章(3)」的 settle 邊緣自動開的，boot() 直接畫文章沒有
+    // 那道邊緣 ⇒ 要先過一次列表。
+    await drawBoardList(
+      page,
+      [
+        boardListRow(1233, 'someoneElse', '[公告] 別篇'),
+        boardListRow(1234, 'testuser', '[閒聊] 測試文章'),
+        boardListRow(1235, 'thirdGuy', '[問卦] 又一篇'),
+      ],
+      1
+    );
+    await drawArticleComplete(footerAt(1, 3, 33, '01', '23'));
+    await expect
+      .poll(() => page.evaluate(() => window.__app.view.useEasyReadingMode))
+      .toBe(true);
+
+    // 探路 → 輸入框開著（_armed 活著 ⇒ busy 為 true）。
+    await collectSent(page);
+    await ptt.sendKey(page, 'X');
+    await runPreflight(page);
+    expect(await page.evaluate(() => window.__app.longPush.busy)).toBe(true);
+
+    // 輸入框開著時來了一幀完整的文章畫面（真實情境：探路收尾按 ⏎ 回文章那一幀，
+    // 它同時也讓好讀退出鏡像原生模式）。好讀想翻頁，但被 longPush.busy 擋下來
+    // —— 這是**正確**的，不可以讓它插進長推文的線路。
+    await collectSent(page);
+    await drawArticleComplete(footerAt(2, 3, 66, '24', '46'));
+    await expect.poll(() => sentText(page)).toBe('');
+
+    // 使用者按取消。這一刻 busy 翻 false，而 queue 早就空了。
+    await page
+      .locator('form')
+      .getByRole('button', { name: await label(page, 'longPushModal_cancel') })
+      .click();
+    await expect(page.locator('[name="longPushText"]')).toHaveCount(0);
+    expect(await page.evaluate(() => window.__app.longPush.busy)).toBe(false);
+
+    // 修好之前：這裡永遠是空字串，文章就此卡住。
+    await expect.poll(() => sentText(page)).toContain('\x1b[6~');
   });
 });
